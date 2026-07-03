@@ -186,8 +186,6 @@ async def _handle_admin(rest: list[str], current_user_id: str) -> None:
 async def _handle_memory(rest: list[str], group_id: str) -> None:
     if not rest:
         await admin_cmd.finish(_memory_help_text())
-    if len(rest) >= 2 and rest[0] == "user":
-        await admin_cmd.finish("成员画像已迁移到 FACT：请使用 #bot facts user <qq_id> 或 #bot profile <qq_id>")
     if rest[0] == "lexicon":
         term = " ".join(rest[1:]).strip()
         memories = storage.list_group_lexicon(group_id, term=term)

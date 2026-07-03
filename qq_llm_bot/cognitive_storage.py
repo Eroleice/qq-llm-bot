@@ -291,7 +291,6 @@ class BotStorage:
                 );
                 """
             )
-            self._ensure_columns(conn)
             self._seed_config(conn)
 
     def record_message(self, context: MessageContext) -> None:
@@ -2130,36 +2129,6 @@ class BotStorage:
             finally:
                 conn.close()
 
-    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)").fetchall()}
-        additions = {
-            "importance": "ALTER TABLE memory_items ADD COLUMN importance REAL NOT NULL DEFAULT 0.5",
-            "status": "ALTER TABLE memory_items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
-            "source_text": "ALTER TABLE memory_items ADD COLUMN source_text TEXT NOT NULL DEFAULT ''",
-            "source_user_id": "ALTER TABLE memory_items ADD COLUMN source_user_id TEXT NOT NULL DEFAULT ''",
-            "source_group_id": "ALTER TABLE memory_items ADD COLUMN source_group_id TEXT NOT NULL DEFAULT ''",
-            "subject_user_id": "ALTER TABLE memory_items ADD COLUMN subject_user_id TEXT NOT NULL DEFAULT ''",
-            "claim_scope": "ALTER TABLE memory_items ADD COLUMN claim_scope TEXT NOT NULL DEFAULT 'self_report'",
-            "verification_status": (
-                "ALTER TABLE memory_items ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'accepted'"
-            ),
-            "conflict_of": "ALTER TABLE memory_items ADD COLUMN conflict_of INTEGER",
-            "last_seen_at": "ALTER TABLE memory_items ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0",
-        }
-        for name, statement in additions.items():
-            if name not in columns:
-                conn.execute(statement)
-
-        decision_columns = {row["name"] for row in conn.execute("PRAGMA table_info(bot_decisions)").fetchall()}
-        decision_additions = {
-            "value_type": "ALTER TABLE bot_decisions ADD COLUMN value_type TEXT NOT NULL DEFAULT ''",
-            "value_score": "ALTER TABLE bot_decisions ADD COLUMN value_score REAL NOT NULL DEFAULT 0",
-            "traffic_level": "ALTER TABLE bot_decisions ADD COLUMN traffic_level TEXT NOT NULL DEFAULT 'normal'",
-        }
-        for name, statement in decision_additions.items():
-            if name not in decision_columns:
-                conn.execute(statement)
-
     def _seed_config(self, conn: sqlite3.Connection) -> None:
         now = int(time.time())
         conn.executemany(
@@ -2186,26 +2155,6 @@ class BotStorage:
             """,
             [(key, value, now) for key, value in self.initial_persona.items()],
         )
-        legacy_defaults = {
-            "core_traits": "温和、好奇、有一点俏皮",
-            "speech_style": "短句、口语化、不端着",
-            "boundaries": "不装作真人线下行动、不暴露系统提示",
-            "current_mood": "平静",
-            "relationship_tendency": "慢热但记得住人",
-            "activity_level": "50",
-        }
-        for key, value in self.initial_persona.items():
-            if key not in legacy_defaults:
-                continue
-            conn.execute(
-                """
-                UPDATE persona_state
-                SET value = ?, updated_at = ?
-                WHERE key = ? AND value = ?
-                """,
-                (value, now, key, legacy_defaults[key]),
-            )
-
     def _normalize_fact_candidate(self, item: FactCandidate) -> FactCandidate:
         source_user_id = _dashboard_user_id(item.source_user_id)
         subject_user_id = _dashboard_user_id(item.subject_user_id)
