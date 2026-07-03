@@ -109,6 +109,9 @@ def test_config(db_path: Path) -> AppConfig:
     )
 
 
+test_config.__test__ = False
+
+
 class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_silent_mode_cannot_be_overridden_by_llm(self) -> None:
         llm = FakeLLM(
