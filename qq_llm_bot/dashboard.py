@@ -542,11 +542,12 @@ _DASHBOARD_HTML = r"""<!doctype html>
         document.getElementById("usersList").innerHTML = items.map((item) => {
           const relation = item.relationship || {};
           const profile = item.profile || [];
+          const nickname = item.nickname || item.display_name || "";
+          const memberLabel = nickname ? `${nickname} (${item.user_id})` : `QQ ${item.user_id}`;
           return `
             <div class="item">
               <div>
-                <span class="pill">group ${escapeHtml(item.group_id || "(unknown)")}</span>
-                <span class="pill">QQ ${escapeHtml(item.user_id)}</span>
+                <span class="pill">${escapeHtml(memberLabel)}</span>
               </div>
               <div class="kv" style="margin-top:10px">
                 <div class="key">亲近</div><div>${relation.closeness ?? 0}</div>

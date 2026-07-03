@@ -297,7 +297,8 @@ async def _maybe_reflect_group(group_id: str) -> None:
 def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
     plain_text = event.get_plaintext().strip()
     sender = getattr(event, "sender", None)
-    sender_name = _sender_field(sender, "card") or _sender_field(sender, "nickname")
+    sender_nickname = _sender_field(sender, "nickname")
+    sender_name = _sender_field(sender, "card") or sender_nickname
     sender_role = _sender_field(sender, "role")
 
     return MessageContext(
@@ -307,6 +308,7 @@ def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
         plain_text=plain_text,
         raw_message=str(event.message),
         sender_name=sender_name,
+        sender_nickname=sender_nickname,
         sender_role=sender_role,
         is_direct=_is_direct_message(bot, event, plain_text),
         timestamp=int(getattr(event, "time", 0) or time.time()),

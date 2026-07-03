@@ -856,6 +856,91 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(items[0]["relationship"]["trust"], 3)  # type: ignore[index]
             self.assertEqual(items[0]["profile"][0]["content"], "喜欢海边")  # type: ignore[index]
 
+    def test_dashboard_user_cognition_groups_by_qq_id_across_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.apply_relationship_delta(
+                "100",
+                "42",
+                RelationDelta(familiarity=1, summary_patch="一群聊过海边"),
+            )
+            storage.apply_relationship_delta(
+                "200",
+                "42",
+                RelationDelta(trust=2, familiarity=3, summary_patch="二群聊过音乐"),
+            )
+            storage.record_memory_candidates(
+                [
+                    MemoryCandidate(
+                        owner_type="user",
+                        owner_id="QQ:42",
+                        kind="preference",
+                        content="喜欢海边",
+                        confidence=0.86,
+                        importance=0.6,
+                        evidence_message_id="m1",
+                        source_user_id="42",
+                        source_group_id="200",
+                        subject_user_id="42",
+                        claim_scope="self_report",
+                    )
+                ]
+            )
+
+            items = storage.list_dashboard_user_cognition()
+            user_items = [item for item in items if item["user_id"] == "42"]
+
+            self.assertEqual(len(user_items), 1)
+            self.assertEqual(user_items[0]["group_ids"], ["100", "200"])
+            self.assertEqual(user_items[0]["relationship"]["trust"], 2)  # type: ignore[index]
+            self.assertEqual(user_items[0]["relationship"]["familiarity"], 4)  # type: ignore[index]
+            self.assertEqual(user_items[0]["profile"][0]["content"], "喜欢海边")  # type: ignore[index]
+
+            filtered_items = storage.list_dashboard_user_cognition(group_id="100")
+            filtered_user_items = [item for item in filtered_items if item["user_id"] == "42"]
+
+            self.assertEqual(len(filtered_user_items), 1)
+            self.assertEqual(filtered_user_items[0]["group_ids"], ["100", "200"])
+            self.assertEqual(filtered_user_items[0]["profile"][0]["content"], "喜欢海边")  # type: ignore[index]
+
+    def test_dashboard_user_cognition_uses_latest_qq_nickname(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_message(
+                MessageContext(
+                    group_id="100",
+                    user_id="42",
+                    message_id="m-old",
+                    plain_text="旧昵称发言",
+                    raw_message="旧昵称发言",
+                    sender_name="旧群名片",
+                    sender_nickname="旧昵称",
+                    timestamp=10,
+                )
+            )
+            storage.record_message(
+                MessageContext(
+                    group_id="100",
+                    user_id="42",
+                    message_id="m-new",
+                    plain_text="新昵称发言",
+                    raw_message="新昵称发言",
+                    sender_name="新群名片",
+                    sender_nickname="新昵称",
+                    timestamp=20,
+                )
+            )
+            storage.apply_relationship_delta("100", "42", RelationDelta(familiarity=1))
+
+            items = storage.list_dashboard_user_cognition(user_id="42")
+
+            self.assertEqual(items[0]["nickname"], "新昵称")
+            self.assertEqual(items[0]["display_name"], "新群名片")
+
     def test_dashboard_messages_can_filter_by_group_user_and_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")

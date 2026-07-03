@@ -121,6 +121,14 @@ class BotStorage:
                     raw_data TEXT NOT NULL DEFAULT ''
                 );
 
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS image_vision_cache (
                     url TEXT PRIMARY KEY,
                     description TEXT NOT NULL DEFAULT '',
@@ -211,6 +219,7 @@ class BotStorage:
             self._seed_config(conn)
 
     def record_message(self, context: MessageContext) -> None:
+        now = context.timestamp or int(time.time())
         with self._connect() as conn:
             conn.execute(
                 """
@@ -221,7 +230,7 @@ class BotStorage:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    context.timestamp or int(time.time()),
+                    now,
                     context.group_id,
                     context.user_id,
                     context.message_id,
@@ -231,7 +240,38 @@ class BotStorage:
                     context.sender_role,
                 ),
             )
+            self._upsert_user_profile(conn, context, now)
             self._record_attachments(conn, context)
+
+    def _upsert_user_profile(
+        self,
+        conn: sqlite3.Connection,
+        context: MessageContext,
+        now: int,
+    ) -> None:
+        user_id = _dashboard_user_id(context.user_id)
+        if not user_id:
+            return
+        nickname = " ".join(str(context.sender_nickname or "").split())
+        display_name = " ".join(str(context.sender_name or "").split())
+        conn.execute(
+            """
+            INSERT INTO user_profiles (user_id, nickname, display_name, updated_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                nickname = CASE
+                    WHEN excluded.nickname != '' THEN excluded.nickname
+                    ELSE user_profiles.nickname
+                END,
+                display_name = CASE
+                    WHEN excluded.display_name != '' THEN excluded.display_name
+                    ELSE user_profiles.display_name
+                END,
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (user_id, nickname, display_name, now, now),
+        )
 
     def record_bot_reply(self, group_id: str, bot_id: str, reply: str) -> None:
         now = int(time.time())
@@ -753,82 +793,214 @@ class BotStorage:
         user_id: str = "",
         limit: int = 100,
     ) -> list[dict[str, object]]:
-        seen: set[tuple[str, str]] = set()
-        items: list[dict[str, object]] = []
-        where = []
-        params: list[object] = []
-        if group_id:
-            where.append("group_id = ?")
-            params.append(str(group_id))
-        if user_id:
-            where.append("user_id = ?")
-            params.append(str(user_id))
-        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        requested_group_id = str(group_id).strip()
+        requested_user_id = str(user_id).strip()
+        limit = max(1, int(limit))
+        query_limit = max(limit * 4, limit)
+        candidates: dict[str, dict[str, object]] = {}
+
+        def candidate_for(raw_user_id: str) -> dict[str, object]:
+            key = _dashboard_user_id(raw_user_id)
+            if key not in candidates:
+                candidates[key] = {
+                    "user_id": key,
+                    "group_ids": set(),
+                    "sort_at": 0,
+                }
+            return candidates[key]
+
+        user_variants = _dashboard_user_id_variants(requested_user_id) if requested_user_id else []
+        user_filter_sql = ""
+        user_filter_params: list[object] = []
+        if user_variants:
+            placeholders = ", ".join("?" for _ in user_variants)
+            user_filter_sql = f" AND user_id IN ({placeholders})"
+            user_filter_params.extend(user_variants)
+
+        memory_user_filter_sql = ""
+        memory_user_filter_params: list[object] = []
+        if user_variants:
+            placeholders = ", ".join("?" for _ in user_variants)
+            memory_user_filter_sql = f" AND owner_id IN ({placeholders})"
+            memory_user_filter_params.extend(user_variants)
+
+        relationship_where = "WHERE 1 = 1"
+        relationship_params: list[object] = []
+        if requested_group_id:
+            relationship_where += " AND group_id = ?"
+            relationship_params.append(requested_group_id)
+        relationship_where += user_filter_sql
+        relationship_params.extend(user_filter_params)
 
         with self._connect() as conn:
             relation_rows = conn.execute(
                 f"""
                 SELECT group_id, user_id, closeness, trust, familiarity, tension, summary, updated_at
                 FROM relationships
-                {where_sql}
+                {relationship_where}
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                [*params, int(limit)],
+                [*relationship_params, query_limit],
             ).fetchall()
 
             memory_where = ["owner_type = 'user'", "status = 'active'"]
             memory_params: list[object] = []
-            if user_id:
-                memory_where.append("owner_id = ?")
-                memory_params.append(str(user_id))
+            if requested_group_id:
+                memory_where.append("source_group_id = ?")
+                memory_params.append(requested_group_id)
             memory_rows = conn.execute(
                 f"""
-                SELECT DISTINCT owner_id AS user_id
+                SELECT owner_id AS user_id, source_group_id, MAX(updated_at) AS updated_at
                 FROM memory_items
                 WHERE {' AND '.join(memory_where)}
-                ORDER BY owner_id
+                {memory_user_filter_sql}
+                GROUP BY owner_id, source_group_id
+                ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                [*memory_params, int(limit)],
+                [*memory_params, *memory_user_filter_params, query_limit],
             ).fetchall()
 
-        for row in relation_rows:
-            relation_group_id = str(row["group_id"])
-            relation_user_id = str(row["user_id"])
-            seen.add((relation_group_id, relation_user_id))
-            items.append(
-                {
-                    "group_id": relation_group_id,
-                    "user_id": relation_user_id,
-                    "relationship": _relationship_row_to_dict(row),
-                    "profile": [
-                        _memory_to_dict(record)
-                        for record in self.list_memories("user", relation_user_id, limit=20)
-                    ],
-                }
-            )
+            for row in relation_rows:
+                entry = candidate_for(str(row["user_id"]))
+                group_ids = entry["group_ids"]
+                assert isinstance(group_ids, set)
+                group_ids.add(str(row["group_id"]))
+                entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
 
-        fallback_group_id = str(group_id)
-        for row in memory_rows:
-            memory_user_id = str(row["user_id"])
-            key = (fallback_group_id, memory_user_id)
-            if key in seen:
-                continue
-            relation = self.get_relationship(fallback_group_id, memory_user_id) if fallback_group_id else None
-            items.append(
-                {
-                    "group_id": fallback_group_id,
-                    "user_id": memory_user_id,
-                    "relationship": _relationship_to_dict(relation) if relation else None,
-                    "profile": [
-                        _memory_to_dict(record)
-                        for record in self.list_memories("user", memory_user_id, limit=20)
-                    ],
-                }
-            )
+            for row in memory_rows:
+                entry = candidate_for(str(row["user_id"]))
+                source_group_id = str(row["source_group_id"] or "")
+                if source_group_id:
+                    group_ids = entry["group_ids"]
+                    assert isinstance(group_ids, set)
+                    group_ids.add(source_group_id)
+                entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
 
+            items: list[dict[str, object]] = []
+            for entry in candidates.values():
+                dashboard_user_id = str(entry["user_id"])
+                relationships = self._list_dashboard_relationship_rows(conn, dashboard_user_id, query_limit)
+                profile_records = self._list_dashboard_user_profile_records(conn, dashboard_user_id, 20)
+                user_profile = self._dashboard_user_profile(conn, dashboard_user_id)
+                group_ids = entry["group_ids"]
+                assert isinstance(group_ids, set)
+                for row in relationships:
+                    group_ids.add(str(row["group_id"]))
+                    entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
+                for record in profile_records:
+                    if record.source_group_id:
+                        group_ids.add(record.source_group_id)
+                    entry["sort_at"] = max(int(entry["sort_at"]), record.updated_at)
+                sorted_group_ids = sorted(group_ids)
+                items.append(
+                    {
+                        "group_id": ", ".join(sorted_group_ids),
+                        "group_ids": sorted_group_ids,
+                        "user_id": dashboard_user_id,
+                        "nickname": user_profile["nickname"],
+                        "display_name": user_profile["display_name"],
+                        "relationship": _dashboard_relationship_to_dict(
+                            dashboard_user_id,
+                            relationships,
+                            sorted_group_ids,
+                        ),
+                        "profile": [_memory_to_dict(record) for record in profile_records],
+                        "updated_at": int(entry["sort_at"]),
+                    }
+                )
+
+        items.sort(key=lambda item: int(item.get("updated_at", 0)), reverse=True)
         return items[:limit]
+
+    def _list_dashboard_relationship_rows(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        variants = _dashboard_user_id_variants(user_id)
+        placeholders = ", ".join("?" for _ in variants)
+        return conn.execute(
+            f"""
+            SELECT group_id, user_id, closeness, trust, familiarity, tension, summary, updated_at
+            FROM relationships
+            WHERE user_id IN ({placeholders})
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            [*variants, int(limit)],
+        ).fetchall()
+
+    def _list_dashboard_user_profile_records(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        limit: int,
+    ) -> list[MemoryRecord]:
+        variants = _dashboard_user_id_variants(user_id)
+        placeholders = ", ".join("?" for _ in variants)
+        rows = conn.execute(
+            f"""
+            SELECT id, owner_type, owner_id, kind, content, confidence, importance, status,
+                   updated_at, source_user_id, source_group_id, subject_user_id,
+                   claim_scope, verification_status
+            FROM memory_items
+            WHERE owner_type = 'user'
+              AND status = 'active'
+              AND owner_id IN ({placeholders})
+            ORDER BY importance DESC, updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            [*variants, int(limit)],
+        ).fetchall()
+        return [_memory_record(row) for row in rows]
+
+    def _dashboard_user_profile(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+    ) -> dict[str, object]:
+        variants = _dashboard_user_id_variants(user_id)
+        placeholders = ", ".join("?" for _ in variants)
+        row = conn.execute(
+            f"""
+            SELECT nickname, display_name, updated_at, last_seen_at
+            FROM user_profiles
+            WHERE user_id IN ({placeholders})
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            """,
+            variants,
+        ).fetchone()
+        if row is not None:
+            return {
+                "nickname": str(row["nickname"] or ""),
+                "display_name": str(row["display_name"] or ""),
+                "updated_at": int(row["updated_at"]),
+                "last_seen_at": int(row["last_seen_at"]),
+            }
+
+        row = conn.execute(
+            f"""
+            SELECT sender_name, time
+            FROM messages
+            WHERE user_id IN ({placeholders})
+              AND sender_name != ''
+            ORDER BY time DESC, id DESC
+            LIMIT 1
+            """,
+            variants,
+        ).fetchone()
+        if row is None:
+            return {"nickname": "", "display_name": "", "updated_at": 0, "last_seen_at": 0}
+        return {
+            "nickname": "",
+            "display_name": str(row["sender_name"] or ""),
+            "updated_at": int(row["time"]),
+            "last_seen_at": int(row["time"]),
+        }
 
     def list_dashboard_messages(
         self,
@@ -1561,6 +1733,53 @@ def _relationship_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
     )
     data["updated_at"] = int(row["updated_at"])
     return data
+
+
+def _dashboard_relationship_to_dict(
+    user_id: str,
+    rows: list[sqlite3.Row],
+    group_ids: list[str],
+) -> dict[str, object] | None:
+    if not rows:
+        return None
+    summary = ""
+    updated_at = 0
+    closeness = 0
+    trust = 0
+    familiarity = 0
+    tension = 0
+    for row in rows:
+        closeness += int(row["closeness"])
+        trust += int(row["trust"])
+        familiarity += int(row["familiarity"])
+        tension += int(row["tension"])
+        summary = _merge_summary(summary, str(row["summary"] or ""))
+        updated_at = max(updated_at, int(row["updated_at"]))
+    return {
+        "group_id": ", ".join(group_ids),
+        "group_ids": group_ids,
+        "user_id": user_id,
+        "closeness": _clamp_score(closeness),
+        "trust": _clamp_score(trust),
+        "familiarity": _clamp_score(familiarity),
+        "tension": _clamp_score(tension),
+        "summary": summary,
+        "updated_at": updated_at,
+    }
+
+
+def _dashboard_user_id(value: str) -> str:
+    user_id = str(value or "").strip()
+    match = re.fullmatch(r"(?i)qq[:：]\s*(\d+)", user_id)
+    return match.group(1) if match else user_id
+
+
+def _dashboard_user_id_variants(value: str) -> list[str]:
+    canonical = _dashboard_user_id(value)
+    variants = [canonical]
+    if canonical.isdigit():
+        variants.extend([f"QQ:{canonical}", f"qq:{canonical}", f"QQ：{canonical}"])
+    return list(dict.fromkeys(item for item in variants if item))
 
 
 def _image_vision_cache_record(row: sqlite3.Row) -> ImageVisionCacheRecord:

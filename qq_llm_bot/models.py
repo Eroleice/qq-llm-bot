@@ -44,6 +44,7 @@ class MessageContext:
     plain_text: str
     raw_message: str
     sender_name: str = ""
+    sender_nickname: str = ""
     sender_role: str = ""
     is_direct: bool = False
     timestamp: int = 0
