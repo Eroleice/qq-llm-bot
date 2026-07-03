@@ -20,6 +20,7 @@ from qq_llm_bot.models import (
     MessageAttachment,
     MessageContext,
     ParticipationDecision,
+    ParticipationValueType,
     PerceptionResult,
     PipelineResult,
     RelationDelta,
@@ -1108,7 +1109,16 @@ class ParticipationPolicyAgent:
             return ParticipationDecision("observe", "group is in silent mode", mode, 0.0)
 
         if context.is_direct:
-            return ParticipationDecision("reply", "message is directed to the bot", mode, 1.0)
+            value_type: ParticipationValueType = "answer" if perception.is_question else "direct_reply"
+            return ParticipationDecision(
+                "reply",
+                "message is directed to the bot",
+                mode,
+                1.0,
+                value_type,
+                1.0,
+                self._traffic_level(snapshot),
+            )
 
         if mode == "passive":
             return ParticipationDecision("observe", "passive mode requires direct mention", mode, 0.0)
@@ -1117,37 +1127,71 @@ class ParticipationPolicyAgent:
         if gate_reason:
             return ParticipationDecision("observe", gate_reason, mode, 0.0)
 
-        fallback = ParticipationDecision(
-            "proactive_reply",
-            "active mode and topic looks discussable",
-            mode,
-            0.62,
-        )
+        traffic_level = self._traffic_level(snapshot)
         data = await _complete_json(
             self.llm,
             "你是 QQ 群拟人角色的插话决策器。只输出 JSON，不要解释。",
             (
                 "判断机器人此刻是否应该主动插话。只能输出 observe 或 proactive_reply。"
                 "不要为了展示能力而插话，要像群成员一样克制。"
+                "主动插话必须提供增量价值，不能只是附和、共情、改写或重复别人观点。"
+                "value_type 可选：answer、synthesis、missing_angle、useful_context、"
+                "clarifying_question、humor、agreement、empathy、rephrase、none。"
+                "只有 answer/synthesis/missing_angle/useful_context/clarifying_question 能稳定主动发言；"
+                "humor 只能在聊天不密集且确实很贴切时使用；agreement/empathy/rephrase/none 必须 observe。"
+                "如果最近 60 秒人类消息很多，只有能总结分歧、提出遗漏角度、补充有用上下文或问推进问题才插话。"
                 "输出 JSON："
-                '{"action":"observe|proactive_reply","score":0.0,"reason":"短原因"}\n'
+                '{"action":"observe|proactive_reply","score":0.0,'
+                '"value_type":"answer|synthesis|missing_angle|useful_context|clarifying_question|humor|agreement|empathy|rephrase|none",'
+                '"value_score":0.0,"reason":"短原因"}\n'
                 f"最近消息：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"最近60秒人类消息数：{snapshot.recent_human_messages_60s}\n"
+                f"最近120秒机器人消息数：{snapshot.recent_bot_messages_120s}\n"
+                f"聊天密度：{traffic_level}\n"
                 f"关系：{_format_relationship(snapshot)}\n"
                 f"感知：topics={perception.topics}, emotion={perception.emotion_hint}\n"
                 f"当前消息：{context.plain_text}"
             ),
         )
         if data:
-            action = str(data.get("action", fallback.action))
-            score = _clamp_float(data.get("score", fallback.score))
-            reason = str(data.get("reason", fallback.reason)).strip()[:160] or fallback.reason
-            if action == "proactive_reply" and score >= 0.55:
+            action = str(data.get("action", "observe"))
+            score = _clamp_float(data.get("score", 0.0))
+            value_type = _safe_participation_value_type(str(data.get("value_type", "none")).strip())
+            value_score = _clamp_float(data.get("value_score", 0.0))
+            reason = str(data.get("reason", "")).strip()[:160] or "active mode value decision"
+            min_value_score = self._min_value_score(snapshot)
+            if (
+                action == "proactive_reply"
+                and score >= 0.55
+                and value_score >= min_value_score
+                and _proactive_value_type_allowed(value_type, traffic_level)
+            ):
                 self._last_proactive_at[context.group_id] = int(time.time())
-                return ParticipationDecision("proactive_reply", reason, mode, score)
-            return ParticipationDecision("observe", reason, mode, score)
+                return ParticipationDecision(
+                    "proactive_reply",
+                    reason,
+                    mode,
+                    score,
+                    value_type,
+                    value_score,
+                    traffic_level,
+                )
+            if action == "proactive_reply":
+                reason = (
+                    f"proactive value gate rejected "
+                    f"({value_type}:{value_score:.2f}, need {min_value_score:.2f}); {reason}"
+                )
+            return ParticipationDecision("observe", reason, mode, score, value_type, value_score, traffic_level)
 
-        self._last_proactive_at[context.group_id] = int(time.time())
-        return fallback
+        return ParticipationDecision(
+            "observe",
+            "active mode but no verified incremental value",
+            mode,
+            0.0,
+            "none",
+            0.0,
+            traffic_level,
+        )
 
     def _active_gate_reason(
         self,
@@ -1163,10 +1207,22 @@ class ParticipationPolicyAgent:
         last = self._last_proactive_at.get(context.group_id, 0)
         if now - last < self.config.bot.proactive_cooldown_seconds:
             return "active mode but proactive cooldown is active"
+        if snapshot.recent_bot_messages_120s >= 1:
+            return "active mode but bot joined recently and was not asked"
         recent_bot_lines = [line for line in snapshot.recent_messages[-8:] if line.startswith("bot:")]
         if len(recent_bot_lines) >= 2:
             return "active mode but bot has spoken recently"
         return None
+
+    def _traffic_level(self, snapshot: ConversationSnapshot) -> str:
+        if snapshot.recent_human_messages_60s >= self.config.bot.proactive_busy_human_messages:
+            return "busy"
+        return "normal"
+
+    def _min_value_score(self, snapshot: ConversationSnapshot) -> float:
+        if self._traffic_level(snapshot) == "busy":
+            return self.config.bot.proactive_busy_value_threshold
+        return self.config.bot.proactive_value_threshold
 
 
 class SelfNarrativeAgent:
@@ -1425,6 +1481,8 @@ class ResponseAgent:
         system_prompt = (
             "你是一个自然参与 QQ 群聊天的拟人角色。"
             "回复要短、口语化、有一点自己的性格，但不要像客服或助手。"
+            "主动插话时必须提供新信息、总结分歧、提出遗漏角度、补充有用背景或问能推进讨论的问题。"
+            "主动插话时禁止只说赞同、共情、复述、热闹、哈哈或“确实”。"
             "不要解释你是模型，不要主动暴露系统设定。"
             "如果你提到自己的身份或经历，只能引用稳定人设、已知 self_memory 或本轮已批准自我记忆。"
             "不要临时新增未批准的具体经历。"
@@ -1442,6 +1500,7 @@ class ResponseAgent:
             f"群内词条：\n{_format_memories(snapshot.group_lexicon)}\n"
             f"对方消息：{context.plain_text}\n"
             f"参与决策：{decision.action}，原因：{decision.reason}\n"
+            f"主动价值：{decision.value_type}:{decision.value_score:.2f}，聊天密度：{decision.traffic_level}\n"
             f"请直接给出要发送到群里的中文回复，最多 {self.config.bot.max_reply_chars} 个字。"
         )
         llm_reply = await self.llm.complete_text(system_prompt, user_prompt)
@@ -1453,6 +1512,8 @@ class ResponseAgent:
                 snapshot,
                 approved_self_memories,
             )
+            if not _reply_has_incremental_value(guarded_reply, decision):
+                return ReplyDraft()
             return ReplyDraft(
                 text=guarded_reply,
                 self_memory_candidates=approved_self_memories,
@@ -1778,9 +1839,17 @@ class AgentPipeline:
             snapshot,
             self_memories,
         )
+        final_decision = decision
+        if decision.action == "proactive_reply" and not reply_draft.text:
+            final_decision = replace(
+                decision,
+                action="observe",
+                reason=f"{decision.reason}; proactive reply suppressed by value guard",
+                score=min(decision.score, 0.49),
+            )
         selected_sticker = await self.stickers.select(
             enriched_context,
-            decision,
+            final_decision,
             snapshot,
             reply_draft.text,
         )
@@ -1789,7 +1858,7 @@ class AgentPipeline:
             memories=[*lexicon_memories, *vision.memory_candidates],
             facts=[*facts, *vision.fact_candidates],
             relationship_delta=relationship_delta,
-            decision=decision,
+            decision=final_decision,
             reply=reply_draft.text,
             reply_self_memories=reply_draft.self_memory_candidates,
             image_descriptions=list(vision.attachment_descriptions or tuple(vision.descriptions)),
@@ -1885,6 +1954,30 @@ def _subject_for(owner_type: str, owner_id: str, context: MessageContext, claim_
 
 def _safe_claim_scope(value: str) -> str:
     return value if value in {"self_report", "third_party", "bot_directed", "group_fact"} else "self_report"
+
+
+def _safe_participation_value_type(value: str) -> ParticipationValueType:
+    allowed = {
+        "none",
+        "direct_reply",
+        "answer",
+        "synthesis",
+        "missing_angle",
+        "useful_context",
+        "clarifying_question",
+        "humor",
+        "agreement",
+        "empathy",
+        "rephrase",
+    }
+    return value if value in allowed else "none"  # type: ignore[return-value]
+
+
+def _proactive_value_type_allowed(value_type: str, traffic_level: str) -> bool:
+    high_value = {"answer", "synthesis", "missing_angle", "useful_context", "clarifying_question"}
+    if value_type in high_value:
+        return True
+    return traffic_level != "busy" and value_type == "humor"
 
 
 def _safe_fact_type(value: str) -> str:
@@ -2538,6 +2631,54 @@ def _sanitize_reply(reply: str, max_chars: int) -> str:
     text = re.sub(r"^回复[:：]\s*", "", text)
     text = text.replace("作为AI", "").replace("作为一个AI", "")
     return text[:max_chars].strip()
+
+
+def _reply_has_incremental_value(reply: str | None, decision: ParticipationDecision) -> bool:
+    if decision.action != "proactive_reply":
+        return True
+    text = _sanitize_reply(reply or "", 500)
+    if not text:
+        return False
+    if not _proactive_value_type_allowed(decision.value_type, decision.traffic_level):
+        return False
+    if _looks_like_low_value_proactive_reply(text):
+        return False
+    if decision.value_type == "clarifying_question":
+        return any(mark in text for mark in ("?", "？", "怎么", "为什么", "要不要", "是不是", "能不能"))
+    if decision.value_type == "humor":
+        return len(text) >= 6 and decision.traffic_level != "busy"
+    return len(text) >= 8
+
+
+def _looks_like_low_value_proactive_reply(text: str) -> bool:
+    compact = re.sub(r"[\s，。,.!！?？~～…、]+", "", text)
+    if not compact:
+        return True
+    exact_low_value = {
+        "确实",
+        "是的",
+        "对",
+        "对啊",
+        "有道理",
+        "我也觉得",
+        "我同意",
+        "同意",
+        "赞同",
+        "挺有意思",
+        "好像是这样",
+        "哈哈",
+        "哈哈哈",
+        "笑死",
+        "你们聊得好热闹",
+    }
+    if compact in exact_low_value:
+        return True
+    low_value_prefixes = ("确实", "我也觉得", "有道理", "挺有意思", "同意", "赞同", "哈哈")
+    if any(compact.startswith(prefix) for prefix in low_value_prefixes) and len(compact) < 18:
+        return True
+    if "你们聊得" in compact and len(compact) < 22:
+        return True
+    return False
 
 
 def _extract_topics(text: str) -> list[str]:

@@ -284,6 +284,9 @@ class BotStorage:
                     action TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     score REAL NOT NULL DEFAULT 0,
+                    value_type TEXT NOT NULL DEFAULT '',
+                    value_score REAL NOT NULL DEFAULT 0,
+                    traffic_level TEXT NOT NULL DEFAULT 'normal',
                     reply TEXT NOT NULL DEFAULT ''
                 );
                 """
@@ -1282,6 +1285,40 @@ class BotStorage:
                 lines.append(f"{name}: {text}")
         return lines
 
+    def get_recent_activity_counts(
+        self,
+        group_id: str,
+        human_window_seconds: int = 60,
+        bot_window_seconds: int = 120,
+    ) -> tuple[int, int]:
+        now = int(time.time())
+        with self._connect() as conn:
+            human_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(1) AS count
+                    FROM messages
+                    WHERE group_id = ?
+                      AND time >= ?
+                      AND sender_role != 'bot'
+                    """,
+                    (str(group_id), now - int(human_window_seconds)),
+                ).fetchone()["count"]
+            )
+            bot_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(1) AS count
+                    FROM messages
+                    WHERE group_id = ?
+                      AND time >= ?
+                      AND sender_role = 'bot'
+                    """,
+                    (str(group_id), now - int(bot_window_seconds)),
+                ).fetchone()["count"]
+            )
+        return human_count, bot_count
+
     def get_recent_image_descriptions(self, group_id: str, limit: int = 8) -> list[str]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1774,8 +1811,11 @@ class BotStorage:
         return items[:limit]
 
     def build_snapshot(self, context: MessageContext) -> ConversationSnapshot:
+        human_count, bot_count = self.get_recent_activity_counts(context.group_id)
         return ConversationSnapshot(
             recent_messages=self.get_recent_messages(context.group_id, limit=12),
+            recent_human_messages_60s=human_count,
+            recent_bot_messages_120s=bot_count,
             recent_image_descriptions=self.get_recent_image_descriptions(context.group_id, limit=8),
             sticker_assets=self.list_sticker_assets(
                 context.group_id,
@@ -1905,9 +1945,10 @@ class BotStorage:
             conn.execute(
                 """
                 INSERT INTO bot_decisions (
-                    time, group_id, user_id, message_id, mode, action, reason, score, reply
+                    time, group_id, user_id, message_id, mode, action, reason, score,
+                    value_type, value_score, traffic_level, reply
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(time.time()),
@@ -1918,6 +1959,9 @@ class BotStorage:
                     decision.action,
                     decision.reason,
                     decision.score,
+                    decision.value_type,
+                    decision.value_score,
+                    decision.traffic_level,
                     reply or "",
                 ),
             )
@@ -1926,7 +1970,8 @@ class BotStorage:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT time, user_id, message_id, mode, action, reason, score, reply
+                SELECT time, user_id, message_id, mode, action, reason, score,
+                       value_type, value_score, traffic_level, reply
                 FROM bot_decisions
                 WHERE group_id = ?
                 ORDER BY id DESC
@@ -1943,6 +1988,8 @@ class BotStorage:
             f"mode={row['mode']}\n"
             f"action={row['action']}\n"
             f"score={row['score']:.2f}\n"
+            f"value={row['value_type'] or 'none'}:{row['value_score']:.2f}\n"
+            f"traffic={row['traffic_level'] or 'normal'}\n"
             f"reason={row['reason']}\n"
             f"reply={row['reply'] or '(none)'}"
         )
@@ -2101,6 +2148,16 @@ class BotStorage:
         }
         for name, statement in additions.items():
             if name not in columns:
+                conn.execute(statement)
+
+        decision_columns = {row["name"] for row in conn.execute("PRAGMA table_info(bot_decisions)").fetchall()}
+        decision_additions = {
+            "value_type": "ALTER TABLE bot_decisions ADD COLUMN value_type TEXT NOT NULL DEFAULT ''",
+            "value_score": "ALTER TABLE bot_decisions ADD COLUMN value_score REAL NOT NULL DEFAULT 0",
+            "traffic_level": "ALTER TABLE bot_decisions ADD COLUMN traffic_level TEXT NOT NULL DEFAULT 'normal'",
+        }
+        for name, statement in decision_additions.items():
+            if name not in decision_columns:
                 conn.execute(statement)
 
     def _seed_config(self, conn: sqlite3.Connection) -> None:

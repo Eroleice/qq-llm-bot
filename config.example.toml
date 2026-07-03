@@ -9,6 +9,9 @@ admin_ids = ["100001"]
 enabled_groups = ["200001"]
 default_group_mode = "passive"
 proactive_cooldown_seconds = 90
+proactive_value_threshold = 0.65
+proactive_busy_value_threshold = 0.78
+proactive_busy_human_messages = 6
 max_reply_chars = 180
 
 [persona]

@@ -29,6 +29,9 @@ class BotConfig:
     enabled_groups: list[str] = field(default_factory=list)
     default_group_mode: ParticipationMode = "passive"
     proactive_cooldown_seconds: int = 90
+    proactive_value_threshold: float = 0.65
+    proactive_busy_value_threshold: float = 0.78
+    proactive_busy_human_messages: int = 6
     max_reply_chars: int = 180
 
 
@@ -196,6 +199,22 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         proactive_cooldown_seconds=_positive_int(
             bot_raw.get("proactive_cooldown_seconds", 90),
             "bot.proactive_cooldown_seconds",
+        ),
+        proactive_value_threshold=_float_in_range(
+            bot_raw.get("proactive_value_threshold", 0.65),
+            "bot.proactive_value_threshold",
+            0,
+            1,
+        ),
+        proactive_busy_value_threshold=_float_in_range(
+            bot_raw.get("proactive_busy_value_threshold", 0.78),
+            "bot.proactive_busy_value_threshold",
+            0,
+            1,
+        ),
+        proactive_busy_human_messages=_positive_int(
+            bot_raw.get("proactive_busy_human_messages", 6),
+            "bot.proactive_busy_human_messages",
         ),
         max_reply_chars=_positive_int(bot_raw.get("max_reply_chars", 180), "bot.max_reply_chars"),
     )

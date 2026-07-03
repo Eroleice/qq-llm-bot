@@ -8,7 +8,9 @@ from pathlib import Path
 from qq_llm_bot.cognitive_agents import (
     AgentPipeline,
     FactExtractorAgent,
+    ParticipationPolicyAgent,
     RelationshipAgent,
+    ResponseAgent,
     StickerSelectorAgent,
     VisionAgent,
 )
@@ -579,6 +581,149 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(selected, asset)
+
+    async def test_active_participation_rejects_agreement_only_value(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        agent = ParticipationPolicyAgent(
+            config,
+            FakeLLM(
+                [
+                    '{"action":"proactive_reply","score":0.9,"value_type":"agreement",'
+                    '"value_score":0.95,"reason":"只是赞同上一位群友"}'
+                ]
+            ),
+        )
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-active",
+            plain_text="这个活动就是负期望彩票，抽多了肯定亏",
+            raw_message="这个活动就是负期望彩票，抽多了肯定亏",
+        )
+        perception = PerceptionResult(
+            is_question=False,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["游戏活动"],
+            confidence=0.8,
+        )
+
+        decision = await agent.decide(context, perception, "active", ConversationSnapshot(recent_human_messages_60s=3))
+
+        self.assertEqual(decision.action, "observe")
+        self.assertEqual(decision.value_type, "agreement")
+        self.assertIn("value gate rejected", decision.reason)
+
+    async def test_busy_chat_requires_high_value_proactive_reply(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        agent = ParticipationPolicyAgent(
+            config,
+            FakeLLM(
+                [
+                    '{"action":"proactive_reply","score":0.9,"value_type":"humor",'
+                    '"value_score":0.96,"reason":"想接一个轻松梗"}'
+                ]
+            ),
+        )
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-busy",
+            plain_text="这版本到底该不该抽，感觉大家说法完全不一样",
+            raw_message="这版本到底该不该抽，感觉大家说法完全不一样",
+        )
+        perception = PerceptionResult(
+            is_question=True,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["游戏"],
+            confidence=0.85,
+        )
+
+        decision = await agent.decide(context, perception, "active", ConversationSnapshot(recent_human_messages_60s=8))
+
+        self.assertEqual(decision.action, "observe")
+        self.assertEqual(decision.traffic_level, "busy")
+        self.assertEqual(decision.value_type, "humor")
+
+    async def test_active_participation_accepts_synthesis_value(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        agent = ParticipationPolicyAgent(
+            config,
+            FakeLLM(
+                [
+                    '{"action":"proactive_reply","score":0.86,"value_type":"synthesis",'
+                    '"value_score":0.82,"reason":"可以整理两边观点的差异"}'
+                ]
+            ),
+        )
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-synthesis",
+            plain_text="一个人说要抽，一个人说等复刻，我有点纠结",
+            raw_message="一个人说要抽，一个人说等复刻，我有点纠结",
+        )
+        perception = PerceptionResult(
+            is_question=False,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["游戏"],
+            confidence=0.85,
+        )
+
+        decision = await agent.decide(context, perception, "active", ConversationSnapshot(recent_human_messages_60s=3))
+
+        self.assertEqual(decision.action, "proactive_reply")
+        self.assertEqual(decision.value_type, "synthesis")
+
+    async def test_proactive_response_suppresses_low_value_agreement(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        agent = ResponseAgent(config, FakeLLM(["确实，我也觉得"]))
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-reply",
+            plain_text="这池子就是亏",
+            raw_message="这池子就是亏",
+        )
+        perception = PerceptionResult(False, False, False, ["游戏"], "neutral", 0.8)
+        decision = ParticipationDecision(
+            "proactive_reply",
+            "can add context",
+            "active",
+            0.9,
+            "useful_context",
+            0.8,
+        )
+
+        draft = await agent.generate(context, perception, decision, ConversationSnapshot())
+
+        self.assertIsNone(draft.text)
+
+    async def test_proactive_response_allows_incremental_synthesis(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        agent = ResponseAgent(config, FakeLLM(["可以拆成两点：想要角色就抽，追性价比就等复刻。"]))
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-reply-ok",
+            plain_text="这版本到底该不该抽",
+            raw_message="这版本到底该不该抽",
+        )
+        perception = PerceptionResult(True, False, False, ["游戏"], "neutral", 0.8)
+        decision = ParticipationDecision(
+            "proactive_reply",
+            "can synthesize tradeoffs",
+            "active",
+            0.9,
+            "synthesis",
+            0.82,
+        )
+
+        draft = await agent.generate(context, perception, decision, ConversationSnapshot())
+
+        self.assertEqual(draft.text, "可以拆成两点：想要角色就抽，追性价比就等复刻。")
 
     async def test_lexicon_learning_creates_group_memory_without_reply_in_silent(self) -> None:
         config = replace(
@@ -1563,6 +1708,37 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(pending[0]["item_type"], "fact")
             self.assertEqual(pending[0]["approve_command"], f"#bot facts approve {pending[0]['id']}")
             self.assertEqual(pending[0]["reject_command"], f"#bot facts reject {pending[0]['id']}")
+
+    def test_last_decision_includes_proactive_value_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-decision",
+                plain_text="聊聊这个活动",
+                raw_message="聊聊这个活动",
+            )
+            storage.record_decision(
+                context,
+                ParticipationDecision(
+                    "observe",
+                    "proactive value gate rejected",
+                    "active",
+                    0.4,
+                    "agreement",
+                    0.2,
+                    "busy",
+                ),
+                None,
+            )
+
+            text = storage.get_last_decision("100")
+
+            self.assertIn("value=agreement:0.20", text)
+            self.assertIn("traffic=busy", text)
 
 
 if __name__ == "__main__":

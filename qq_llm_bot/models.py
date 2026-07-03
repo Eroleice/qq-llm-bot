@@ -6,6 +6,19 @@ from typing import Literal
 from qq_llm_bot.config import ParticipationMode
 
 DecisionAction = Literal["observe", "reply", "proactive_reply"]
+ParticipationValueType = Literal[
+    "none",
+    "direct_reply",
+    "answer",
+    "synthesis",
+    "missing_angle",
+    "useful_context",
+    "clarifying_question",
+    "humor",
+    "agreement",
+    "empathy",
+    "rephrase",
+]
 MemoryStatus = Literal["active", "candidate", "pending_confirmation", "conflict", "rejected", "forgotten"]
 ClaimScope = Literal["self_report", "third_party", "bot_directed", "group_fact"]
 VerificationStatus = Literal["accepted", "pending_confirmation", "conflict", "rejected"]
@@ -226,6 +239,8 @@ class RelationDelta:
 @dataclass(frozen=True)
 class ConversationSnapshot:
     recent_messages: list[str] = field(default_factory=list)
+    recent_human_messages_60s: int = 0
+    recent_bot_messages_120s: int = 0
     recent_image_descriptions: list[str] = field(default_factory=list)
     sticker_assets: list[StickerAssetRecord] = field(default_factory=list)
     user_memories: list[MemoryRecord] = field(default_factory=list)
@@ -244,6 +259,9 @@ class ParticipationDecision:
     reason: str
     mode: ParticipationMode
     score: float = 0.0
+    value_type: ParticipationValueType = "none"
+    value_score: float = 0.0
+    traffic_level: str = "normal"
 
 
 @dataclass(frozen=True)

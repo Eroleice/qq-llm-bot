@@ -74,7 +74,19 @@ http://127.0.0.1:8080/dashboard
 
 - `silent`：只记录与观察，普通消息不回复。
 - `passive`：仅在被 @、被叫昵称、或被明确提及时回复。
-- `active`：允许主动参与，但受冷却、最近发言频率、话题相关性和 LLM 决策共同约束。
+- `active`：允许主动参与，但必须通过“增量价值”门控；只附和、共情、复述或说热闹时会继续旁听。
+
+主动参与阈值：
+
+```toml
+[bot]
+proactive_cooldown_seconds = 90
+proactive_value_threshold = 0.65
+proactive_busy_value_threshold = 0.78
+proactive_busy_human_messages = 6
+```
+
+`active` 模式下，机器人只有在能回答问题、总结分歧、提出遗漏角度、补充有用上下文或问一个能推进讨论的问题时才主动插话；聊天密集时阈值更高，轻量接梗也会被压住。
 
 ## 当前落地范围
 
@@ -82,7 +94,7 @@ http://127.0.0.1:8080/dashboard
 - 已实现管理员与群白名单配置。
 - 已实现群状态机：`silent | passive | active`。
 - 已实现群消息 SQLite 记录、上下文检索、成员 FACT、全局成员画像、自我记忆、群复盘和关系记录。
-- 已实现结构化 LLM agents pipeline：感知、FACT 抽取、关系变化、参与决策、回复生成、回复后自我记忆账本。
+- 已实现结构化 LLM agents pipeline：感知、FACT 抽取、关系变化、增量价值参与决策、回复生成、回复后自我记忆账本。
 - 已实现保守记忆写入：低置信候选拒绝，冲突候选标记为 `conflict`，不会覆盖旧记忆。
 - 已实现成员认知防投毒策略：本人 FACT 达阈值直接采信，第三方转述按信任度进入 `accepted` 或 `pending_confirmation`，管理员可批准或拒绝。
 - 已实现受控词条学习：发现疑似网络用语、玩梗或圈层黑话时，可按配置联网搜索并形成 `group/lexicon` 记忆。
