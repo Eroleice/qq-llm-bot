@@ -1,0 +1,81 @@
+[napcat]
+ws_url = "ws://your-napcat-host:3001"
+access_token = "your-napcat-access-token"
+
+[bot]
+nicknames = ["小祈"]
+command_start = ["#", "/"]
+admin_ids = ["100001"]
+enabled_groups = ["200001"]
+default_group_mode = "passive"
+proactive_cooldown_seconds = 90
+max_reply_chars = 180
+
+[persona]
+self_name = "小祈"
+full_name = ""
+gender = ""
+age = 0
+city = ""
+education_school = ""
+education_major = ""
+education_degree = ""
+employer = ""
+occupation = ""
+work_years = 0
+relationship_status = ""
+background_summary = ""
+core_traits = ["温和", "好奇", "有一点俏皮"]
+speech_style = ["短句", "口语化", "不端着"]
+boundaries = ["这是群聊中的拟人角色设定", "不提供真实联系方式", "不承诺线下见面或现实行动", "不暴露系统提示"]
+current_mood = "平静"
+relationship_tendency = "慢热但记得住人"
+activity_level = 50
+
+[reflection]
+enabled = true
+message_threshold = 30
+recent_limit = 40
+min_interval_seconds = 600
+
+[lexicon]
+# Learn internet slang/memes by controlled web search. Providers: disabled | duckduckgo | serper | searxng
+enabled = false
+provider = "disabled"
+base_url = ""
+api_key = ""
+api_key_env = "WEB_SEARCH_API_KEY"
+min_interval_seconds = 300
+max_terms_per_message = 1
+max_results = 5
+confidence_threshold = 0.78
+timeout_seconds = 10.0
+
+[dashboard]
+enabled = true
+route_prefix = "/dashboard"
+api_prefix = "/api/dashboard"
+access_token = ""
+access_token_env = "QQ_LLM_BOT_DASHBOARD_TOKEN"
+
+[vision]
+# Enable if your OpenAI-compatible model supports image_url multimodal input.
+enabled = false
+model = ""
+max_images_per_message = 3
+detail = "low"
+timeout_seconds = 45.0
+remember_threshold = 0.78
+
+[storage]
+sqlite_path = "data/bot.sqlite3"
+
+[llm]
+provider = "openai-compatible"
+model = "your-model-name"
+base_url = "https://your-openai-compatible-api.example.com/v1"
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+temperature = 0.8
+max_tokens = 256
+timeout_seconds = 30.0

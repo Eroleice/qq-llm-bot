@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+from qq_llm_bot.config import ParticipationMode
+
+DecisionAction = Literal["observe", "reply", "proactive_reply"]
+MemoryStatus = Literal["active", "candidate", "pending_confirmation", "conflict", "rejected", "forgotten"]
+ClaimScope = Literal["self_report", "third_party", "bot_directed", "group_fact"]
+VerificationStatus = Literal["accepted", "pending_confirmation", "conflict", "rejected"]
+
+
+@dataclass(frozen=True)
+class MessageAttachment:
+    attachment_type: Literal["image"]
+    file: str = ""
+    url: str = ""
+    summary: str = ""
+    raw_data: str = ""
+
+
+@dataclass(frozen=True)
+class ImageVisionCacheRecord:
+    url: str
+    description: str
+    ocr_text: str = ""
+    topics: tuple[str, ...] = ()
+    memory: str = ""
+    confidence: float = 0.0
+    importance: float = 0.5
+    model: str = ""
+    created_at: int = 0
+    updated_at: int = 0
+    last_seen_at: int = 0
+    hit_count: int = 0
+
+
+@dataclass(frozen=True)
+class MessageContext:
+    group_id: str
+    user_id: str
+    message_id: str
+    plain_text: str
+    raw_message: str
+    sender_name: str = ""
+    sender_role: str = ""
+    is_direct: bool = False
+    timestamp: int = 0
+    attachments: list[MessageAttachment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PerceptionResult:
+    is_question: bool
+    is_self_disclosure: bool
+    mentions_bot: bool
+    topics: list[str] = field(default_factory=list)
+    emotion_hint: str = "neutral"
+    confidence: float = 0.5
+
+
+@dataclass(frozen=True)
+class MemoryCandidate:
+    owner_type: Literal["user", "self", "group"]
+    owner_id: str
+    kind: str
+    content: str
+    confidence: float
+    evidence_message_id: str
+    importance: float = 0.5
+    source_text: str = ""
+    status: MemoryStatus = "candidate"
+    conflict_of: int | None = None
+    source_user_id: str = ""
+    source_group_id: str = ""
+    subject_user_id: str = ""
+    claim_scope: ClaimScope = "self_report"
+    verification_status: VerificationStatus = "pending_confirmation"
+
+
+@dataclass(frozen=True)
+class MemoryRecord:
+    id: int
+    owner_type: str
+    owner_id: str
+    kind: str
+    content: str
+    confidence: float
+    importance: float
+    status: str
+    updated_at: int
+    source_user_id: str = ""
+    source_group_id: str = ""
+    subject_user_id: str = ""
+    claim_scope: str = "self_report"
+    verification_status: str = "accepted"
+
+
+@dataclass(frozen=True)
+class MemoryWriteSet:
+    accepted: list[MemoryCandidate] = field(default_factory=list)
+    pending: list[MemoryCandidate] = field(default_factory=list)
+    conflicts: list[MemoryCandidate] = field(default_factory=list)
+    rejected: list[MemoryCandidate] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RelationshipState:
+    group_id: str
+    user_id: str
+    closeness: int = 0
+    trust: int = 0
+    familiarity: int = 0
+    tension: int = 0
+    summary: str = ""
+
+
+@dataclass(frozen=True)
+class RelationDelta:
+    closeness: int = 0
+    trust: int = 0
+    familiarity: int = 0
+    tension: int = 0
+    summary_patch: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ConversationSnapshot:
+    recent_messages: list[str] = field(default_factory=list)
+    recent_image_descriptions: list[str] = field(default_factory=list)
+    user_memories: list[MemoryRecord] = field(default_factory=list)
+    self_memories: list[MemoryRecord] = field(default_factory=list)
+    group_reflections: list[MemoryRecord] = field(default_factory=list)
+    group_lexicon: list[MemoryRecord] = field(default_factory=list)
+    relationship: RelationshipState | None = None
+    persona_lines: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ParticipationDecision:
+    action: DecisionAction
+    reason: str
+    mode: ParticipationMode
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
+class ReplyDraft:
+    text: str | None = None
+    self_memory_candidates: list[MemoryCandidate] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PipelineResult:
+    perception: PerceptionResult
+    memories: list[MemoryCandidate]
+    relationship_delta: RelationDelta
+    decision: ParticipationDecision
+    reply: str | None = None
+    reply_self_memories: list[MemoryCandidate] = field(default_factory=list)
+    image_descriptions: list[str] = field(default_factory=list)
