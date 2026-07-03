@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from qq_llm_bot.cognitive_agents import AgentPipeline, VisionAgent
+from qq_llm_bot.cognitive_agents import AgentPipeline, RelationshipAgent, VisionAgent
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import (
     AppConfig,
@@ -24,6 +24,7 @@ from qq_llm_bot.models import (
     MemoryRecord,
     MessageAttachment,
     MessageContext,
+    PerceptionResult,
     RelationDelta,
 )
 from qq_llm_bot.web_search import SearchResult
@@ -119,6 +120,35 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.decision.action, "observe")
         self.assertIsNone(result.reply)
+
+    async def test_relationship_agent_does_not_summarize_message_logs(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
+                '"summary_patch":"分享冰淇淋图片","reason":"observed"}'
+            ]
+        )
+        agent = RelationshipAgent(llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="814207765",
+            message_id="m-log",
+            plain_text="",
+            raw_message="[CQ:image]",
+        )
+        perception = PerceptionResult(
+            is_question=False,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["冰淇淋"],
+            emotion_hint="neutral",
+            confidence=0.9,
+        )
+
+        result = await agent.calculate_delta(context, perception, ConversationSnapshot())
+
+        self.assertEqual(result.familiarity, 1)
+        self.assertEqual(result.summary_patch, "")
 
     async def test_self_narrative_is_prepared_before_reply(self) -> None:
         llm = FakeLLM(
@@ -855,6 +885,45 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(items[0]["user_id"], "42")
             self.assertEqual(items[0]["relationship"]["trust"], 3)  # type: ignore[index]
             self.assertEqual(items[0]["profile"][0]["content"], "喜欢海边")  # type: ignore[index]
+
+    def test_relationship_summary_filters_low_value_message_log_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            with storage._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO relationships (
+                        group_id, user_id, closeness, trust, familiarity, tension, summary, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "100",
+                        "814207765",
+                        0,
+                        0,
+                        1,
+                        0,
+                        "分享冰淇淋图片；发表负面群体类比；表达看阅兵时的无力感；"
+                        "发送空消息；讨论技术与玩家便利性角度；解释因为是60帧",
+                        10,
+                    ),
+                )
+
+            self.assertEqual(storage.get_relationship("100", "814207765").summary, "")
+            storage.apply_relationship_delta(
+                "100",
+                "814207765",
+                RelationDelta(closeness=1, familiarity=1, summary_patch="主动找可可讨论技术问题"),
+            )
+
+            relation = storage.get_relationship("100", "814207765")
+            items = storage.list_dashboard_user_cognition(group_id="100", user_id="814207765")
+
+            self.assertEqual(relation.summary, "主动找可可讨论技术问题")
+            self.assertEqual(items[0]["relationship"]["summary"], "主动找可可讨论技术问题")  # type: ignore[index]
 
     def test_dashboard_user_cognition_groups_by_qq_id_across_groups(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,6 +22,7 @@ from qq_llm_bot.models import (
     RelationDelta,
     RelationshipState,
 )
+from qq_llm_bot.relationship_summary import merge_relationship_summary
 
 CONFLICT_SENSITIVE_KINDS = {
     "alias",
@@ -642,7 +643,7 @@ class BotStorage:
             trust=int(row["trust"]),
             familiarity=int(row["familiarity"]),
             tension=int(row["tension"]),
-            summary=str(row["summary"] or ""),
+            summary=merge_relationship_summary("", str(row["summary"] or "")),
         )
 
     def apply_relationship_delta(self, group_id: str, user_id: str, delta: RelationDelta) -> RelationshipState:
@@ -1898,10 +1899,4 @@ def _self_object_terms(content: str) -> set[str]:
 
 
 def _merge_summary(current: str, patch: str) -> str:
-    patch = " ".join(patch.split())
-    if not patch:
-        return current
-    if patch in current:
-        return current
-    merged = f"{current}；{patch}" if current else patch
-    return merged[-500:]
+    return merge_relationship_summary(current, patch)

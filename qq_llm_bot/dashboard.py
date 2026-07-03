@@ -554,7 +554,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
                 <div class="key">信任</div><div>${relation.trust ?? 0}</div>
                 <div class="key">熟悉</div><div>${relation.familiarity ?? 0}</div>
                 <div class="key">紧张</div><div>${relation.tension ?? 0}</div>
-                <div class="key">关系摘要</div><div>${escapeHtml(relation.summary || "(empty)")}</div>
+                <div class="key">关系洞察</div><div>${escapeHtml(relation.summary || "(empty)")}</div>
               </div>
               ${profile.length ? profile.map(memoryHtml).join("") : `<div class="memory muted">暂无画像记忆。</div>`}
             </div>`;

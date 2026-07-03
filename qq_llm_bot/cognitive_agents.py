@@ -22,6 +22,7 @@ from qq_llm_bot.models import (
     RelationDelta,
     ReplyDraft,
 )
+from qq_llm_bot.relationship_summary import clean_relationship_summary_patch
 from qq_llm_bot.web_search import SearchResult, WebSearchClient, build_web_search_client, default_slang_query
 
 
@@ -757,9 +758,12 @@ class RelationshipAgent:
             (
                 "评估这条消息对机器人与说话人的关系影响。"
                 "delta 必须是 -3 到 3 的整数，轻微互动通常 familiarity +1。"
+                "summary_patch 只记录稳定的关系洞察，例如互动风格、信任来源、紧张点、"
+                "用户如何使用或对待机器人；没有这类信号时必须输出空字符串。"
+                "不要记录普通话题、图片/截图/梗图、空消息、一次性情绪或流水账事件。"
                 "输出 JSON："
                 '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
-                '"summary_patch":"短句","reason":"短原因"}\n'
+                '"summary_patch":"关系洞察短句或空字符串","reason":"短原因"}\n'
                 f"当前关系：{_format_relationship(snapshot)}\n"
                 f"感知：topics={perception.topics}, emotion={perception.emotion_hint}, direct={context.is_direct}\n"
                 f"消息：{context.plain_text}"
@@ -772,7 +776,9 @@ class RelationshipAgent:
             trust=_clamp_delta(data.get("trust", fallback.trust)),
             familiarity=_clamp_delta(data.get("familiarity", fallback.familiarity)),
             tension=_clamp_delta(data.get("tension", fallback.tension)),
-            summary_patch=str(data.get("summary_patch", fallback.summary_patch)).strip()[:120],
+            summary_patch=clean_relationship_summary_patch(
+                str(data.get("summary_patch", fallback.summary_patch))
+            ),
             reason=str(data.get("reason", fallback.reason)).strip()[:120],
         )
 
