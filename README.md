@@ -51,6 +51,9 @@ http://127.0.0.1:8080/dashboard
 #bot memory conflicts
 #bot memory approve <memory_id>
 #bot memory reject <memory_id>
+#bot stickers list [数量]
+#bot stickers enable <sticker_id>
+#bot stickers disable <sticker_id>
 #bot relation <qq_id>
 #bot persona show
 #bot persona self
@@ -81,6 +84,7 @@ http://127.0.0.1:8080/dashboard
 - 已实现自我叙事治理：机器人可生成轻量虚构的自我偏好、习惯和小经历，但必须先通过一致性检查并写入 `self` 记忆后再引用。
 - 已实现本地 Web 看板：按 tab 查看机器人自我设定、成员画像与关系、群聊记录、待确认/冲突记忆。
 - 已实现多模态识图：可解析 OneBot 图片消息，调用支持 `image_url` 的 OpenAI-compatible 模型生成图片摘要、OCR 和保守群记忆。
+- 已实现表情包学习与发送：可识别聊天图片中的表情包/梗图，分析适合使用的场景，下载保存到本地，并在回复时保守选择合适表情发送。
 
 ## 本地看板
 
@@ -176,6 +180,33 @@ remember_threshold = 0.78
 - 图片附件和视觉摘要会显示在看板的群聊记录里。
 
 隐私策略默认保守：不做人脸身份识别，不猜测真实人物身份，不把身份证、手机号、住址、密码等敏感信息写入长期记忆。
+
+## 表情包学习
+
+表情包功能依赖图片理解。启用后，机器人会从群聊图片中识别明显的表情包、梗图或反应图，分析它适合表达的情绪和使用场景，并下载到本地：
+
+```toml
+[vision]
+enabled = true
+
+[stickers]
+enabled = true
+storage_dir = "data/stickers"
+min_confidence = 0.72
+selection_threshold = 0.68
+max_context_stickers = 24
+download_timeout_seconds = 20.0
+max_download_bytes = 8388608
+send_cooldown_seconds = 120
+```
+
+机器人只会在已经决定要回复时考虑附带表情；如果语境严肃、匹配度不够或处于冷却期，就只发文字。管理员可管理本群表情库：
+
+```text
+#bot stickers list [数量]
+#bot stickers disable <sticker_id>
+#bot stickers enable <sticker_id>
+```
 
 ## 自我叙事治理
 

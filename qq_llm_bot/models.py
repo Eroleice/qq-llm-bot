@@ -37,6 +37,41 @@ class ImageVisionCacheRecord:
 
 
 @dataclass(frozen=True)
+class StickerCandidate:
+    url: str
+    file: str = ""
+    description: str = ""
+    ocr_text: str = ""
+    mood: str = ""
+    usage: str = ""
+    tags: tuple[str, ...] = ()
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class StickerAssetRecord:
+    id: int
+    group_id: str
+    source_user_id: str
+    source_message_id: str
+    url: str
+    file: str
+    local_path: str
+    sha256: str
+    description: str
+    ocr_text: str
+    mood: str
+    usage: str
+    tags: tuple[str, ...]
+    confidence: float
+    enabled: bool
+    created_at: int
+    updated_at: int
+    last_seen_at: int
+    hit_count: int = 0
+
+
+@dataclass(frozen=True)
 class MessageContext:
     group_id: str
     user_id: str
@@ -131,6 +166,7 @@ class RelationDelta:
 class ConversationSnapshot:
     recent_messages: list[str] = field(default_factory=list)
     recent_image_descriptions: list[str] = field(default_factory=list)
+    sticker_assets: list[StickerAssetRecord] = field(default_factory=list)
     user_memories: list[MemoryRecord] = field(default_factory=list)
     self_memories: list[MemoryRecord] = field(default_factory=list)
     group_reflections: list[MemoryRecord] = field(default_factory=list)
@@ -162,3 +198,5 @@ class PipelineResult:
     reply: str | None = None
     reply_self_memories: list[MemoryCandidate] = field(default_factory=list)
     image_descriptions: list[str] = field(default_factory=list)
+    sticker_candidates: list[StickerCandidate] = field(default_factory=list)
+    selected_sticker: StickerAssetRecord | None = None

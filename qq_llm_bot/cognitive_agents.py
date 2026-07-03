@@ -21,6 +21,8 @@ from qq_llm_bot.models import (
     PipelineResult,
     RelationDelta,
     ReplyDraft,
+    StickerAssetRecord,
+    StickerCandidate,
 )
 from qq_llm_bot.relationship_summary import clean_relationship_summary_patch
 from qq_llm_bot.web_search import SearchResult, WebSearchClient, build_web_search_client, default_slang_query
@@ -40,6 +42,7 @@ class VisionAnalysis:
     ocr_text: str = ""
     topics: tuple[str, ...] = ()
     memory_candidates: tuple[MemoryCandidate, ...] = ()
+    sticker_candidates: tuple[StickerCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,11 @@ class VisionImageResult:
     memory: str = ""
     confidence: float = 0.0
     importance: float = 0.5
+    is_sticker: bool = False
+    sticker_mood: str = ""
+    sticker_usage: str = ""
+    sticker_tags: tuple[str, ...] = ()
+    sticker_confidence: float = 0.0
 
 
 class VisionCacheStore(Protocol):
@@ -548,6 +556,7 @@ class VisionAgent:
         cached_results, missing_urls = self._load_cached_results(image_urls)
         fresh_results: dict[str, VisionImageResult] = {}
         if missing_urls:
+            sticker_prompt = self._sticker_prompt()
             data = await _complete_vision_json(
                 self.llm,
                 self.config,
@@ -557,9 +566,12 @@ class VisionAgent:
                     "不要识别或猜测真实人物身份，不要推断敏感个人信息。"
                     "如果是截图，可做简短 OCR；如果是表情包/梗图，可描述梗点。"
                     "长期记忆只记录非隐私、对群聊上下文有帮助的图片观察。"
+                    f"{sticker_prompt}"
                     "输出 JSON："
                     '{"images":[{"description":"图像简述","ocr_text":"可空","topics":["话题"],'
-                    '"should_remember":bool,"memory":"可空","confidence":0.0,"importance":0.0}]}\n'
+                    '"should_remember":bool,"memory":"可空","confidence":0.0,"importance":0.0,'
+                    '"is_sticker":bool,"sticker_mood":"可空","sticker_usage":"可空",'
+                    '"sticker_tags":["可空"],"sticker_confidence":0.0}]}\n'
                     f"发言人 QQ：{context.user_id}\n"
                     f"随图文字：{context.plain_text or '(none)'}"
                 ),
@@ -574,6 +586,16 @@ class VisionAgent:
         if not results_by_url:
             return fallback
         return self._build_analysis_from_results(context, image_urls, results_by_url, fallback)
+
+    def _sticker_prompt(self) -> str:
+        if not self.config.stickers.enabled:
+            return ""
+        return (
+            "同时判断图片是否适合作为聊天表情包/梗图/反应图长期保存。"
+            "只有明显用于表达情绪、吐槽、调侃、安慰、震惊、无语、庆祝等聊天反应时，"
+            "is_sticker 才为 true。sticker_usage 写清适合什么时候发，"
+            "例如“对方犯困时轻轻吐槽”“大家都在笑时接梗”。"
+        )
 
     def _load_cached_results(
         self,
@@ -592,6 +614,17 @@ class VisionAgent:
                     memory=record.memory,
                     confidence=record.confidence,
                     importance=record.importance,
+                    is_sticker=(
+                        self.config.stickers.enabled
+                        and record.confidence >= self.config.stickers.min_confidence
+                        and _looks_like_sticker_image(
+                            record.description,
+                            record.ocr_text,
+                            record.topics,
+                        )
+                    ),
+                    sticker_tags=record.topics,
+                    sticker_confidence=record.confidence,
                 )
             else:
                 missing.append(url)
@@ -625,6 +658,7 @@ class VisionAgent:
         ocr_text = _clean_image_text(str(item.get("ocr_text", "")))
         confidence = _clamp_float(item.get("confidence", 0.0))
         importance = _clamp_float(item.get("importance", 0.5))
+        topics = tuple(_clean_list(item.get("topics"))[:5])
         memory_text = _clean_image_text(str(item.get("memory", "")))
         should_remember = _as_bool(item.get("should_remember"), False)
         if (
@@ -637,11 +671,33 @@ class VisionAgent:
             url=url,
             description=description,
             ocr_text=ocr_text,
-            topics=tuple(_clean_list(item.get("topics"))[:5]),
+            topics=topics,
             memory=memory_text,
             confidence=confidence,
             importance=importance,
+            is_sticker=self._is_sticker_item(item, description, ocr_text, topics, confidence),
+            sticker_mood=_clean_sticker_text(str(item.get("sticker_mood", "")), limit=80),
+            sticker_usage=_clean_sticker_text(str(item.get("sticker_usage", "")), limit=240),
+            sticker_tags=tuple(_clean_list(item.get("sticker_tags"))[:8]),
+            sticker_confidence=_clamp_float(item.get("sticker_confidence", confidence)),
         )
+
+    def _is_sticker_item(
+        self,
+        item: dict[str, Any],
+        description: str,
+        ocr_text: str,
+        topics: tuple[str, ...],
+        confidence: float,
+    ) -> bool:
+        if not self.config.stickers.enabled:
+            return False
+        sticker_confidence = _clamp_float(item.get("sticker_confidence", confidence))
+        if sticker_confidence < self.config.stickers.min_confidence:
+            return False
+        if _as_bool(item.get("is_sticker"), False):
+            return True
+        return _looks_like_sticker_image(description, ocr_text, topics)
 
     def _save_cached_result(self, result: VisionImageResult) -> None:
         if self.vision_cache is None:
@@ -671,8 +727,12 @@ class VisionAgent:
         ocr_parts: list[str] = []
         topics: list[str] = []
         memories: list[MemoryCandidate] = []
+        stickers: list[StickerCandidate] = []
         seen_memory_urls: set[str] = set()
         seen_ocr_urls: set[str] = set()
+        image_attachments = [
+            attachment for attachment in context.attachments if attachment.attachment_type == "image"
+        ][: self.config.vision.max_images_per_message]
         for index, url in enumerate(image_urls):
             result = results_by_url.get(url)
             if result and result.description:
@@ -693,12 +753,27 @@ class VisionAgent:
             ):
                 memories.append(self._memory_candidate_from_image(context, index, result))
                 seen_memory_urls.add(url)
+            if result.is_sticker and result.sticker_confidence >= self.config.stickers.min_confidence:
+                attachment = image_attachments[index] if index < len(image_attachments) else None
+                stickers.append(
+                    StickerCandidate(
+                        url=result.url,
+                        file=attachment.file if attachment is not None else "",
+                        description=result.description,
+                        ocr_text=result.ocr_text,
+                        mood=result.sticker_mood or _infer_sticker_mood(result),
+                        usage=result.sticker_usage or _fallback_sticker_usage(result),
+                        tags=result.sticker_tags or result.topics,
+                        confidence=result.sticker_confidence,
+                    )
+                )
 
         return VisionAnalysis(
             descriptions=descriptions or fallback.descriptions,
             ocr_text="\n".join(_dedupe_strings(ocr_parts)),
             topics=tuple(_dedupe_strings(topics)),
             memory_candidates=tuple(memories),
+            sticker_candidates=tuple(stickers),
         )
 
     def _memory_candidate_from_image(
@@ -1205,6 +1280,91 @@ class ResponseAgent:
         return "这个我不拿自己的经历乱套，但感觉能懂一点。"
 
 
+class StickerSelectorAgent:
+    def __init__(self, config: AppConfig, llm: LLMClient) -> None:
+        self.config = config
+        self.llm = llm
+        self._last_sent_at: dict[str, int] = {}
+
+    async def select(
+        self,
+        context: MessageContext,
+        decision: ParticipationDecision,
+        snapshot: ConversationSnapshot,
+        reply: str | None,
+    ) -> StickerAssetRecord | None:
+        if not self.config.stickers.enabled:
+            return None
+        if decision.action == "observe" or not reply:
+            return None
+        if not snapshot.sticker_assets:
+            return None
+        if self._cooldown_active(context.group_id):
+            return None
+
+        fallback = self._heuristic_select(context, reply, snapshot.sticker_assets)
+        data = await _complete_json(
+            self.llm,
+            "你是 QQ 群拟人角色的表情包选择器。只输出 JSON，不要解释。",
+            (
+                "判断这次回复是否适合附带一个表情包。"
+                "只有明显契合语气和上下文时才选；严肃、敏感、争吵、安慰过重时不要发。"
+                "asset_id 为 0 表示不发。"
+                "输出 JSON："
+                '{"asset_id":0,"confidence":0.0,"reason":"短原因"}\n'
+                f"最近群聊：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"对方消息：{context.plain_text}\n"
+                f"机器人文字回复：{reply}\n"
+                f"可用表情：\n{_format_sticker_assets(snapshot.sticker_assets)}"
+            ),
+        )
+        selected = self._asset_from_json(data, snapshot.sticker_assets) if data else fallback
+        if selected is None:
+            return None
+        self._last_sent_at[context.group_id] = int(time.time())
+        return selected
+
+    def _cooldown_active(self, group_id: str) -> bool:
+        last = self._last_sent_at.get(group_id, 0)
+        return int(time.time()) - last < self.config.stickers.send_cooldown_seconds
+
+    def _asset_from_json(
+        self,
+        data: dict[str, Any] | None,
+        assets: list[StickerAssetRecord],
+    ) -> StickerAssetRecord | None:
+        if not data:
+            return None
+        confidence = _clamp_float(data.get("confidence", 0.0))
+        if confidence < self.config.stickers.selection_threshold:
+            return None
+        try:
+            asset_id = int(data.get("asset_id", 0))
+        except (TypeError, ValueError):
+            return None
+        if asset_id <= 0:
+            return None
+        by_id = {asset.id: asset for asset in assets}
+        return by_id.get(asset_id)
+
+    def _heuristic_select(
+        self,
+        context: MessageContext,
+        reply: str,
+        assets: list[StickerAssetRecord],
+    ) -> StickerAssetRecord | None:
+        text = f"{context.plain_text}\n{reply}"
+        if any(token in text for token in ("哈哈", "笑死", "乐", "好好笑")):
+            return _first_matching_sticker(assets, ("笑", "好笑", "乐", "开心"))
+        if any(token in text for token in ("离谱", "震惊", "啊？", "啊?", "真的假的")):
+            return _first_matching_sticker(assets, ("震惊", "惊讶", "离谱"))
+        if any(token in text for token in ("无语", "沉默", "尴尬")):
+            return _first_matching_sticker(assets, ("无语", "沉默", "尴尬"))
+        if any(token in text for token in ("困", "累", "下班", "不想动")):
+            return _first_matching_sticker(assets, ("困", "累", "疲惫", "下班"))
+        return None
+
+
 class SelfMemoryLedger:
     CLAIM_PATTERNS = (
         re.compile(r"(我(?:以前|之前|曾经|小时候|上次|最近)[^。！？\n]{2,40})"),
@@ -1314,6 +1474,7 @@ class AgentPipeline:
         self.policy = ParticipationPolicyAgent(config, llm)
         self.self_narrative = SelfNarrativeAgent(llm)
         self.response = ResponseAgent(config, llm)
+        self.stickers = StickerSelectorAgent(config, llm)
         self.reflection = ReflectionAgent(llm)
 
     async def run(
@@ -1346,6 +1507,12 @@ class AgentPipeline:
             snapshot,
             self_memories,
         )
+        selected_sticker = await self.stickers.select(
+            enriched_context,
+            decision,
+            snapshot,
+            reply_draft.text,
+        )
         return PipelineResult(
             perception=perception,
             memories=[*memories, *lexicon_memories, *vision.memory_candidates],
@@ -1354,6 +1521,8 @@ class AgentPipeline:
             reply=reply_draft.text,
             reply_self_memories=reply_draft.self_memory_candidates,
             image_descriptions=vision.descriptions,
+            sticker_candidates=list(vision.sticker_candidates),
+            selected_sticker=selected_sticker,
         )
 
     async def reflect(
@@ -1454,6 +1623,56 @@ def _context_with_vision(context: MessageContext, vision: VisionAnalysis) -> Mes
 def _clean_image_text(value: str) -> str:
     text = " ".join(str(value).strip().split())
     return text[:300].strip()
+
+
+def _clean_sticker_text(value: str, limit: int = 160) -> str:
+    text = " ".join(str(value).strip().split())
+    return text[:limit].strip()
+
+
+def _looks_like_sticker_image(description: str, ocr_text: str, topics: tuple[str, ...]) -> bool:
+    haystack = " ".join([description, ocr_text, *topics]).lower()
+    return any(
+        token in haystack
+        for token in (
+            "表情包",
+            "梗图",
+            "meme",
+            "反应图",
+            "配字",
+            "熊猫头",
+            "猫猫表情",
+            "狗头",
+            "无语",
+            "笑死",
+        )
+    )
+
+
+def _infer_sticker_mood(result: VisionImageResult) -> str:
+    text = " ".join([result.description, result.ocr_text, *result.topics])
+    if any(token in text for token in ("笑", "哈哈", "开心", "乐")):
+        return "好笑"
+    if any(token in text for token in ("无语", "沉默", "尴尬")):
+        return "无语"
+    if any(token in text for token in ("震惊", "惊讶", "瞪大")):
+        return "震惊"
+    if any(token in text for token in ("困", "累", "下班")):
+        return "疲惫"
+    return "接梗"
+
+
+def _fallback_sticker_usage(result: VisionImageResult) -> str:
+    mood = _infer_sticker_mood(result)
+    if mood == "好笑":
+        return "适合在群里有人开玩笑、接梗或大家都在笑时使用。"
+    if mood == "无语":
+        return "适合在轻度吐槽、无奈或尴尬但不严肃的场合使用。"
+    if mood == "震惊":
+        return "适合在看到意外消息、离谱展开或反转时使用。"
+    if mood == "疲惫":
+        return "适合在聊到犯困、下班、累了或想摆一下时使用。"
+    return "适合在轻松聊天里接梗或表达反应时使用。"
 
 
 def _looks_sensitive_image_memory(value: str) -> bool:
@@ -1583,6 +1802,30 @@ def _format_memory_candidates(memories: list[MemoryCandidate]) -> str:
     if not memories:
         return "(none)"
     return "\n".join(f"[{item.kind}] {item.content}" for item in memories)
+
+
+def _format_sticker_assets(assets: list[StickerAssetRecord]) -> str:
+    if not assets:
+        return "(none)"
+    lines = []
+    for asset in assets:
+        tags = "、".join(asset.tags[:6])
+        lines.append(
+            f"#{asset.id} mood={asset.mood or '(unknown)'} "
+            f"tags={tags or '(none)'} usage={asset.usage or asset.description}"
+        )
+    return "\n".join(lines)
+
+
+def _first_matching_sticker(
+    assets: list[StickerAssetRecord],
+    tokens: tuple[str, ...],
+) -> StickerAssetRecord | None:
+    for asset in assets:
+        haystack = " ".join([asset.mood, asset.usage, asset.description, *asset.tags])
+        if any(token in haystack for token in tokens):
+            return asset
+    return None
 
 
 def _fallback_reply_with_self_memory(memory: MemoryCandidate) -> str:

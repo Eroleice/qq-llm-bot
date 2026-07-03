@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from nonebot import get_driver, on_command, on_message
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 
@@ -14,7 +15,8 @@ from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import ParticipationMode, load_config
 from qq_llm_bot.dashboard import register_dashboard_routes
 from qq_llm_bot.llm import build_llm_client, is_llm_configured, normalize_chat_completions_url
-from qq_llm_bot.models import MessageAttachment, MessageContext
+from qq_llm_bot.models import MessageAttachment, MessageContext, StickerAssetRecord, StickerCandidate
+from qq_llm_bot.stickers import StickerLocalStore
 
 __plugin_meta__ = PluginMetadata(
     name="llm-group-bot",
@@ -26,6 +28,7 @@ config = load_config()
 storage = BotStorage.from_config(config)
 llm = build_llm_client(config.llm)
 pipeline = AgentPipeline(config, llm, vision_cache=storage)
+sticker_store = StickerLocalStore(config)
 driver = get_driver()
 
 if config.dashboard.enabled:
@@ -82,6 +85,9 @@ async def _handle_admin_command(event: GroupMessageEvent, args: Message = Comman
     if topic == "memory":
         await _handle_memory(rest, group_id)
 
+    if topic in {"stickers", "sticker", "表情", "表情包"}:
+        await _handle_stickers(rest, group_id)
+
     if topic == "persona":
         await _handle_persona(rest)
 
@@ -119,17 +125,20 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     memory_write = storage.record_memory_candidates(result.memories)
     storage.record_memory_candidates(result.reply_self_memories)
     storage.update_image_descriptions(context.group_id, context.message_id, result.image_descriptions)
+    await _record_sticker_candidates(context, result.sticker_candidates)
     storage.apply_relationship_delta(context.group_id, context.user_id, result.relationship_delta)
     await _maybe_reflect_group(context.group_id)
-    final_reply = (
-        storage.build_conflict_confirmation(memory_write.conflicts, context, mode)
-        or result.reply
-    )
-    storage.record_decision(context, result.decision, final_reply)
+    conflict_reply = storage.build_conflict_confirmation(memory_write.conflicts, context, mode)
+    final_reply = conflict_reply or result.reply
+    selected_sticker = None if conflict_reply else result.selected_sticker
+    decision_reply = _reply_record_text(final_reply, selected_sticker)
+    storage.record_decision(context, result.decision, decision_reply)
 
     if final_reply:
-        storage.record_bot_reply(context.group_id, str(bot.self_id), final_reply)
-        await group_message.finish(final_reply)
+        storage.record_bot_reply(context.group_id, str(bot.self_id), decision_reply)
+        if selected_sticker:
+            storage.record_sticker_sent(selected_sticker.id)
+        await group_message.finish(_reply_message(final_reply, selected_sticker))
 
 
 async def _handle_whitelist(rest: list[str]) -> None:
@@ -195,6 +204,21 @@ async def _handle_memory(rest: list[str], group_id: str) -> None:
         ok = storage.reject_memory(memory_id)
         await admin_cmd.finish("已拒绝。" if ok else "没有找到可拒绝的记忆。")
     await admin_cmd.finish(_memory_help_text())
+
+
+async def _handle_stickers(rest: list[str], group_id: str) -> None:
+    action = rest[0].lower() if rest else "list"
+    if action == "list":
+        limit = _parse_memory_id(rest[1]) if len(rest) >= 2 else 20
+        stickers = storage.list_stickers(group_id, limit=limit or 20)
+        await admin_cmd.finish("\n\n".join(stickers) if stickers else "本群暂无已保存表情包。")
+    if len(rest) >= 2 and action in {"enable", "disable"}:
+        sticker_id = _parse_memory_id(rest[1])
+        if sticker_id is None:
+            await admin_cmd.finish("sticker_id 必须是数字，例如：#bot stickers disable 12")
+        ok = storage.set_sticker_enabled(sticker_id, action == "enable")
+        await admin_cmd.finish("已更新表情状态。" if ok else "没有找到该表情。")
+    await admin_cmd.finish("用法：#bot stickers list [数量]|enable <id>|disable <id>")
 
 
 async def _handle_persona(rest: list[str]) -> None:
@@ -294,6 +318,56 @@ async def _maybe_reflect_group(group_id: str) -> None:
         storage.record_memory_candidates([reflection])
 
 
+async def _record_sticker_candidates(
+    context: MessageContext,
+    candidates: list[StickerCandidate],
+) -> None:
+    if not config.stickers.enabled or not candidates:
+        return
+    for candidate in candidates:
+        saved = await sticker_store.save_candidate(context, candidate)
+        if saved is None:
+            continue
+        storage.upsert_sticker_asset(
+            context,
+            candidate,
+            local_path=saved.local_path,
+            sha256=saved.sha256,
+        )
+
+
+def _reply_message(reply: str, sticker: StickerAssetRecord | None) -> Message | str:
+    if sticker is None:
+        return reply
+    file_ref = _sticker_file_ref(sticker)
+    if not file_ref:
+        return reply
+    message = Message()
+    if reply:
+        message += MessageSegment.text(reply)
+        message += MessageSegment.text("\n")
+    message += MessageSegment.image(file=file_ref)
+    return message
+
+
+def _sticker_file_ref(sticker: StickerAssetRecord) -> str:
+    local_path = sticker.local_path.strip()
+    if local_path:
+        path = Path(local_path)
+        if path.exists():
+            return path.resolve().as_uri()
+    return sticker.url.strip()
+
+
+def _reply_record_text(reply: str | None, sticker: StickerAssetRecord | None) -> str:
+    text = reply or ""
+    if sticker is None:
+        return text
+    label = sticker.usage or sticker.description or sticker.local_path or sticker.url
+    marker = f"[表情 #{sticker.id}: {label}]"
+    return f"{text}\n{marker}".strip()
+
+
 def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
     plain_text = event.get_plaintext().strip()
     sender = getattr(event, "sender", None)
@@ -381,6 +455,7 @@ def _help_text() -> str:
         "#bot whitelist list|add <group_id>|remove <group_id>\n"
         "#bot admin list|add <qq_id>|remove <qq_id>\n"
         "#bot memory user <qq_id>|lexicon [term]|pending|conflicts|approve <id>|reject <id>\n"
+        "#bot stickers list [数量]|enable <id>|disable <id>\n"
         "#bot persona show|self [pending|conflicts|approve <id>|reject <id>|forget <id>]\n"
         "#bot llm status|test [prompt]\n"
         "#bot why\n"

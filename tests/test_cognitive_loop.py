@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from qq_llm_bot.cognitive_agents import AgentPipeline, RelationshipAgent, VisionAgent
+from qq_llm_bot.cognitive_agents import AgentPipeline, RelationshipAgent, StickerSelectorAgent, VisionAgent
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import (
     AppConfig,
@@ -16,6 +16,7 @@ from qq_llm_bot.config import (
     PersonaConfig,
     ReflectionConfig,
     StorageConfig,
+    StickerConfig,
     VisionConfig,
 )
 from qq_llm_bot.models import (
@@ -26,6 +27,9 @@ from qq_llm_bot.models import (
     MessageContext,
     PerceptionResult,
     RelationDelta,
+    ParticipationDecision,
+    StickerAssetRecord,
+    StickerCandidate,
 )
 from qq_llm_bot.web_search import SearchResult
 
@@ -319,6 +323,92 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(cached)
             self.assertGreaterEqual(cached.hit_count, 2)
 
+    async def test_vision_analysis_detects_sticker_candidate_when_enabled(self) -> None:
+        config = replace(
+            test_config(Path("unused.sqlite3")),
+            vision=VisionConfig(enabled=True),
+            stickers=StickerConfig(enabled=True, min_confidence=0.7),
+        )
+        llm = FakeLLM(
+            vision_replies=[
+                '{"images":[{"description":"一张猫猫表情包，配字是下班了",'
+                '"ocr_text":"下班了","topics":["表情包","猫猫"],'
+                '"should_remember":false,"memory":"","confidence":0.9,"importance":0.4,'
+                '"is_sticker":true,"sticker_mood":"疲惫",'
+                '"sticker_usage":"适合大家聊到下班、犯困或想摆一下时使用",'
+                '"sticker_tags":["下班","困","猫猫"],"sticker_confidence":0.86}]}'
+            ]
+        )
+        agent = VisionAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-sticker",
+            plain_text="",
+            raw_message="[CQ:image,url=https://example.test/meme.png]",
+            attachments=[
+                MessageAttachment(
+                    attachment_type="image",
+                    url="https://example.test/meme.png",
+                    file="meme.png",
+                )
+            ],
+        )
+
+        result = await agent.analyze(context)
+
+        self.assertEqual(len(result.sticker_candidates), 1)
+        self.assertEqual(result.sticker_candidates[0].mood, "疲惫")
+        self.assertIn("下班", result.sticker_candidates[0].usage)
+        self.assertEqual(result.sticker_candidates[0].file, "meme.png")
+
+    async def test_sticker_selector_uses_matching_asset_from_llm(self) -> None:
+        config = replace(
+            test_config(Path("unused.sqlite3")),
+            stickers=StickerConfig(enabled=True, selection_threshold=0.68),
+        )
+        asset = StickerAssetRecord(
+            id=7,
+            group_id="100",
+            source_user_id="42",
+            source_message_id="m1",
+            url="https://example.test/meme.png",
+            file="meme.png",
+            local_path="E:\\tmp\\meme.png",
+            sha256="abc",
+            description="一张猫猫下班表情包",
+            ocr_text="下班了",
+            mood="疲惫",
+            usage="适合聊到下班、犯困或想摆一下时使用",
+            tags=("下班", "困", "猫猫"),
+            confidence=0.86,
+            enabled=True,
+            created_at=1,
+            updated_at=1,
+            last_seen_at=1,
+        )
+        selector = StickerSelectorAgent(
+            config,
+            FakeLLM(['{"asset_id":7,"confidence":0.82,"reason":"回复在接下班梗"}']),
+        )
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m2",
+            plain_text="终于下班了",
+            raw_message="终于下班了",
+        )
+        decision = ParticipationDecision("reply", "message is directed to the bot", "passive", 1.0)
+
+        selected = await selector.select(
+            context,
+            decision,
+            ConversationSnapshot(sticker_assets=[asset]),
+            "辛苦了，今天可以摆一下。",
+        )
+
+        self.assertEqual(selected, asset)
+
     async def test_lexicon_learning_creates_group_memory_without_reply_in_silent(self) -> None:
         config = replace(
             test_config(Path("unused.sqlite3")),
@@ -423,6 +513,41 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MemoryStorageTests(unittest.TestCase):
+    def test_sticker_asset_is_saved_and_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            local_path = str(Path(tmp) / "meme.png")
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-sticker",
+                plain_text="",
+                raw_message="[CQ:image]",
+            )
+            candidate = StickerCandidate(
+                url="https://example.test/meme.png",
+                file="meme.png",
+                description="一张猫猫下班表情包",
+                ocr_text="下班了",
+                mood="疲惫",
+                usage="适合聊到下班、犯困或想摆一下时使用",
+                tags=("下班", "困", "猫猫"),
+                confidence=0.86,
+            )
+
+            asset = storage.upsert_sticker_asset(context, candidate, local_path=local_path, sha256="abc")
+            active = storage.list_sticker_assets("100")
+
+            self.assertIsNotNone(asset)
+            self.assertEqual(active[0].usage, "适合聊到下班、犯困或想摆一下时使用")
+            self.assertEqual(active[0].tags, ("下班", "困", "猫猫"))
+
+            self.assertTrue(storage.set_sticker_enabled(active[0].id, False))
+            self.assertEqual(storage.list_sticker_assets("100"), [])
+            self.assertEqual(len(storage.list_sticker_assets("100", enabled_only=False)), 1)
+
     def test_bot_sourced_lexicon_group_fact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")

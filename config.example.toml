@@ -67,6 +67,17 @@ detail = "low"
 timeout_seconds = 45.0
 remember_threshold = 0.78
 
+[stickers]
+# Requires [vision].enabled = true. Detected stickers are downloaded into storage_dir.
+enabled = false
+storage_dir = "data/stickers"
+min_confidence = 0.72
+selection_threshold = 0.68
+max_context_stickers = 24
+download_timeout_seconds = 20.0
+max_download_bytes = 8388608
+send_cooldown_seconds = 120
+
 [storage]
 sqlite_path = "data/bot.sqlite3"
 

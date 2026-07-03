@@ -97,6 +97,18 @@ class VisionConfig:
 
 
 @dataclass(frozen=True)
+class StickerConfig:
+    enabled: bool = False
+    storage_dir: str = "data/stickers"
+    min_confidence: float = 0.72
+    selection_threshold: float = 0.68
+    max_context_stickers: int = 24
+    download_timeout_seconds: float = 20.0
+    max_download_bytes: int = 8 * 1024 * 1024
+    send_cooldown_seconds: int = 120
+
+
+@dataclass(frozen=True)
 class StorageConfig:
     sqlite_path: str = "data/bot.sqlite3"
 
@@ -122,6 +134,7 @@ class AppConfig:
     lexicon: LexiconConfig = field(default_factory=LexiconConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    stickers: StickerConfig = field(default_factory=StickerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     config_path: Path = Path("config.toml")
@@ -149,6 +162,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     lexicon_raw = _section(raw, "lexicon")
     dashboard_raw = _section(raw, "dashboard")
     vision_raw = _section(raw, "vision")
+    stickers_raw = _section(raw, "stickers")
     storage_raw = _section(raw, "storage")
     llm_raw = _section(raw, "llm")
 
@@ -290,6 +304,41 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
                 "vision.remember_threshold",
                 0,
                 1,
+            ),
+        ),
+        stickers=StickerConfig(
+            enabled=_bool_value(stickers_raw.get("enabled", False)),
+            storage_dir=str(stickers_raw.get("storage_dir", "data/stickers")).strip()
+            or "data/stickers",
+            min_confidence=_float_in_range(
+                stickers_raw.get("min_confidence", 0.72),
+                "stickers.min_confidence",
+                0,
+                1,
+            ),
+            selection_threshold=_float_in_range(
+                stickers_raw.get("selection_threshold", 0.68),
+                "stickers.selection_threshold",
+                0,
+                1,
+            ),
+            max_context_stickers=_positive_int(
+                stickers_raw.get("max_context_stickers", 24),
+                "stickers.max_context_stickers",
+            ),
+            download_timeout_seconds=_float_in_range(
+                stickers_raw.get("download_timeout_seconds", 20.0),
+                "stickers.download_timeout_seconds",
+                1,
+                300,
+            ),
+            max_download_bytes=_positive_int(
+                stickers_raw.get("max_download_bytes", 8 * 1024 * 1024),
+                "stickers.max_download_bytes",
+            ),
+            send_cooldown_seconds=_positive_int(
+                stickers_raw.get("send_cooldown_seconds", 120),
+                "stickers.send_cooldown_seconds",
             ),
         ),
         storage=StorageConfig(

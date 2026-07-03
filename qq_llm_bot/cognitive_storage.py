@@ -21,6 +21,8 @@ from qq_llm_bot.models import (
     ParticipationDecision,
     RelationDelta,
     RelationshipState,
+    StickerAssetRecord,
+    StickerCandidate,
 )
 from qq_llm_bot.relationship_summary import merge_relationship_summary
 
@@ -47,11 +49,13 @@ class BotStorage:
         initial_admins: Iterable[str],
         initial_groups: Iterable[str],
         initial_persona: dict[str, str],
+        sticker_context_limit: int = 24,
     ) -> None:
         self.db_path = db_path
         self.initial_admins = {str(item) for item in initial_admins}
         self.initial_groups = {str(item) for item in initial_groups}
         self.initial_persona = initial_persona
+        self.sticker_context_limit = max(1, int(sticker_context_limit))
         self._lock = RLock()
 
     @classmethod
@@ -90,6 +94,7 @@ class BotStorage:
             config.bot.admin_ids,
             config.bot.enabled_groups,
             persona,
+            config.stickers.max_context_stickers,
         )
 
     def setup(self) -> None:
@@ -139,6 +144,28 @@ class BotStorage:
                     confidence REAL NOT NULL DEFAULT 0,
                     importance REAL NOT NULL DEFAULT 0.5,
                     model TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS sticker_assets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL,
+                    source_user_id TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL DEFAULT '',
+                    file TEXT NOT NULL DEFAULT '',
+                    local_path TEXT NOT NULL DEFAULT '',
+                    sha256 TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    ocr_text TEXT NOT NULL DEFAULT '',
+                    mood TEXT NOT NULL DEFAULT '',
+                    usage TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     last_seen_at INTEGER NOT NULL,
@@ -430,6 +457,199 @@ class BotStorage:
                     now,
                 ),
             )
+
+    def upsert_sticker_asset(
+        self,
+        context: MessageContext,
+        candidate: StickerCandidate,
+        local_path: str,
+        sha256: str = "",
+    ) -> StickerAssetRecord | None:
+        group_id = str(context.group_id)
+        url = str(candidate.url).strip()
+        file = str(candidate.file).strip()
+        local_path = str(local_path).strip()
+        sha256 = str(sha256).strip()
+        if not group_id or not local_path:
+            return None
+
+        now = int(time.time())
+        tags_json = json.dumps(_compact_string_list(candidate.tags, limit=12), ensure_ascii=False)
+        with self._connect() as conn:
+            existing = self._find_sticker_asset(conn, group_id, sha256=sha256, url=url)
+            if existing is not None:
+                asset_id = int(existing["id"])
+                conn.execute(
+                    """
+                    UPDATE sticker_assets
+                    SET source_user_id = ?,
+                        source_message_id = ?,
+                        url = CASE WHEN ? != '' THEN ? ELSE url END,
+                        file = CASE WHEN ? != '' THEN ? ELSE file END,
+                        local_path = CASE WHEN ? != '' THEN ? ELSE local_path END,
+                        sha256 = CASE WHEN ? != '' THEN ? ELSE sha256 END,
+                        description = ?,
+                        ocr_text = ?,
+                        mood = ?,
+                        usage = ?,
+                        tags = ?,
+                        confidence = MAX(confidence, ?),
+                        updated_at = ?,
+                        last_seen_at = ?,
+                        hit_count = hit_count + 1
+                    WHERE id = ?
+                    """,
+                    (
+                        context.user_id,
+                        context.message_id,
+                        url,
+                        url,
+                        file,
+                        file,
+                        local_path,
+                        local_path,
+                        sha256,
+                        sha256,
+                        candidate.description[:1000],
+                        candidate.ocr_text[:1000],
+                        candidate.mood[:80],
+                        candidate.usage[:500],
+                        tags_json,
+                        float(candidate.confidence),
+                        now,
+                        now,
+                        asset_id,
+                    ),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO sticker_assets (
+                        group_id, source_user_id, source_message_id, url, file,
+                        local_path, sha256, description, ocr_text, mood, usage,
+                        tags, confidence, enabled, created_at, updated_at,
+                        last_seen_at, hit_count
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1)
+                    """,
+                    (
+                        group_id,
+                        context.user_id,
+                        context.message_id,
+                        url,
+                        file,
+                        local_path,
+                        sha256,
+                        candidate.description[:1000],
+                        candidate.ocr_text[:1000],
+                        candidate.mood[:80],
+                        candidate.usage[:500],
+                        tags_json,
+                        float(candidate.confidence),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                asset_id = int(cursor.lastrowid)
+            row = conn.execute(
+                """
+                SELECT id, group_id, source_user_id, source_message_id, url, file,
+                       local_path, sha256, description, ocr_text, mood, usage,
+                       tags, confidence, enabled, created_at, updated_at,
+                       last_seen_at, hit_count
+                FROM sticker_assets
+                WHERE id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+        return _sticker_asset_record(row) if row is not None else None
+
+    def list_sticker_assets(
+        self,
+        group_id: str,
+        limit: int = 24,
+        enabled_only: bool = True,
+    ) -> list[StickerAssetRecord]:
+        where = ["group_id = ?", "local_path != ''"]
+        params: list[object] = [str(group_id)]
+        if enabled_only:
+            where.append("enabled = 1")
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, group_id, source_user_id, source_message_id, url, file,
+                       local_path, sha256, description, ocr_text, mood, usage,
+                       tags, confidence, enabled, created_at, updated_at,
+                       last_seen_at, hit_count
+                FROM sticker_assets
+                WHERE {' AND '.join(where)}
+                ORDER BY confidence DESC, hit_count DESC, updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_sticker_asset_record(row) for row in rows]
+
+    def list_stickers(self, group_id: str, limit: int = 20) -> list[str]:
+        assets = self.list_sticker_assets(group_id, limit=limit, enabled_only=False)
+        return [format_sticker_asset(asset) for asset in assets]
+
+    def set_sticker_enabled(self, sticker_id: int, enabled: bool) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE sticker_assets
+                SET enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (1 if enabled else 0, int(time.time()), int(sticker_id)),
+            )
+        return cursor.rowcount > 0
+
+    def record_sticker_sent(self, sticker_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sticker_assets
+                SET last_seen_at = ?,
+                    hit_count = hit_count + 1
+                WHERE id = ?
+                """,
+                (int(time.time()), int(sticker_id)),
+            )
+
+    def _find_sticker_asset(
+        self,
+        conn: sqlite3.Connection,
+        group_id: str,
+        sha256: str = "",
+        url: str = "",
+    ) -> sqlite3.Row | None:
+        if sha256:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM sticker_assets
+                WHERE group_id = ? AND sha256 = ?
+                LIMIT 1
+                """,
+                (str(group_id), str(sha256)),
+            ).fetchone()
+            if row is not None:
+                return row
+        if url:
+            return conn.execute(
+                """
+                SELECT id
+                FROM sticker_assets
+                WHERE group_id = ? AND url = ?
+                LIMIT 1
+                """,
+                (str(group_id), str(url)),
+            ).fetchone()
+        return None
 
     def record_memories(self, memories: Iterable[MemoryCandidate]) -> None:
         self.record_memory_candidates(memories)
@@ -1120,6 +1340,10 @@ class BotStorage:
         return ConversationSnapshot(
             recent_messages=self.get_recent_messages(context.group_id, limit=12),
             recent_image_descriptions=self.get_recent_image_descriptions(context.group_id, limit=8),
+            sticker_assets=self.list_sticker_assets(
+                context.group_id,
+                limit=self.sticker_context_limit,
+            ),
             user_memories=self.list_memories("user", context.user_id, limit=10),
             self_memories=self.list_memories("self", "bot", limit=12),
             group_reflections=self.list_memories("group", context.group_id, limit=3),
@@ -1685,6 +1909,18 @@ def format_memory_record(record: MemoryRecord) -> str:
     )
 
 
+def format_sticker_asset(asset: StickerAssetRecord) -> str:
+    status = "enabled" if asset.enabled else "disabled"
+    tags = "、".join(asset.tags[:5]) or "(no tags)"
+    usage = asset.usage or asset.description or "(no usage)"
+    return (
+        f"#{asset.id} [{status}] mood={asset.mood or '(unknown)'} "
+        f"tags={tags} conf={asset.confidence:.2f} hits={asset.hit_count}\n"
+        f"用途：{usage}\n"
+        f"本地：{asset.local_path}"
+    )
+
+
 def _compact_persona_items(items: dict[str, str]) -> dict[str, str]:
     return {key: value.strip() for key, value in items.items() if value.strip()}
 
@@ -1793,6 +2029,30 @@ def _image_vision_cache_record(row: sqlite3.Row) -> ImageVisionCacheRecord:
         confidence=float(row["confidence"]),
         importance=float(row["importance"]),
         model=str(row["model"] or ""),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+        last_seen_at=int(row["last_seen_at"]),
+        hit_count=int(row["hit_count"]),
+    )
+
+
+def _sticker_asset_record(row: sqlite3.Row) -> StickerAssetRecord:
+    return StickerAssetRecord(
+        id=int(row["id"]),
+        group_id=str(row["group_id"]),
+        source_user_id=str(row["source_user_id"] or ""),
+        source_message_id=str(row["source_message_id"] or ""),
+        url=str(row["url"] or ""),
+        file=str(row["file"] or ""),
+        local_path=str(row["local_path"] or ""),
+        sha256=str(row["sha256"] or ""),
+        description=str(row["description"] or ""),
+        ocr_text=str(row["ocr_text"] or ""),
+        mood=str(row["mood"] or ""),
+        usage=str(row["usage"] or ""),
+        tags=tuple(_decode_string_list(str(row["tags"] or "[]"))),
+        confidence=float(row["confidence"]),
+        enabled=bool(int(row["enabled"])),
         created_at=int(row["created_at"]),
         updated_at=int(row["updated_at"]),
         last_seen_at=int(row["last_seen_at"]),
