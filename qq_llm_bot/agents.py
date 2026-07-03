@@ -11,6 +11,7 @@ from qq_llm_bot.models import (
     ParticipationDecision,
     PerceptionResult,
     PipelineResult,
+    RelationDelta,
 )
 
 
@@ -157,6 +158,8 @@ class AgentPipeline:
         return PipelineResult(
             perception=perception,
             memories=memories,
+            facts=[],
+            relationship_delta=RelationDelta(),
             decision=decision,
             reply=reply,
         )
@@ -179,9 +182,11 @@ def _emotion_hint(text: str) -> str:
 
 
 from qq_llm_bot.cognitive_agents import AgentPipeline as AgentPipeline  # noqa: E402,F401
+from qq_llm_bot.cognitive_agents import FactExtractorAgent as FactExtractorAgent  # noqa: E402,F401
 from qq_llm_bot.cognitive_agents import MemoryCuratorAgent as MemoryCuratorAgent  # noqa: E402,F401
 from qq_llm_bot.cognitive_agents import ParticipationPolicyAgent as ParticipationPolicyAgent  # noqa: E402,F401
 from qq_llm_bot.cognitive_agents import PerceptionAgent as PerceptionAgent  # noqa: E402,F401
+from qq_llm_bot.cognitive_agents import ProfileAggregatorAgent as ProfileAggregatorAgent  # noqa: E402,F401
 from qq_llm_bot.cognitive_agents import ReflectionAgent as ReflectionAgent  # noqa: E402,F401
 from qq_llm_bot.cognitive_agents import RelationshipAgent as RelationshipAgent  # noqa: E402,F401
 from qq_llm_bot.cognitive_agents import ResponseAgent as ResponseAgent  # noqa: E402,F401

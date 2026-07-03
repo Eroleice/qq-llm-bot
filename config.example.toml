@@ -38,6 +38,12 @@ message_threshold = 30
 recent_limit = 40
 min_interval_seconds = 600
 
+[facts]
+fact_confidence_threshold = 0.75
+third_party_trust_threshold = 70
+third_party_confidence_threshold = 0.85
+profile_fact_threshold = 5
+
 [lexicon]
 # Learn internet slang/memes by controlled web search. Providers: disabled | duckduckgo | serper | searxng
 enabled = false

@@ -9,6 +9,7 @@ DecisionAction = Literal["observe", "reply", "proactive_reply"]
 MemoryStatus = Literal["active", "candidate", "pending_confirmation", "conflict", "rejected", "forgotten"]
 ClaimScope = Literal["self_report", "third_party", "bot_directed", "group_fact"]
 VerificationStatus = Literal["accepted", "pending_confirmation", "conflict", "rejected"]
+FactStatus = Literal["candidate", "accepted", "pending_confirmation", "rejected"]
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,66 @@ class MemoryWriteSet:
 
 
 @dataclass(frozen=True)
+class FactCandidate:
+    subject_user_id: str
+    fact_type: str
+    claim_text: str
+    topic: str
+    stance: str
+    confidence: float
+    evidence_message_id: str
+    evidence_text: str
+    source_user_id: str
+    source_group_id: str
+    claim_scope: ClaimScope = "self_report"
+    status: FactStatus = "candidate"
+
+
+@dataclass(frozen=True)
+class FactRecord:
+    id: int
+    subject_user_id: str
+    fact_type: str
+    claim_text: str
+    topic: str
+    stance: str
+    confidence: float
+    status: str
+    claim_scope: str
+    source_user_id: str
+    source_group_id: str
+    evidence_message_id: str
+    evidence_text: str
+    created_at: int
+    updated_at: int
+
+
+@dataclass(frozen=True)
+class FactWriteSet:
+    accepted: list[FactRecord] = field(default_factory=list)
+    pending: list[FactRecord] = field(default_factory=list)
+    rejected: list[FactCandidate] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class UserProfileRecord:
+    user_id: str
+    summary: str
+    traits: dict[str, object] = field(default_factory=dict)
+    supporting_fact_ids: tuple[int, ...] = ()
+    fact_count: int = 0
+    version: int = 0
+    updated_at: int = 0
+
+
+@dataclass(frozen=True)
+class UserProfileDraft:
+    summary: str
+    traits: dict[str, object] = field(default_factory=dict)
+    supporting_fact_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class RelationshipState:
     group_id: str
     user_id: str
@@ -168,6 +229,8 @@ class ConversationSnapshot:
     recent_image_descriptions: list[str] = field(default_factory=list)
     sticker_assets: list[StickerAssetRecord] = field(default_factory=list)
     user_memories: list[MemoryRecord] = field(default_factory=list)
+    user_facts: list[FactRecord] = field(default_factory=list)
+    user_profile: UserProfileRecord | None = None
     self_memories: list[MemoryRecord] = field(default_factory=list)
     group_reflections: list[MemoryRecord] = field(default_factory=list)
     group_lexicon: list[MemoryRecord] = field(default_factory=list)
@@ -193,6 +256,7 @@ class ReplyDraft:
 class PipelineResult:
     perception: PerceptionResult
     memories: list[MemoryCandidate]
+    facts: list[FactCandidate]
     relationship_delta: RelationDelta
     decision: ParticipationDecision
     reply: str | None = None

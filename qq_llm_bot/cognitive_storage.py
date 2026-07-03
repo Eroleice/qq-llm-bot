@@ -13,6 +13,9 @@ from typing import Iterator, Iterable
 from qq_llm_bot.config import AppConfig, ParticipationMode
 from qq_llm_bot.models import (
     ConversationSnapshot,
+    FactCandidate,
+    FactRecord,
+    FactWriteSet,
     ImageVisionCacheRecord,
     MemoryCandidate,
     MemoryRecord,
@@ -23,6 +26,8 @@ from qq_llm_bot.models import (
     RelationshipState,
     StickerAssetRecord,
     StickerCandidate,
+    UserProfileRecord,
+    UserProfileDraft,
 )
 from qq_llm_bot.relationship_summary import merge_relationship_summary
 
@@ -50,12 +55,20 @@ class BotStorage:
         initial_groups: Iterable[str],
         initial_persona: dict[str, str],
         sticker_context_limit: int = 24,
+        fact_confidence_threshold: float = 0.75,
+        third_party_trust_threshold: int = 70,
+        third_party_confidence_threshold: float = 0.85,
+        profile_fact_threshold: int = 5,
     ) -> None:
         self.db_path = db_path
         self.initial_admins = {str(item) for item in initial_admins}
         self.initial_groups = {str(item) for item in initial_groups}
         self.initial_persona = initial_persona
         self.sticker_context_limit = max(1, int(sticker_context_limit))
+        self.fact_confidence_threshold = _clamp_float(fact_confidence_threshold)
+        self.third_party_trust_threshold = _clamp_score(third_party_trust_threshold)
+        self.third_party_confidence_threshold = _clamp_float(third_party_confidence_threshold)
+        self.profile_fact_threshold = max(1, int(profile_fact_threshold))
         self._lock = RLock()
 
     @classmethod
@@ -95,6 +108,10 @@ class BotStorage:
             config.bot.enabled_groups,
             persona,
             config.stickers.max_context_stickers,
+            config.facts.fact_confidence_threshold,
+            config.facts.third_party_trust_threshold,
+            config.facts.third_party_confidence_threshold,
+            config.facts.profile_fact_threshold,
         )
 
     def setup(self) -> None:
@@ -209,6 +226,34 @@ class BotStorage:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     last_seen_at INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS member_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject_user_id TEXT NOT NULL,
+                    fact_type TEXT NOT NULL,
+                    claim_text TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    stance TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'accepted',
+                    claim_scope TEXT NOT NULL DEFAULT 'self_report',
+                    source_user_id TEXT NOT NULL DEFAULT '',
+                    source_group_id TEXT NOT NULL DEFAULT '',
+                    evidence_message_id TEXT NOT NULL DEFAULT '',
+                    evidence_text TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS member_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    summary TEXT NOT NULL DEFAULT '',
+                    traits_json TEXT NOT NULL DEFAULT '{}',
+                    supporting_fact_ids TEXT NOT NULL DEFAULT '[]',
+                    fact_count INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS relationships (
@@ -365,6 +410,8 @@ class BotStorage:
                 (str(group_id), str(message_id)),
             ).fetchall()
             for row, description in zip(rows, descriptions):
+                if not str(description).strip():
+                    continue
                 conn.execute(
                     """
                     UPDATE message_attachments
@@ -596,6 +643,21 @@ class BotStorage:
         assets = self.list_sticker_assets(group_id, limit=limit, enabled_only=False)
         return [format_sticker_asset(asset) for asset in assets]
 
+    def get_sticker_asset(self, sticker_id: int) -> StickerAssetRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, group_id, source_user_id, source_message_id, url, file,
+                       local_path, sha256, description, ocr_text, mood, usage,
+                       tags, confidence, enabled, created_at, updated_at,
+                       last_seen_at, hit_count
+                FROM sticker_assets
+                WHERE id = ?
+                """,
+                (int(sticker_id),),
+            ).fetchone()
+        return _sticker_asset_record(row) if row is not None else None
+
     def set_sticker_enabled(self, sticker_id: int, enabled: bool) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -607,6 +669,14 @@ class BotStorage:
                 (1 if enabled else 0, int(time.time()), int(sticker_id)),
             )
         return cursor.rowcount > 0
+
+    def delete_sticker_asset(self, sticker_id: int) -> StickerAssetRecord | None:
+        asset = self.get_sticker_asset(sticker_id)
+        if asset is None:
+            return None
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sticker_assets WHERE id = ?", (int(sticker_id),))
+        return asset
 
     def record_sticker_sent(self, sticker_id: int) -> None:
         with self._connect() as conn:
@@ -729,6 +799,275 @@ class BotStorage:
             conflicts=conflicts,
             rejected=rejected,
         )
+
+    def record_fact_candidates(self, facts: Iterable[FactCandidate]) -> FactWriteSet:
+        accepted: list[FactRecord] = []
+        pending: list[FactRecord] = []
+        rejected: list[FactCandidate] = []
+        now = int(time.time())
+
+        with self._connect() as conn:
+            for item in facts:
+                normalized = self._normalize_fact_candidate(item)
+                acceptance_status = self._fact_acceptance_status(conn, normalized)
+                if acceptance_status == "rejected":
+                    rejected.append(replace(normalized, status="rejected"))
+                    continue
+
+                duplicate = self._find_duplicate_fact(conn, normalized, acceptance_status)
+                if duplicate:
+                    conn.execute(
+                        """
+                        UPDATE member_facts
+                        SET confidence = MAX(confidence, ?),
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (normalized.confidence, now, duplicate.id),
+                    )
+                    updated = replace(
+                        duplicate,
+                        confidence=max(duplicate.confidence, normalized.confidence),
+                        updated_at=now,
+                    )
+                    if updated.status == "accepted":
+                        accepted.append(updated)
+                    elif updated.status == "pending_confirmation":
+                        pending.append(updated)
+                    continue
+
+                inserted = self._insert_fact(
+                    conn,
+                    replace(
+                        normalized,
+                        status="accepted" if acceptance_status == "accepted" else "pending_confirmation",
+                    ),
+                    now,
+                )
+                if inserted.status == "accepted":
+                    accepted.append(inserted)
+                elif inserted.status == "pending_confirmation":
+                    pending.append(inserted)
+
+        return FactWriteSet(accepted=accepted, pending=pending, rejected=rejected)
+
+    def list_user_facts(
+        self,
+        user_id: str,
+        limit: int = 20,
+        status: str = "accepted",
+        group_id: str = "",
+    ) -> list[FactRecord]:
+        subject = _dashboard_user_id(user_id)
+        if not subject:
+            return []
+        where = ["subject_user_id = ?", "status = ?"]
+        params: list[object] = [subject, _safe_fact_status(status)]
+        if group_id:
+            where.append("source_group_id = ?")
+            params.append(str(group_id))
+        limit_value = int(limit)
+        limit_sql = "LIMIT ?" if limit_value > 0 else ""
+        if limit_value > 0:
+            params.append(limit_value)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at
+                FROM member_facts
+                WHERE {' AND '.join(where)}
+                ORDER BY updated_at DESC, id DESC
+                {limit_sql}
+                """,
+                params,
+            ).fetchall()
+        return [_fact_record(row) for row in rows]
+
+    def list_user_facts_text(self, user_id: str, limit: int = 20, status: str = "accepted") -> list[str]:
+        return [format_fact_record(record) for record in self.list_user_facts(user_id, limit, status)]
+
+    def list_pending_facts(self, limit: int = 20) -> list[FactRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at
+                FROM member_facts
+                WHERE status = 'pending_confirmation'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [_fact_record(row) for row in rows]
+
+    def get_fact_record(self, fact_id: int) -> FactRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at
+                FROM member_facts
+                WHERE id = ?
+                """,
+                (int(fact_id),),
+            ).fetchone()
+        return _fact_record(row) if row else None
+
+    def approve_fact(self, fact_id: int) -> FactRecord | None:
+        now = int(time.time())
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE member_facts
+                SET status = 'accepted', updated_at = ?
+                WHERE id = ? AND status = 'pending_confirmation'
+                """,
+                (now, int(fact_id)),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            row = conn.execute(
+                """
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at
+                FROM member_facts
+                WHERE id = ?
+                """,
+                (int(fact_id),),
+            ).fetchone()
+        return _fact_record(row) if row else None
+
+    def reject_fact(self, fact_id: int) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE member_facts
+                SET status = 'rejected', updated_at = ?
+                WHERE id = ? AND status = 'pending_confirmation'
+                """,
+                (int(time.time()), int(fact_id)),
+            )
+        return cursor.rowcount > 0
+
+    def get_user_profile(self, user_id: str) -> UserProfileRecord | None:
+        subject = _dashboard_user_id(user_id)
+        if not subject:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT user_id, summary, traits_json, supporting_fact_ids,
+                       fact_count, version, updated_at
+                FROM member_profiles
+                WHERE user_id = ?
+                """,
+                (subject,),
+            ).fetchone()
+        return _user_profile_record(row) if row else None
+
+    def should_update_user_profile(self, user_id: str, threshold: int | None = None) -> bool:
+        subject = _dashboard_user_id(user_id)
+        if not subject or not subject.isdigit():
+            return False
+        threshold = max(1, int(threshold or self.profile_fact_threshold))
+        with self._connect() as conn:
+            accepted_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM member_facts
+                    WHERE subject_user_id = ? AND status = 'accepted'
+                    """,
+                    (subject,),
+                ).fetchone()["count"]
+            )
+            row = conn.execute(
+                "SELECT fact_count FROM member_profiles WHERE user_id = ?",
+                (subject,),
+            ).fetchone()
+        profiled_count = int(row["fact_count"]) if row else 0
+        return accepted_count - profiled_count >= threshold
+
+    def maybe_update_user_profile(
+        self,
+        user_id: str,
+        draft: UserProfileDraft,
+        facts: list[FactRecord],
+        force: bool = False,
+    ) -> UserProfileRecord | None:
+        subject = _dashboard_user_id(user_id)
+        if not subject or not draft.summary.strip():
+            return None
+        if not force and not self.should_update_user_profile(subject):
+            return None
+        accepted_facts = [fact for fact in facts if fact.status == "accepted"]
+        fact_count = len(accepted_facts)
+        supporting_ids = draft.supporting_fact_ids or tuple(fact.id for fact in accepted_facts[-20:])
+        now = int(time.time())
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT version FROM member_profiles WHERE user_id = ?",
+                (subject,),
+            ).fetchone()
+            version = int(current["version"]) + 1 if current else 1
+            conn.execute(
+                """
+                INSERT INTO member_profiles (
+                    user_id, summary, traits_json, supporting_fact_ids,
+                    fact_count, version, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    summary = excluded.summary,
+                    traits_json = excluded.traits_json,
+                    supporting_fact_ids = excluded.supporting_fact_ids,
+                    fact_count = excluded.fact_count,
+                    version = excluded.version,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    subject,
+                    " ".join(draft.summary.split())[:500],
+                    json.dumps(draft.traits, ensure_ascii=False),
+                    json.dumps(_compact_int_list(supporting_ids, limit=80), ensure_ascii=False),
+                    fact_count,
+                    version,
+                    now,
+                ),
+            )
+        return UserProfileRecord(
+            user_id=subject,
+            summary=" ".join(draft.summary.split())[:500],
+            traits=draft.traits,
+            supporting_fact_ids=tuple(_compact_int_list(supporting_ids, limit=80)),
+            fact_count=fact_count,
+            version=version,
+            updated_at=now,
+        )
+
+    def format_user_profile(self, user_id: str) -> str:
+        profile = self.get_user_profile(user_id)
+        facts = self.list_user_facts(user_id, limit=8)
+        if profile is None and not facts:
+            return "暂无该用户画像。"
+        lines = []
+        if profile is not None:
+            lines.append(
+                f"QQ {profile.user_id} profile v{profile.version} "
+                f"(facts={profile.fact_count})\n{profile.summary}"
+            )
+            if profile.traits:
+                lines.append(json.dumps(profile.traits, ensure_ascii=False))
+        if facts:
+            lines.append("近期 FACT：")
+            lines.extend(format_fact_record(record) for record in facts)
+        return "\n".join(lines)
 
     def list_memories(
         self,
@@ -1003,6 +1342,10 @@ class BotStorage:
                 SELECT group_id FROM relationships
                 UNION
                 SELECT source_group_id AS group_id FROM memory_items WHERE source_group_id != ''
+                UNION
+                SELECT source_group_id AS group_id FROM member_facts WHERE source_group_id != ''
+                UNION
+                SELECT group_id FROM sticker_assets
                 ORDER BY group_id
                 """
             ).fetchall()
@@ -1038,12 +1381,12 @@ class BotStorage:
             user_filter_sql = f" AND user_id IN ({placeholders})"
             user_filter_params.extend(user_variants)
 
-        memory_user_filter_sql = ""
-        memory_user_filter_params: list[object] = []
+        fact_user_filter_sql = ""
+        fact_user_filter_params: list[object] = []
         if user_variants:
             placeholders = ", ".join("?" for _ in user_variants)
-            memory_user_filter_sql = f" AND owner_id IN ({placeholders})"
-            memory_user_filter_params.extend(user_variants)
+            fact_user_filter_sql = f" AND subject_user_id IN ({placeholders})"
+            fact_user_filter_params.extend(user_variants)
 
         relationship_where = "WHERE 1 = 1"
         relationship_params: list[object] = []
@@ -1065,23 +1408,42 @@ class BotStorage:
                 [*relationship_params, query_limit],
             ).fetchall()
 
-            memory_where = ["owner_type = 'user'", "status = 'active'"]
-            memory_params: list[object] = []
+            fact_where = ["status = 'accepted'"]
+            fact_params: list[object] = []
             if requested_group_id:
-                memory_where.append("source_group_id = ?")
-                memory_params.append(requested_group_id)
-            memory_rows = conn.execute(
+                fact_where.append("source_group_id = ?")
+                fact_params.append(requested_group_id)
+            fact_rows = conn.execute(
                 f"""
-                SELECT owner_id AS user_id, source_group_id, MAX(updated_at) AS updated_at
-                FROM memory_items
-                WHERE {' AND '.join(memory_where)}
-                {memory_user_filter_sql}
-                GROUP BY owner_id, source_group_id
+                SELECT subject_user_id AS user_id, source_group_id, MAX(updated_at) AS updated_at
+                FROM member_facts
+                WHERE {' AND '.join(fact_where)}
+                {fact_user_filter_sql}
+                GROUP BY subject_user_id, source_group_id
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                [*memory_params, *memory_user_filter_params, query_limit],
+                [*fact_params, *fact_user_filter_params, query_limit],
             ).fetchall()
+
+            profile_where = "WHERE 1 = 1"
+            profile_params: list[object] = []
+            if user_variants:
+                placeholders = ", ".join("?" for _ in user_variants)
+                profile_where += f" AND user_id IN ({placeholders})"
+                profile_params.extend(user_variants)
+            profile_rows = []
+            if not requested_group_id:
+                profile_rows = conn.execute(
+                    f"""
+                    SELECT user_id, updated_at
+                    FROM member_profiles
+                    {profile_where}
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    [*profile_params, query_limit],
+                ).fetchall()
 
             for row in relation_rows:
                 entry = candidate_for(str(row["user_id"]))
@@ -1090,7 +1452,7 @@ class BotStorage:
                 group_ids.add(str(row["group_id"]))
                 entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
 
-            for row in memory_rows:
+            for row in fact_rows:
                 entry = candidate_for(str(row["user_id"]))
                 source_group_id = str(row["source_group_id"] or "")
                 if source_group_id:
@@ -1099,21 +1461,28 @@ class BotStorage:
                     group_ids.add(source_group_id)
                 entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
 
+            for row in profile_rows:
+                entry = candidate_for(str(row["user_id"]))
+                entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
+
             items: list[dict[str, object]] = []
             for entry in candidates.values():
                 dashboard_user_id = str(entry["user_id"])
                 relationships = self._list_dashboard_relationship_rows(conn, dashboard_user_id, query_limit)
-                profile_records = self._list_dashboard_user_profile_records(conn, dashboard_user_id, 20)
+                fact_records = self._list_dashboard_user_fact_records(conn, dashboard_user_id, 20)
+                member_profile = self._dashboard_member_profile(conn, dashboard_user_id)
                 user_profile = self._dashboard_user_profile(conn, dashboard_user_id)
                 group_ids = entry["group_ids"]
                 assert isinstance(group_ids, set)
                 for row in relationships:
                     group_ids.add(str(row["group_id"]))
                     entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
-                for record in profile_records:
+                for record in fact_records:
                     if record.source_group_id:
                         group_ids.add(record.source_group_id)
                     entry["sort_at"] = max(int(entry["sort_at"]), record.updated_at)
+                if member_profile is not None:
+                    entry["sort_at"] = max(int(entry["sort_at"]), member_profile.updated_at)
                 sorted_group_ids = sorted(group_ids)
                 items.append(
                     {
@@ -1127,7 +1496,8 @@ class BotStorage:
                             relationships,
                             sorted_group_ids,
                         ),
-                        "profile": [_memory_to_dict(record) for record in profile_records],
+                        "profile": _user_profile_to_dict(member_profile),
+                        "facts": [_fact_to_dict(record) for record in fact_records],
                         "updated_at": int(entry["sort_at"]),
                     }
                 )
@@ -1154,29 +1524,48 @@ class BotStorage:
             [*variants, int(limit)],
         ).fetchall()
 
-    def _list_dashboard_user_profile_records(
+    def _list_dashboard_user_fact_records(
         self,
         conn: sqlite3.Connection,
         user_id: str,
         limit: int,
-    ) -> list[MemoryRecord]:
+    ) -> list[FactRecord]:
         variants = _dashboard_user_id_variants(user_id)
         placeholders = ", ".join("?" for _ in variants)
         rows = conn.execute(
             f"""
-            SELECT id, owner_type, owner_id, kind, content, confidence, importance, status,
-                   updated_at, source_user_id, source_group_id, subject_user_id,
-                   claim_scope, verification_status
-            FROM memory_items
-            WHERE owner_type = 'user'
-              AND status = 'active'
-              AND owner_id IN ({placeholders})
-            ORDER BY importance DESC, updated_at DESC, id DESC
+            SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                   confidence, status, claim_scope, source_user_id, source_group_id,
+                   evidence_message_id, evidence_text, created_at, updated_at
+            FROM member_facts
+            WHERE status = 'accepted'
+              AND subject_user_id IN ({placeholders})
+            ORDER BY updated_at DESC, id DESC
             LIMIT ?
             """,
             [*variants, int(limit)],
         ).fetchall()
-        return [_memory_record(row) for row in rows]
+        return [_fact_record(row) for row in rows]
+
+    def _dashboard_member_profile(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+    ) -> UserProfileRecord | None:
+        variants = _dashboard_user_id_variants(user_id)
+        placeholders = ", ".join("?" for _ in variants)
+        row = conn.execute(
+            f"""
+            SELECT user_id, summary, traits_json, supporting_fact_ids,
+                   fact_count, version, updated_at
+            FROM member_profiles
+            WHERE user_id IN ({placeholders})
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            variants,
+        ).fetchone()
+        return _user_profile_record(row) if row else None
 
     def _dashboard_user_profile(
         self,
@@ -1311,6 +1700,33 @@ class BotStorage:
             key = (str(item["group_id"]), str(item["message_id"]))
             item["attachments"] = by_key.get(key, [])
 
+    def list_dashboard_stickers(
+        self,
+        group_id: str = "",
+        limit: int = 200,
+    ) -> list[dict[str, object]]:
+        where = ["enabled = 1", "local_path != ''"]
+        params: list[object] = []
+        if group_id:
+            where.append("group_id = ?")
+            params.append(str(group_id))
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, group_id, source_user_id, source_message_id, url, file,
+                       local_path, sha256, description, ocr_text, mood, usage,
+                       tags, confidence, enabled, created_at, updated_at,
+                       last_seen_at, hit_count
+                FROM sticker_assets
+                WHERE {' AND '.join(where)}
+                ORDER BY group_id, confidence DESC, hit_count DESC, updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_sticker_asset_to_dict(_sticker_asset_record(row)) for row in rows]
+
     def list_dashboard_pending(self, limit: int = 100) -> list[dict[str, object]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1325,16 +1741,37 @@ class BotStorage:
                 """,
                 (int(limit),),
             ).fetchall()
+            fact_rows = conn.execute(
+                """
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at
+                FROM member_facts
+                WHERE status = 'pending_confirmation'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
 
         items = []
         for row in rows:
             record = _memory_record(row)
             data = _memory_to_dict(record)
+            data["item_type"] = "memory"
             prefix = "#bot persona self" if record.owner_type == "self" else "#bot memory"
             data["approve_command"] = f"{prefix} approve {record.id}"
             data["reject_command"] = f"{prefix} reject {record.id}"
             items.append(data)
-        return items
+        for row in fact_rows:
+            record = _fact_record(row)
+            data = _fact_to_dict(record)
+            data["item_type"] = "fact"
+            data["approve_command"] = f"#bot facts approve {record.id}"
+            data["reject_command"] = f"#bot facts reject {record.id}"
+            items.append(data)
+        items.sort(key=lambda item: int(item.get("updated_at", 0)), reverse=True)
+        return items[:limit]
 
     def build_snapshot(self, context: MessageContext) -> ConversationSnapshot:
         return ConversationSnapshot(
@@ -1344,7 +1781,9 @@ class BotStorage:
                 context.group_id,
                 limit=self.sticker_context_limit,
             ),
-            user_memories=self.list_memories("user", context.user_id, limit=10),
+            user_memories=[],
+            user_facts=self.list_user_facts(context.user_id, limit=20),
+            user_profile=self.get_user_profile(context.user_id),
             self_memories=self.list_memories("self", "bot", limit=12),
             group_reflections=self.list_memories("group", context.group_id, limit=3),
             group_lexicon=self.list_group_lexicon_records(context.group_id, limit=10),
@@ -1710,6 +2149,142 @@ class BotStorage:
                 (value, now, key, legacy_defaults[key]),
             )
 
+    def _normalize_fact_candidate(self, item: FactCandidate) -> FactCandidate:
+        source_user_id = _dashboard_user_id(item.source_user_id)
+        subject_user_id = _dashboard_user_id(item.subject_user_id)
+        claim_scope = _safe_claim_scope(item.claim_scope)
+        if claim_scope == "self_report" and subject_user_id and source_user_id and subject_user_id != source_user_id:
+            claim_scope = "third_party"
+        return replace(
+            item,
+            subject_user_id=subject_user_id,
+            fact_type=_clean_fact_field(item.fact_type, 40),
+            claim_text=_clean_fact_field(item.claim_text, 300),
+            topic=_clean_fact_field(item.topic, 120),
+            stance=_clean_fact_field(item.stance, 60),
+            confidence=_clamp_float(item.confidence),
+            status=_safe_fact_status(item.status),
+            claim_scope=claim_scope,
+            source_user_id=source_user_id,
+            source_group_id=str(item.source_group_id).strip(),
+            evidence_message_id=str(item.evidence_message_id).strip(),
+            evidence_text=_clean_fact_field(item.evidence_text, 1000),
+        )
+
+    def _fact_acceptance_status(
+        self,
+        conn: sqlite3.Connection,
+        item: FactCandidate,
+    ) -> str:
+        if not _is_complete_fact(item):
+            return "rejected"
+        if item.confidence < self.fact_confidence_threshold:
+            return "rejected"
+        if _looks_low_value_fact(item):
+            return "rejected"
+        if item.claim_scope == "third_party":
+            source_trust = self._source_trust(conn, item.source_group_id, item.source_user_id)
+            if (
+                source_trust >= self.third_party_trust_threshold
+                and item.confidence >= self.third_party_confidence_threshold
+            ):
+                return "accepted"
+            return "pending_confirmation"
+        return "accepted"
+
+    def _find_duplicate_fact(
+        self,
+        conn: sqlite3.Connection,
+        item: FactCandidate,
+        acceptance_status: str,
+    ) -> FactRecord | None:
+        target_status = "accepted" if acceptance_status == "accepted" else "pending_confirmation"
+        row = conn.execute(
+            """
+            SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                   confidence, status, claim_scope, source_user_id, source_group_id,
+                   evidence_message_id, evidence_text, created_at, updated_at
+            FROM member_facts
+            WHERE subject_user_id = ?
+              AND fact_type = ?
+              AND claim_text = ?
+              AND status = ?
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (item.subject_user_id, item.fact_type, item.claim_text, target_status),
+        ).fetchone()
+        if row:
+            return _fact_record(row)
+        if not item.evidence_message_id:
+            return None
+        row = conn.execute(
+            """
+            SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                   confidence, status, claim_scope, source_user_id, source_group_id,
+                   evidence_message_id, evidence_text, created_at, updated_at
+            FROM member_facts
+            WHERE subject_user_id = ?
+              AND evidence_message_id = ?
+              AND claim_text = ?
+              AND status = ?
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (item.subject_user_id, item.evidence_message_id, item.claim_text, target_status),
+        ).fetchone()
+        return _fact_record(row) if row else None
+
+    def _insert_fact(
+        self,
+        conn: sqlite3.Connection,
+        item: FactCandidate,
+        now: int,
+    ) -> FactRecord:
+        cursor = conn.execute(
+            """
+            INSERT INTO member_facts (
+                subject_user_id, fact_type, claim_text, topic, stance,
+                confidence, status, claim_scope, source_user_id, source_group_id,
+                evidence_message_id, evidence_text, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item.subject_user_id,
+                item.fact_type,
+                item.claim_text,
+                item.topic,
+                item.stance,
+                item.confidence,
+                item.status,
+                item.claim_scope,
+                item.source_user_id,
+                item.source_group_id,
+                item.evidence_message_id,
+                item.evidence_text,
+                now,
+                now,
+            ),
+        )
+        return FactRecord(
+            id=int(cursor.lastrowid),
+            subject_user_id=item.subject_user_id,
+            fact_type=item.fact_type,
+            claim_text=item.claim_text,
+            topic=item.topic,
+            stance=item.stance,
+            confidence=item.confidence,
+            status=item.status,
+            claim_scope=item.claim_scope,
+            source_user_id=item.source_user_id,
+            source_group_id=item.source_group_id,
+            evidence_message_id=item.evidence_message_id,
+            evidence_text=item.evidence_text,
+            created_at=now,
+            updated_at=now,
+        )
+
     def _normalize_memory_candidate(self, item: MemoryCandidate) -> MemoryCandidate:
         return replace(
             item,
@@ -1909,6 +2484,15 @@ def format_memory_record(record: MemoryRecord) -> str:
     )
 
 
+def format_fact_record(record: FactRecord) -> str:
+    return (
+        f"#{record.id} [{record.fact_type}/{record.status}/{record.claim_scope}] "
+        f"{record.claim_text} -> user:{record.subject_user_id} "
+        f"(topic={record.topic}, stance={record.stance or '-'}, "
+        f"src={record.source_user_id}, conf={record.confidence:.2f})"
+    )
+
+
 def format_sticker_asset(asset: StickerAssetRecord) -> str:
     status = "enabled" if asset.enabled else "disabled"
     tags = "、".join(asset.tags[:5]) or "(no tags)"
@@ -1919,6 +2503,33 @@ def format_sticker_asset(asset: StickerAssetRecord) -> str:
         f"用途：{usage}\n"
         f"本地：{asset.local_path}"
     )
+
+
+def _sticker_asset_to_dict(asset: StickerAssetRecord) -> dict[str, object]:
+    usage = asset.usage or asset.description or "(no usage)"
+    return {
+        "id": asset.id,
+        "group_id": asset.group_id,
+        "source_user_id": asset.source_user_id,
+        "source_message_id": asset.source_message_id,
+        "url": asset.url,
+        "file": asset.file,
+        "local_path": asset.local_path,
+        "sha256": asset.sha256,
+        "description": asset.description,
+        "ocr_text": asset.ocr_text,
+        "mood": asset.mood,
+        "usage": usage,
+        "trigger": usage,
+        "tags": list(asset.tags),
+        "confidence": asset.confidence,
+        "enabled": asset.enabled,
+        "created_at": asset.created_at,
+        "updated_at": asset.updated_at,
+        "last_seen_at": asset.last_seen_at,
+        "hit_count": asset.hit_count,
+        "delete_command": f"#bot stickers delete {asset.id}",
+    }
 
 
 def _compact_persona_items(items: dict[str, str]) -> dict[str, str]:
@@ -1941,6 +2552,40 @@ def _memory_to_dict(record: MemoryRecord) -> dict[str, object]:
         "subject_user_id": record.subject_user_id,
         "claim_scope": record.claim_scope,
         "verification_status": record.verification_status,
+    }
+
+
+def _fact_to_dict(record: FactRecord) -> dict[str, object]:
+    return {
+        "id": record.id,
+        "subject_user_id": record.subject_user_id,
+        "fact_type": record.fact_type,
+        "claim_text": record.claim_text,
+        "topic": record.topic,
+        "stance": record.stance,
+        "confidence": record.confidence,
+        "status": record.status,
+        "claim_scope": record.claim_scope,
+        "source_user_id": record.source_user_id,
+        "source_group_id": record.source_group_id,
+        "evidence_message_id": record.evidence_message_id,
+        "evidence_text": record.evidence_text,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
+def _user_profile_to_dict(record: UserProfileRecord | None) -> dict[str, object] | None:
+    if record is None:
+        return None
+    return {
+        "user_id": record.user_id,
+        "summary": record.summary,
+        "traits": record.traits,
+        "supporting_fact_ids": list(record.supporting_fact_ids),
+        "fact_count": record.fact_count,
+        "version": record.version,
+        "updated_at": record.updated_at,
     }
 
 
@@ -2079,6 +2724,38 @@ def _memory_record(row: sqlite3.Row) -> MemoryRecord:
     )
 
 
+def _fact_record(row: sqlite3.Row) -> FactRecord:
+    return FactRecord(
+        id=int(row["id"]),
+        subject_user_id=str(row["subject_user_id"]),
+        fact_type=str(row["fact_type"]),
+        claim_text=str(row["claim_text"]),
+        topic=str(row["topic"]),
+        stance=str(row["stance"] or ""),
+        confidence=float(row["confidence"]),
+        status=str(row["status"]),
+        claim_scope=str(row["claim_scope"]),
+        source_user_id=str(row["source_user_id"] or ""),
+        source_group_id=str(row["source_group_id"] or ""),
+        evidence_message_id=str(row["evidence_message_id"] or ""),
+        evidence_text=str(row["evidence_text"] or ""),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+    )
+
+
+def _user_profile_record(row: sqlite3.Row) -> UserProfileRecord:
+    return UserProfileRecord(
+        user_id=str(row["user_id"]),
+        summary=str(row["summary"] or ""),
+        traits=_decode_traits(str(row["traits_json"] or "{}")),
+        supporting_fact_ids=tuple(_decode_int_list(str(row["supporting_fact_ids"] or "[]"))),
+        fact_count=int(row["fact_count"]),
+        version=int(row["version"]),
+        updated_at=int(row["updated_at"]),
+    )
+
+
 def _clamp_score(value: int) -> int:
     return max(0, min(100, int(value)))
 
@@ -2093,6 +2770,47 @@ def _safe_claim_scope(value: str) -> str:
 
 def _safe_verification_status(value: str) -> str:
     return value if value in {"accepted", "pending_confirmation", "conflict", "rejected"} else "pending_confirmation"
+
+
+def _safe_fact_status(value: str) -> str:
+    return value if value in {"candidate", "accepted", "pending_confirmation", "rejected"} else "candidate"
+
+
+def _clean_fact_field(value: str, limit: int) -> str:
+    return " ".join(str(value or "").strip().split())[:limit]
+
+
+def _is_complete_fact(item: FactCandidate) -> bool:
+    return bool(
+        item.subject_user_id
+        and item.fact_type
+        and item.claim_text
+        and item.topic
+        and item.evidence_message_id
+        and item.evidence_text
+    )
+
+
+def _looks_low_value_fact(item: FactCandidate) -> bool:
+    text = f"{item.claim_text} {item.topic} {item.evidence_text}"
+    if len(item.claim_text) < 6 or len(item.topic) < 2:
+        return True
+    low_value_markers = (
+        "继续聊",
+        "随口",
+        "发了",
+        "发送",
+        "分享图片",
+        "分享截图",
+        "空消息",
+        "表情包",
+        "聊天",
+        "参与讨论",
+        "表达情绪",
+    )
+    return any(marker in text for marker in low_value_markers) and not any(
+        signal in text for signal in ("认为", "觉得", "喜欢", "讨厌", "支持", "反对", "评价", "倾向")
+    )
 
 
 def _row_value(row: sqlite3.Row, key: str, default: str) -> str:
@@ -2125,6 +2843,41 @@ def _decode_string_list(value: str) -> list[str]:
     if not isinstance(decoded, list):
         return []
     return _compact_string_list((str(item) for item in decoded), limit=10)
+
+
+def _compact_int_list(values: Iterable[int], limit: int = 20) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        try:
+            item = int(value)
+        except (TypeError, ValueError):
+            continue
+        if item in seen:
+            continue
+        result.append(item)
+        seen.add(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _decode_int_list(value: str) -> list[int]:
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return _compact_int_list(decoded, limit=80)
+
+
+def _decode_traits(value: str) -> dict[str, object]:
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _normalize_lexicon_term(term: str) -> str:

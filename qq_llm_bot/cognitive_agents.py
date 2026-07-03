@@ -12,9 +12,12 @@ from qq_llm_bot.config import AppConfig, ParticipationMode
 from qq_llm_bot.llm import LLMClient
 from qq_llm_bot.models import (
     ConversationSnapshot,
+    FactCandidate,
+    FactRecord,
     ImageVisionCacheRecord,
     MemoryCandidate,
     MemoryRecord,
+    MessageAttachment,
     MessageContext,
     ParticipationDecision,
     PerceptionResult,
@@ -23,6 +26,8 @@ from qq_llm_bot.models import (
     ReplyDraft,
     StickerAssetRecord,
     StickerCandidate,
+    UserProfileDraft,
+    UserProfileRecord,
 )
 from qq_llm_bot.relationship_summary import clean_relationship_summary_patch
 from qq_llm_bot.web_search import SearchResult, WebSearchClient, build_web_search_client, default_slang_query
@@ -42,7 +47,9 @@ class VisionAnalysis:
     ocr_text: str = ""
     topics: tuple[str, ...] = ()
     memory_candidates: tuple[MemoryCandidate, ...] = ()
+    fact_candidates: tuple[FactCandidate, ...] = ()
     sticker_candidates: tuple[StickerCandidate, ...] = ()
+    attachment_descriptions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,7 @@ class VisionImageResult:
     description: str = ""
     ocr_text: str = ""
     topics: tuple[str, ...] = ()
+    image_type: str = "unknown"
     memory: str = ""
     confidence: float = 0.0
     importance: float = 0.5
@@ -333,6 +341,148 @@ class MemoryCuratorAgent:
         return memories
 
 
+class FactExtractorAgent:
+    SELF_PATTERNS = (
+        ("preference", re.compile(r"我(?:很|比较|超|挺)?喜欢\s*([^，。,.!！?？]{1,50})")),
+        ("dislike", re.compile(r"我(?:不喜欢|讨厌)\s*([^，。,.!！?？]{1,50})")),
+        ("identity", re.compile(r"我是\s*([^，。,.!！?？]{1,50})")),
+        ("opinion", re.compile(r"我(?:觉得|认为|感觉)\s*([^，。,.!！?？]{2,80})")),
+    )
+
+    THIRD_PARTY_PATTERN = re.compile(
+        r"([^\s，。,.!！?？我大家群里]{1,16})(喜欢|不喜欢|讨厌|认为|觉得)\s*([^，。,.!！?？]{1,80})"
+    )
+
+    def __init__(self, llm: LLMClient) -> None:
+        self.llm = llm
+
+    async def extract(
+        self,
+        context: MessageContext,
+        perception: PerceptionResult,
+        snapshot: ConversationSnapshot,
+    ) -> list[FactCandidate]:
+        fallback = self._heuristic(context)
+        data = await _complete_json(
+            self.llm,
+            "你是保守的群聊 FACT 抽取器。只输出 JSON，不要解释。",
+            (
+                "从这条 QQ 群消息和必要上下文中抽取成员认知 FACT。"
+                "FACT 必须是结论性、要素完整、证据文本明确的原子断言。"
+                "只记录成员的观点、偏好、身份、稳定倾向或对事件/对象的评价。"
+                "不要记录聊天动作、继续聊、分享、发送图片、空消息、一次性情绪或流水账。"
+                "如果主语、对象/话题、结论、证据任一不明确，facts 返回空数组。"
+                "本人发言里的自我观点用 self_report；别人转述某成员用 third_party。"
+                "输出 JSON："
+                '{"facts":[{"subject_user_id":"QQ或name:称呼","fact_type":"preference|dislike|'
+                'opinion|identity|habit|skill|boundary|event_stance|other",'
+                '"claim_text":"完整结论句","topic":"对象或事件","stance":"positive|negative|neutral|mixed|unknown",'
+                '"confidence":0.0,"claim_scope":"self_report|third_party",'
+                '"evidence_text":"原消息中的证据片段"}]}\n'
+                "好例子：我觉得刮刮乐像负期望彩票 -> 用户认为刮刮乐活动像负期望彩票。"
+                "坏例子：继续聊比赛感受、分享截图、哈哈、空消息 -> facts=[]。\n"
+                f"说话人 QQ：{context.user_id}\n"
+                f"最近上下文：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"当前消息：{context.plain_text}"
+            ),
+        )
+        facts: list[FactCandidate] = []
+        if data:
+            for item in data.get("facts", []):
+                if not isinstance(item, dict):
+                    continue
+                fact = self._parse_llm_fact(context, item)
+                if fact:
+                    facts.append(fact)
+        return _dedupe_fact_candidates(facts) or fallback
+
+    def _parse_llm_fact(
+        self,
+        context: MessageContext,
+        item: dict[str, Any],
+    ) -> FactCandidate | None:
+        claim_scope = _safe_claim_scope(str(item.get("claim_scope", "self_report")).strip())
+        subject_user_id = str(item.get("subject_user_id", "")).strip()
+        if not subject_user_id and claim_scope == "self_report":
+            subject_user_id = context.user_id
+        claim_text = _clean_fact_text(str(item.get("claim_text", "")), 300)
+        topic = _clean_fact_text(str(item.get("topic", "")), 120)
+        evidence_text = _clean_fact_text(str(item.get("evidence_text", "")), 1000)
+        if not subject_user_id or not claim_text or not topic or not evidence_text:
+            return None
+        if _looks_low_value_fact_text(claim_text, topic, evidence_text):
+            return None
+        return FactCandidate(
+            subject_user_id=subject_user_id,
+            fact_type=_safe_fact_type(str(item.get("fact_type", "other")).strip()),
+            claim_text=claim_text,
+            topic=topic,
+            stance=_safe_stance(str(item.get("stance", "unknown")).strip()),
+            confidence=_clamp_float(item.get("confidence", 0.0)),
+            evidence_message_id=context.message_id,
+            evidence_text=evidence_text,
+            source_user_id=context.user_id,
+            source_group_id=context.group_id,
+            claim_scope=claim_scope,  # type: ignore[arg-type]
+        )
+
+    def _heuristic(self, context: MessageContext) -> list[FactCandidate]:
+        text = _strip_bot_call(context.plain_text, [])
+        if not text or _looks_low_value_fact_text(text, text, text):
+            return []
+        facts: list[FactCandidate] = []
+        for fact_type, pattern in self.SELF_PATTERNS:
+            for match in pattern.finditer(text):
+                value = match.group(1).strip()
+                if not value:
+                    continue
+                topic = _heuristic_fact_topic(value)
+                stance = _heuristic_stance(value, fact_type)
+                if fact_type == "preference":
+                    claim = f"用户{context.user_id}喜欢{value}"
+                elif fact_type == "dislike":
+                    claim = f"用户{context.user_id}不喜欢{value}"
+                elif fact_type == "identity":
+                    claim = f"用户{context.user_id}表示自己是{value}"
+                else:
+                    claim = f"用户{context.user_id}认为{value}"
+                facts.append(
+                    _fact_candidate(
+                        context=context,
+                        subject_user_id=context.user_id,
+                        fact_type=fact_type,
+                        claim_text=claim,
+                        topic=topic,
+                        stance=stance,
+                        confidence=0.8,
+                        claim_scope="self_report",
+                        evidence_text=match.group(0),
+                    )
+                )
+
+        for match in self.THIRD_PARTY_PATTERN.finditer(text):
+            subject = match.group(1).strip()
+            verb = match.group(2).strip()
+            value = match.group(3).strip()
+            if not subject or subject in {"可可", "机器人", "大家", "群里", "我们", "你"}:
+                continue
+            fact_type = "preference" if verb == "喜欢" else "dislike" if verb in {"不喜欢", "讨厌"} else "opinion"
+            facts.append(
+                _fact_candidate(
+                    context=context,
+                    subject_user_id=f"name:{subject}",
+                    fact_type=fact_type,
+                    claim_text=f"{subject}{verb}{value}",
+                    topic=_heuristic_fact_topic(value),
+                    stance=_heuristic_stance(value, fact_type),
+                    confidence=0.78,
+                    claim_scope="third_party",
+                    evidence_text=match.group(0),
+                )
+            )
+        return _dedupe_fact_candidates(facts)
+
+
 class LexiconAgent:
     def __init__(
         self,
@@ -544,11 +694,11 @@ class VisionAgent:
     async def analyze(self, context: MessageContext) -> VisionAnalysis:
         if not self.config.vision.enabled:
             return VisionAnalysis([])
-        image_urls = [
-            attachment.url
-            for attachment in context.attachments
-            if attachment.attachment_type == "image" and attachment.url
-        ][: self.config.vision.max_images_per_message]
+        image_attachments = _select_image_attachments(
+            context.attachments,
+            self.config.vision.max_images_per_message,
+        )
+        image_urls = [attachment.url for attachment in image_attachments]
         if not image_urls:
             return VisionAnalysis([])
 
@@ -568,7 +718,13 @@ class VisionAgent:
                     "长期记忆只记录非隐私、对群聊上下文有帮助的图片观察。"
                     f"{sticker_prompt}"
                     "输出 JSON："
+                    "如果一条消息里有多张图，你看到的是抽样图；请结合这些图判断这一组图片的大意。"
+                    "把每张图分成 image_type：sticker=表情包/梗图/反应图；"
+                    "content_image=有可读文字、截图、海报、文档、聊天记录等内容型图片；"
+                    "pure_image=没有明显可读文字、主要靠画面本身表达的照片/插画/截图；"
+                    "unknown=无法判断。"
                     '{"images":[{"description":"图像简述","ocr_text":"可空","topics":["话题"],'
+                    '"image_type":"sticker|content_image|pure_image|unknown",'
                     '"should_remember":bool,"memory":"可空","confidence":0.0,"importance":0.0,'
                     '"is_sticker":bool,"sticker_mood":"可空","sticker_usage":"可空",'
                     '"sticker_tags":["可空"],"sticker_confidence":0.0}]}\n'
@@ -585,7 +741,7 @@ class VisionAgent:
         results_by_url = {**cached_results, **fresh_results}
         if not results_by_url:
             return fallback
-        return self._build_analysis_from_results(context, image_urls, results_by_url, fallback)
+        return self._build_analysis_from_results(context, image_attachments, image_urls, results_by_url, fallback)
 
     def _sticker_prompt(self) -> str:
         if not self.config.stickers.enabled:
@@ -606,23 +762,25 @@ class VisionAgent:
         for url in _dedupe_strings(image_urls):
             record = self._get_cached_record(url)
             if record and (record.description or record.ocr_text or record.memory):
+                is_sticker = (
+                    self.config.stickers.enabled
+                    and record.confidence >= self.config.stickers.min_confidence
+                    and _looks_like_sticker_image(
+                        record.description,
+                        record.ocr_text,
+                        record.topics,
+                    )
+                )
                 cached[url] = VisionImageResult(
                     url=record.url,
                     description=record.description,
                     ocr_text=record.ocr_text,
                     topics=record.topics,
+                    image_type=_infer_image_type(record.description, record.ocr_text, record.topics, is_sticker),
                     memory=record.memory,
                     confidence=record.confidence,
                     importance=record.importance,
-                    is_sticker=(
-                        self.config.stickers.enabled
-                        and record.confidence >= self.config.stickers.min_confidence
-                        and _looks_like_sticker_image(
-                            record.description,
-                            record.ocr_text,
-                            record.topics,
-                        )
-                    ),
+                    is_sticker=is_sticker,
                     sticker_tags=record.topics,
                     sticker_confidence=record.confidence,
                 )
@@ -661,6 +819,11 @@ class VisionAgent:
         topics = tuple(_clean_list(item.get("topics"))[:5])
         memory_text = _clean_image_text(str(item.get("memory", "")))
         should_remember = _as_bool(item.get("should_remember"), False)
+        raw_is_sticker = _as_bool(item.get("is_sticker"), False)
+        is_sticker = self._is_sticker_item(item, description, ocr_text, topics, confidence)
+        image_type = _safe_image_type(str(item.get("image_type", "unknown")).strip())
+        if image_type == "unknown":
+            image_type = _infer_image_type(description, ocr_text, topics, raw_is_sticker or is_sticker)
         if (
             not should_remember
             or confidence < self.config.vision.remember_threshold
@@ -672,10 +835,11 @@ class VisionAgent:
             description=description,
             ocr_text=ocr_text,
             topics=topics,
+            image_type=image_type,
             memory=memory_text,
             confidence=confidence,
             importance=importance,
-            is_sticker=self._is_sticker_item(item, description, ocr_text, topics, confidence),
+            is_sticker=is_sticker,
             sticker_mood=_clean_sticker_text(str(item.get("sticker_mood", "")), limit=80),
             sticker_usage=_clean_sticker_text(str(item.get("sticker_usage", "")), limit=240),
             sticker_tags=tuple(_clean_list(item.get("sticker_tags"))[:8]),
@@ -719,6 +883,7 @@ class VisionAgent:
     def _build_analysis_from_results(
         self,
         context: MessageContext,
+        image_attachments: list[MessageAttachment],
         image_urls: list[str],
         results_by_url: dict[str, VisionImageResult],
         fallback: VisionAnalysis,
@@ -727,12 +892,11 @@ class VisionAgent:
         ocr_parts: list[str] = []
         topics: list[str] = []
         memories: list[MemoryCandidate] = []
+        facts: list[FactCandidate] = []
         stickers: list[StickerCandidate] = []
         seen_memory_urls: set[str] = set()
+        seen_fact_keys: set[tuple[str, str]] = set()
         seen_ocr_urls: set[str] = set()
-        image_attachments = [
-            attachment for attachment in context.attachments if attachment.attachment_type == "image"
-        ][: self.config.vision.max_images_per_message]
         for index, url in enumerate(image_urls):
             result = results_by_url.get(url)
             if result and result.description:
@@ -753,6 +917,12 @@ class VisionAgent:
             ):
                 memories.append(self._memory_candidate_from_image(context, index, result))
                 seen_memory_urls.add(url)
+            fact = self._fact_candidate_from_image_interest(context, index, result)
+            if fact:
+                fact_key = (fact.subject_user_id, fact.claim_text)
+                if fact_key not in seen_fact_keys:
+                    facts.append(fact)
+                    seen_fact_keys.add(fact_key)
             if result.is_sticker and result.sticker_confidence >= self.config.stickers.min_confidence:
                 attachment = image_attachments[index] if index < len(image_attachments) else None
                 stickers.append(
@@ -773,7 +943,9 @@ class VisionAgent:
             ocr_text="\n".join(_dedupe_strings(ocr_parts)),
             topics=tuple(_dedupe_strings(topics)),
             memory_candidates=tuple(memories),
+            fact_candidates=tuple(facts),
             sticker_candidates=tuple(stickers),
+            attachment_descriptions=_attachment_descriptions(context, results_by_url),
         )
 
     def _memory_candidate_from_image(
@@ -804,16 +976,69 @@ class VisionAgent:
             claim_scope="group_fact",
         )
 
+    def _fact_candidate_from_image_interest(
+        self,
+        context: MessageContext,
+        index: int,
+        result: VisionImageResult,
+    ) -> FactCandidate | None:
+        image_type = result.image_type
+        if image_type == "unknown":
+            image_type = _infer_image_type(result.description, result.ocr_text, result.topics, result.is_sticker)
+        if image_type == "sticker" or result.is_sticker:
+            return None
+        if result.confidence < 0.55 or not result.description:
+            return None
+
+        topic = _image_interest_topic(result)
+        if not topic:
+            return None
+        if image_type == "content_image" or result.ocr_text:
+            claim_text = f"用户{context.user_id}对图片中的{topic}内容感兴趣"
+            evidence_kind = "content_image"
+        elif image_type == "pure_image":
+            claim_text = f"用户{context.user_id}对{topic}这类图片感兴趣"
+            evidence_kind = "pure_image"
+        else:
+            return None
+
+        evidence_parts = [
+            f"image_index={index}",
+            f"image_type={evidence_kind}",
+            f"description={result.description}",
+        ]
+        if result.ocr_text:
+            evidence_parts.append(f"ocr={result.ocr_text}")
+        return _fact_candidate(
+            context=context,
+            subject_user_id=context.user_id,
+            fact_type="preference",
+            claim_text=claim_text,
+            topic=topic,
+            stance="positive",
+            confidence=max(0.76, result.confidence),
+            claim_scope="self_report",
+            evidence_text="\n".join(evidence_parts),
+        )
+
     def _fallback_analysis(self, context: MessageContext) -> VisionAnalysis:
         descriptions = []
-        for attachment in context.attachments:
-            if attachment.attachment_type != "image":
-                continue
+        attachment_descriptions = []
+        selected = _select_image_attachments(context.attachments, self.config.vision.max_images_per_message)
+        selected_urls = {attachment.url for attachment in selected if attachment.url}
+        for attachment in [item for item in context.attachments if item.attachment_type == "image"]:
+            summary = ""
             if attachment.summary:
-                descriptions.append(attachment.summary)
-            elif attachment.url or attachment.file:
-                descriptions.append("收到一张图片，但当前没有可用的视觉解读结果")
-        return VisionAnalysis(descriptions[: self.config.vision.max_images_per_message])
+                summary = attachment.summary
+            elif attachment.url in selected_urls or (not attachment.url and attachment.file):
+                summary = "收到一张图片，但当前没有可用的视觉解读结果"
+            attachment_descriptions.append(summary)
+            if summary and (not attachment.url or attachment.url in selected_urls):
+                descriptions.append(summary)
+        return VisionAnalysis(
+            descriptions[: self.config.vision.max_images_per_message],
+            attachment_descriptions=tuple(attachment_descriptions),
+        )
 
 
 class RelationshipAgent:
@@ -1210,7 +1435,8 @@ class ResponseAgent:
             f"本轮已批准自我记忆：\n{_format_memory_candidates(approved_self_memories)}\n"
             f"最近群聊：\n{_join_lines(snapshot.recent_messages)}\n"
             f"最近图片：\n{_join_lines(snapshot.recent_image_descriptions)}\n"
-            f"发言人画像：\n{_format_memories(snapshot.user_memories)}\n"
+            f"发言人全局画像：\n{_format_user_profile_record(snapshot.user_profile)}\n"
+            f"发言人 FACT：\n{_format_fact_records(snapshot.user_facts[:10])}\n"
             f"与发言人关系：{_format_relationship(snapshot)}\n"
             f"群复盘：\n{_format_memories(snapshot.group_reflections)}\n"
             f"群内词条：\n{_format_memories(snapshot.group_lexicon)}\n"
@@ -1458,6 +1684,50 @@ class ReflectionAgent:
         )
 
 
+class ProfileAggregatorAgent:
+    def __init__(self, llm: LLMClient) -> None:
+        self.llm = llm
+
+    async def aggregate(
+        self,
+        user_id: str,
+        facts: list[FactRecord],
+        current_profile: UserProfileRecord | None = None,
+    ) -> UserProfileDraft | None:
+        if not facts:
+            return None
+        data = await _complete_json(
+            self.llm,
+            "你是群成员画像分析器。只输出 JSON，不要解释。",
+            (
+                "根据 accepted FACT 更新该 QQ 用户的全局画像。"
+                "画像必须从 FACT 归纳，不要编造 FACT 没有支持的内容。"
+                "summary 用 1-3 句中文概括稳定特征、偏好、观点倾向或互动风格。"
+                "traits 是对象，可包含 preferences、opinions、communication_style、interests、boundaries 等数组。"
+                "supporting_fact_ids 只填实际支撑画像的 FACT id。"
+                "输出 JSON："
+                '{"summary":"画像摘要","traits":{"preferences":[],"opinions":[]},'
+                '"supporting_fact_ids":[1,2]}\n'
+                f"QQ：{user_id}\n"
+                f"当前画像：\n{_format_user_profile_record(current_profile)}\n"
+                f"FACT：\n{_format_fact_records(facts)}"
+            ),
+        )
+        if not data:
+            return None
+        summary = _clean_fact_text(str(data.get("summary", "")), 500)
+        traits = _clean_traits(data.get("traits"))
+        fallback_ids = tuple(fact.id for fact in facts[:20])
+        supporting_ids = _parse_fact_ids(data.get("supporting_fact_ids"), fallback_ids)
+        if not summary:
+            return None
+        return UserProfileDraft(
+            summary=summary,
+            traits=traits,
+            supporting_fact_ids=supporting_ids,
+        )
+
+
 class AgentPipeline:
     def __init__(
         self,
@@ -1468,7 +1738,7 @@ class AgentPipeline:
     ) -> None:
         self.perception = PerceptionAgent(llm)
         self.vision = VisionAgent(config, llm, vision_cache)
-        self.memory_curator = MemoryCuratorAgent(llm)
+        self.fact_extractor = FactExtractorAgent(llm)
         self.lexicon = LexiconAgent(config, llm, web_search)
         self.relationship = RelationshipAgent(llm)
         self.policy = ParticipationPolicyAgent(config, llm)
@@ -1476,6 +1746,7 @@ class AgentPipeline:
         self.response = ResponseAgent(config, llm)
         self.stickers = StickerSelectorAgent(config, llm)
         self.reflection = ReflectionAgent(llm)
+        self.profile_aggregator = ProfileAggregatorAgent(llm)
 
     async def run(
         self,
@@ -1486,7 +1757,7 @@ class AgentPipeline:
         vision = await self.vision.analyze(context)
         enriched_context = _context_with_vision(context, vision)
         perception = await self.perception.analyze(enriched_context, snapshot)
-        memories = await self.memory_curator.extract(enriched_context, perception, snapshot)
+        facts = await self.fact_extractor.extract(enriched_context, perception, snapshot)
         lexicon_memories = await self.lexicon.learn(enriched_context, snapshot)
         relationship_delta = await self.relationship.calculate_delta(
             enriched_context,
@@ -1515,12 +1786,13 @@ class AgentPipeline:
         )
         return PipelineResult(
             perception=perception,
-            memories=[*memories, *lexicon_memories, *vision.memory_candidates],
+            memories=[*lexicon_memories, *vision.memory_candidates],
+            facts=[*facts, *vision.fact_candidates],
             relationship_delta=relationship_delta,
             decision=decision,
             reply=reply_draft.text,
             reply_self_memories=reply_draft.self_memory_candidates,
-            image_descriptions=vision.descriptions,
+            image_descriptions=list(vision.attachment_descriptions or tuple(vision.descriptions)),
             sticker_candidates=list(vision.sticker_candidates),
             selected_sticker=selected_sticker,
         )
@@ -1532,6 +1804,14 @@ class AgentPipeline:
         prior_reflections: list[MemoryRecord],
     ) -> MemoryCandidate | None:
         return await self.reflection.reflect(group_id, recent_messages, prior_reflections)
+
+    async def profile(
+        self,
+        user_id: str,
+        facts: list[FactRecord],
+        current_profile: UserProfileRecord | None = None,
+    ) -> UserProfileDraft | None:
+        return await self.profile_aggregator.aggregate(user_id, facts, current_profile)
 
 
 async def _complete_json(llm: LLMClient, system_prompt: str, user_prompt: str) -> dict[str, Any] | None:
@@ -1607,6 +1887,118 @@ def _safe_claim_scope(value: str) -> str:
     return value if value in {"self_report", "third_party", "bot_directed", "group_fact"} else "self_report"
 
 
+def _safe_fact_type(value: str) -> str:
+    allowed = {
+        "preference",
+        "dislike",
+        "opinion",
+        "identity",
+        "habit",
+        "skill",
+        "boundary",
+        "event_stance",
+        "other",
+    }
+    return value if value in allowed else "other"
+
+
+def _safe_stance(value: str) -> str:
+    return value if value in {"positive", "negative", "neutral", "mixed", "unknown"} else "unknown"
+
+
+def _clean_fact_text(value: str, limit: int) -> str:
+    text = " ".join(str(value or "").strip().split())
+    return text[:limit].strip()
+
+
+def _looks_low_value_fact_text(claim_text: str, topic: str, evidence_text: str) -> bool:
+    combined = f"{claim_text} {topic} {evidence_text}".strip()
+    if not combined or combined.startswith("[图片解读]") or combined.startswith("[图片文字]"):
+        return True
+    if len(_clean_fact_text(claim_text, 300)) < 4:
+        return True
+    low_value = (
+        "继续聊",
+        "随口",
+        "发了",
+        "发送",
+        "分享图片",
+        "分享截图",
+        "空消息",
+        "表情包",
+        "接梗",
+        "聊天",
+        "参与讨论",
+        "表达情绪",
+    )
+    signals = ("认为", "觉得", "喜欢", "不喜欢", "讨厌", "支持", "反对", "评价", "表示自己")
+    return any(token in combined for token in low_value) and not any(token in combined for token in signals)
+
+
+def _heuristic_fact_topic(value: str) -> str:
+    text = _clean_fact_text(value, 120)
+    if not text:
+        return ""
+    for marker in ("像", "是", "不", "很", "太", "应该", "可以", "不能", "好", "差", "离谱"):
+        index = text.find(marker)
+        if index > 1:
+            return text[:index].strip()
+    return text[:30].strip()
+
+
+def _heuristic_stance(value: str, fact_type: str) -> str:
+    if fact_type == "preference":
+        return "positive"
+    if fact_type == "dislike":
+        return "negative"
+    if any(token in value for token in ("不", "差", "烂", "离谱", "讨厌", "恶心", "亏", "负面")):
+        return "negative"
+    if any(token in value for token in ("好", "喜欢", "支持", "可以", "舒服", "赞")):
+        return "positive"
+    return "neutral"
+
+
+def _fact_candidate(
+    *,
+    context: MessageContext,
+    subject_user_id: str,
+    fact_type: str,
+    claim_text: str,
+    topic: str,
+    stance: str,
+    confidence: float,
+    claim_scope: str,
+    evidence_text: str,
+) -> FactCandidate:
+    return FactCandidate(
+        subject_user_id=subject_user_id,
+        fact_type=_safe_fact_type(fact_type),
+        claim_text=_clean_fact_text(claim_text, 300),
+        topic=_clean_fact_text(topic, 120),
+        stance=_safe_stance(stance),
+        confidence=_clamp_float(confidence),
+        evidence_message_id=context.message_id,
+        evidence_text=_clean_fact_text(evidence_text, 1000),
+        source_user_id=context.user_id,
+        source_group_id=context.group_id,
+        claim_scope=_safe_claim_scope(claim_scope),  # type: ignore[arg-type]
+    )
+
+
+def _dedupe_fact_candidates(facts: list[FactCandidate]) -> list[FactCandidate]:
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[FactCandidate] = []
+    for fact in facts:
+        if _looks_low_value_fact_text(fact.claim_text, fact.topic, fact.evidence_text):
+            continue
+        key = (fact.subject_user_id, fact.fact_type, fact.claim_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(fact)
+    return deduped
+
+
 def _context_with_vision(context: MessageContext, vision: VisionAnalysis) -> MessageContext:
     if not vision.descriptions and not vision.ocr_text:
         return context
@@ -1618,6 +2010,79 @@ def _context_with_vision(context: MessageContext, vision: VisionAnalysis) -> Mes
     if vision.ocr_text:
         lines.append(f"[图片文字] {vision.ocr_text}")
     return replace(context, plain_text="\n".join(lines))
+
+
+def _select_image_attachments(
+    attachments: list[MessageAttachment],
+    limit: int,
+) -> list[MessageAttachment]:
+    images = [attachment for attachment in attachments if attachment.attachment_type == "image" and attachment.url]
+    max_count = max(1, int(limit))
+    if len(images) <= max_count:
+        return images
+    if max_count == 1:
+        return [images[0]]
+    if max_count == 2:
+        return [images[0], images[-1]]
+
+    step = (len(images) - 1) / (max_count - 1)
+    indices: list[int] = []
+    for slot in range(max_count):
+        index = int(round(slot * step))
+        if index not in indices:
+            indices.append(index)
+    if indices[-1] != len(images) - 1:
+        indices[-1] = len(images) - 1
+    return [images[index] for index in indices]
+
+
+def _safe_image_type(value: str) -> str:
+    return value if value in {"sticker", "content_image", "pure_image", "unknown"} else "unknown"
+
+
+def _infer_image_type(
+    description: str,
+    ocr_text: str,
+    topics: tuple[str, ...],
+    is_sticker: bool,
+) -> str:
+    if is_sticker or _looks_like_sticker_image(description, ocr_text, topics):
+        return "sticker"
+    if ocr_text.strip():
+        return "content_image"
+    if description.strip():
+        return "pure_image"
+    return "unknown"
+
+
+def _attachment_descriptions(
+    context: MessageContext,
+    results_by_url: dict[str, VisionImageResult],
+) -> tuple[str, ...]:
+    descriptions: list[str] = []
+    for attachment in context.attachments:
+        if attachment.attachment_type != "image":
+            continue
+        result = results_by_url.get(attachment.url)
+        if result and result.description:
+            descriptions.append(result.description)
+        else:
+            descriptions.append("")
+    return tuple(descriptions)
+
+
+def _image_interest_topic(result: VisionImageResult) -> str:
+    for topic in result.topics:
+        cleaned = _clean_fact_text(topic, 40)
+        if cleaned and cleaned not in {"图片", "截图", "照片", "内容", "文字"}:
+            return cleaned
+    if result.ocr_text:
+        text = _clean_fact_text(result.ocr_text, 80)
+        return text[:30].strip()
+    description = result.description
+    description = re.sub(r"^(一张|这张|图片中|图中|照片中|画面中)", "", description).strip()
+    description = re.sub(r"(图片|照片|截图|插画|海报)$", "", description).strip()
+    return _clean_fact_text(description, 40)
 
 
 def _clean_image_text(value: str) -> str:
@@ -1802,6 +2267,61 @@ def _format_memory_candidates(memories: list[MemoryCandidate]) -> str:
     if not memories:
         return "(none)"
     return "\n".join(f"[{item.kind}] {item.content}" for item in memories)
+
+
+def _format_fact_records(facts: list[FactRecord]) -> str:
+    if not facts:
+        return "(none)"
+    return "\n".join(
+        f"#{fact.id} [{fact.fact_type}/{fact.stance or 'unknown'}] "
+        f"{fact.claim_text} (topic={fact.topic}, conf={fact.confidence:.2f}, "
+        f"evidence={fact.evidence_text})"
+        for fact in facts
+    )
+
+
+def _format_user_profile_record(profile: UserProfileRecord | None) -> str:
+    if profile is None:
+        return "(none)"
+    traits = json.dumps(profile.traits, ensure_ascii=False) if profile.traits else "{}"
+    return (
+        f"v{profile.version} facts={profile.fact_count}\n"
+        f"{profile.summary}\ntraits={traits}"
+    )
+
+
+def _parse_fact_ids(value: Any, fallback: tuple[int, ...]) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        return fallback
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in value:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed in seen:
+            continue
+        ids.append(parsed)
+        seen.add(parsed)
+        if len(ids) >= 20:
+            break
+    return tuple(ids) or fallback
+
+
+def _clean_traits(value: Any) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    cleaned: dict[str, object] = {}
+    for key, raw in value.items():
+        name = _clean_fact_text(str(key), 40)
+        if not name:
+            continue
+        if isinstance(raw, list):
+            cleaned[name] = [_clean_fact_text(str(item), 80) for item in raw if _clean_fact_text(str(item), 80)][:12]
+        elif isinstance(raw, (str, int, float, bool)):
+            cleaned[name] = _clean_fact_text(str(raw), 120)
+    return cleaned
 
 
 def _format_sticker_assets(assets: list[StickerAssetRecord]) -> str:

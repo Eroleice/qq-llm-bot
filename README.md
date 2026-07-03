@@ -45,15 +45,20 @@ http://127.0.0.1:8080/dashboard
 #bot admin list
 #bot admin add <qq_id>
 #bot admin remove <qq_id>
-#bot memory user <qq_id>
 #bot memory lexicon [term]
 #bot memory pending
 #bot memory conflicts
 #bot memory approve <memory_id>
 #bot memory reject <memory_id>
+#bot facts user <qq_id>
+#bot facts pending
+#bot facts approve <fact_id>
+#bot facts reject <fact_id>
+#bot profile <qq_id>
 #bot stickers list [数量]
 #bot stickers enable <sticker_id>
 #bot stickers disable <sticker_id>
+#bot stickers delete <sticker_id>
 #bot relation <qq_id>
 #bot persona show
 #bot persona self
@@ -76,13 +81,13 @@ http://127.0.0.1:8080/dashboard
 - 已接入 NoneBot2 + OneBot V11 正向 WebSocket 配置。
 - 已实现管理员与群白名单配置。
 - 已实现群状态机：`silent | passive | active`。
-- 已实现群消息 SQLite 记录、上下文检索、用户记忆、自我记忆、群复盘和关系记录。
-- 已实现结构化 LLM agents pipeline：感知、记忆候选、关系变化、参与决策、回复生成、回复后自我记忆账本。
+- 已实现群消息 SQLite 记录、上下文检索、成员 FACT、全局成员画像、自我记忆、群复盘和关系记录。
+- 已实现结构化 LLM agents pipeline：感知、FACT 抽取、关系变化、参与决策、回复生成、回复后自我记忆账本。
 - 已实现保守记忆写入：低置信候选拒绝，冲突候选标记为 `conflict`，不会覆盖旧记忆。
-- 已实现群聊教学防投毒策略：本人自述直接采信，第三方转述按信任度进入 `active` 或 `pending_confirmation`，管理员可批准或拒绝。
+- 已实现成员认知防投毒策略：本人 FACT 达阈值直接采信，第三方转述按信任度进入 `accepted` 或 `pending_confirmation`，管理员可批准或拒绝。
 - 已实现受控词条学习：发现疑似网络用语、玩梗或圈层黑话时，可按配置联网搜索并形成 `group/lexicon` 记忆。
 - 已实现自我叙事治理：机器人可生成轻量虚构的自我偏好、习惯和小经历，但必须先通过一致性检查并写入 `self` 记忆后再引用。
-- 已实现本地 Web 看板：按 tab 查看机器人自我设定、成员画像与关系、群聊记录、待确认/冲突记忆。
+- 已实现本地 Web 看板：按 tab 查看机器人自我设定、成员 FACT/画像与关系、群聊记录、待确认/冲突记忆。
 - 已实现多模态识图：可解析 OneBot 图片消息，调用支持 `image_url` 的 OpenAI-compatible 模型生成图片摘要、OCR 和保守群记忆。
 - 已实现表情包学习与发送：可识别聊天图片中的表情包/梗图，分析适合使用的场景，下载保存到本地，并在回复时保守选择合适表情发送。
 
@@ -97,8 +102,9 @@ http://127.0.0.1:8080/dashboard
 看板包含：
 
 - `自我设定`：展示稳定/当前人设和机器人自己的 self memory。
-- `成员认知`：按群号和 QQ ID 查询机器人对群员的画像、亲近、信任、熟悉、紧张和关系摘要。
+- `成员认知`：按群号和 QQ ID 查询成员全局画像、accepted FACT、亲近、信任、熟悉、紧张和关系摘要。
 - `群聊记录`：按群号、发言人、开始日期、结束日期筛选已入库消息。
+- `表情包`：查看现存可使用表情包、触发条件和复制删除命令。
 - `Pending`：展示 `pending_confirmation` 和 `conflict` 记忆，并生成可直接复制到 QQ 群里的确认命令。
 
 网页不会直接批准或拒绝 pending，仍需要管理员在 QQ 群里发送命令，例如：
@@ -106,6 +112,8 @@ http://127.0.0.1:8080/dashboard
 ```text
 #bot memory approve <memory_id>
 #bot memory reject <memory_id>
+#bot facts approve <fact_id>
+#bot facts reject <fact_id>
 #bot persona self approve <memory_id>
 #bot persona self reject <memory_id>
 ```
@@ -125,6 +133,16 @@ access_token_env = "QQ_LLM_BOT_DASHBOARD_TOKEN"
 
 ```text
 http://127.0.0.1:8080/dashboard?token=你的token
+```
+
+成员 FACT 与画像阈值：
+
+```toml
+[facts]
+fact_confidence_threshold = 0.75
+third_party_trust_threshold = 70
+third_party_confidence_threshold = 0.85
+profile_fact_threshold = 5
 ```
 
 ## 接入 OpenAI-compatible LLM
@@ -155,7 +173,7 @@ OPENAI_API_KEY=你的 API key
 #bot llm test 用一句话打个招呼
 ```
 
-LLM 当前用于回复生成、感知分析、记忆抽取、关系变化、主动参与决策和周期性群复盘。所有这些 agents 都要求结构化 JSON；解析失败时会安全降级为启发式观察或保守回复。
+LLM 当前用于回复生成、感知分析、成员 FACT 抽取、全局画像聚合、关系变化、主动参与决策和周期性群复盘。所有这些 agents 都要求结构化 JSON；解析失败时会安全降级为启发式观察或保守回复。
 
 ## 图片理解
 
@@ -174,7 +192,9 @@ remember_threshold = 0.78
 图片处理流程：
 
 - 从 OneBot V11 `image` segment 提取 `url/file/summary` 并落库。
-- 调用视觉模型输出图片描述、OCR 文本、话题和可选群记忆。
+- 单条消息图片超过 `max_images_per_message` 时只抽样理解，抽样包含第一张和最后一张。
+- 调用视觉模型输出图片描述、OCR 文本、话题、图片类型和可选群记忆。
+- 非表情包图片会形成成员 FACT：文字内容图记录“用户对此内容感兴趣”，纯图片记录“用户对这类图片感兴趣”。
 - 相同图片 URL 的识图结果会进入本地缓存，重复表情包只调用一次视觉模型。
 - 图片摘要会进入回复上下文，机器人能回答“这图是什么”之类的问题。
 - 图片附件和视觉摘要会显示在看板的群聊记录里。
@@ -206,7 +226,10 @@ send_cooldown_seconds = 120
 #bot stickers list [数量]
 #bot stickers disable <sticker_id>
 #bot stickers enable <sticker_id>
+#bot stickers delete <sticker_id>
 ```
+
+`delete` 会移除表情库记录，并删除本地保存的表情图片。
 
 ## 自我叙事治理
 

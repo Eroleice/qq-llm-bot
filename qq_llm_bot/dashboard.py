@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import AppConfig
@@ -80,6 +81,36 @@ def register_dashboard_routes(driver: Any, storage: BotStorage, config: AppConfi
         _ensure_authorized(request, config)
         return {"items": storage.list_dashboard_pending(limit=_clamp_limit(limit, 10, 300))}
 
+    @app.get(f"{api_prefix}/stickers")
+    async def dashboard_stickers(
+        request: Request,
+        group_id: str = "",
+        limit: int = 200,
+    ) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        items = storage.list_dashboard_stickers(
+            group_id=group_id.strip(),
+            limit=_clamp_limit(limit, 10, 500),
+        )
+        return {
+            "items": [
+                item
+                for item in items
+                if _resolve_sticker_file(config, str(item.get("local_path", ""))) is not None
+            ]
+        }
+
+    @app.get(f"{api_prefix}/stickers/{{sticker_id}}/image")
+    async def dashboard_sticker_image(request: Request, sticker_id: int) -> FileResponse:
+        _ensure_authorized(request, config)
+        asset = storage.get_sticker_asset(sticker_id)
+        if asset is None or not asset.enabled:
+            raise HTTPException(status_code=404, detail="sticker not found")
+        image_path = _resolve_sticker_file(config, asset.local_path)
+        if image_path is None:
+            raise HTTPException(status_code=404, detail="sticker image not found")
+        return FileResponse(image_path)
+
 
 def _ensure_authorized(request: Request, config: AppConfig) -> None:
     expected = _dashboard_token(config)
@@ -108,6 +139,22 @@ def _date_to_timestamp(value: str, end: bool) -> int | None:
 
 def _clamp_limit(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, int(value)))
+
+
+def _resolve_sticker_file(config: AppConfig, local_path: str) -> Path | None:
+    raw_path = str(local_path).strip()
+    if not raw_path:
+        return None
+    try:
+        path = Path(raw_path).resolve()
+        root = config.resolve_path(config.stickers.storage_dir).resolve()
+    except OSError:
+        return None
+    if not path.is_relative_to(root):
+        return None
+    if not path.exists() or not path.is_file():
+        return None
+    return path
 
 
 _DASHBOARD_HTML = r"""<!doctype html>
@@ -295,6 +342,24 @@ _DASHBOARD_HTML = r"""<!doctype html>
       margin-top: 10px;
       align-items: center;
     }
+    .sticker-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .sticker-card {
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+    .sticker-media {
+      width: 100%;
+      aspect-ratio: 1;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+      object-fit: contain;
+    }
     .empty {
       color: var(--muted);
       padding: 18px;
@@ -340,6 +405,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       <button class="tab active" data-tab="persona">自我设定</button>
       <button class="tab" data-tab="users">成员认知</button>
       <button class="tab" data-tab="messages">群聊记录</button>
+      <button class="tab" data-tab="stickers">表情包</button>
       <button class="tab" data-tab="pending">Pending</button>
     </nav>
     <section class="content">
@@ -391,6 +457,16 @@ _DASHBOARD_HTML = r"""<!doctype html>
         </div>
         <div id="pendingList"></div>
       </div>
+
+      <div id="stickers" class="section">
+        <h2>可使用表情包</h2>
+        <div class="toolbar">
+          <label>群号<select id="stickersGroup"></select></label>
+          <label>数量<input id="stickersLimit" type="number" value="200" min="10" max="500" /></label>
+          <button class="primary" id="loadStickersBtn">刷新</button>
+        </div>
+        <div id="stickersList"></div>
+      </div>
     </section>
   </main>
   <script>
@@ -416,6 +492,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
     });
     document.getElementById("loadUsersBtn").addEventListener("click", loadUsers);
     document.getElementById("loadMessagesBtn").addEventListener("click", loadMessages);
+    document.getElementById("loadStickersBtn").addEventListener("click", loadStickers);
     document.getElementById("loadPendingBtn").addEventListener("click", loadPending);
 
     async function api(path, params = {}) {
@@ -459,6 +536,13 @@ _DASHBOARD_HTML = r"""<!doctype html>
       if (!seconds) return "";
       return new Date(seconds * 1000).toLocaleString();
     }
+    function tokenParam() {
+      const token = localStorage.getItem("qqBotDashboardToken") || "";
+      return token ? `?token=${encodeURIComponent(token)}` : "";
+    }
+    function stickerImageSrc(item) {
+      return `${API_PREFIX}/stickers/${encodeURIComponent(item.id)}/image${tokenParam()}`;
+    }
     function statusPill(status) {
       const cls = status === "conflict" ? "danger" : status === "pending_confirmation" ? "warn" : "ok";
       return `<span class="pill ${cls}">${escapeHtml(status)}</span>`;
@@ -479,6 +563,31 @@ _DASHBOARD_HTML = r"""<!doctype html>
             · ${formatTime(memory.updated_at)}
           </div>
           </div>`;
+    }
+    function factHtml(fact) {
+      return `
+        <div class="memory">
+          <div>
+            <span class="pill">#${fact.id}</span>
+            <span class="pill">${escapeHtml(fact.fact_type)}</span>
+            ${statusPill(fact.status)}
+            <span class="pill">${escapeHtml(fact.claim_scope)}</span>
+          </div>
+          <div class="message-text">${escapeHtml(fact.claim_text)}</div>
+          <div class="muted">
+            topic=${escapeHtml(fact.topic)}
+            stance=${escapeHtml(fact.stance || "-")}
+            conf=${Number(fact.confidence).toFixed(2)}
+            · ${formatTime(fact.updated_at)}
+          </div>
+        </div>`;
+    }
+    function traitsHtml(traits) {
+      if (!traits || !Object.keys(traits).length) return "";
+      return Object.entries(traits).map(([key, value]) => {
+        const rendered = Array.isArray(value) ? value.join("、") : String(value ?? "");
+        return `<div class="key">${escapeHtml(key)}</div><div>${escapeHtml(rendered || "(empty)")}</div>`;
+      }).join("");
     }
     function attachmentsHtml(attachments) {
       if (!attachments || !attachments.length) return "";
@@ -516,6 +625,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       state.groups = data.groups || [];
       fillGroupSelect("usersGroup");
       fillGroupSelect("messagesGroup");
+      fillGroupSelect("stickersGroup");
     }
     async function loadPersona() {
       const data = await api("/persona");
@@ -538,10 +648,11 @@ _DASHBOARD_HTML = r"""<!doctype html>
           limit: document.getElementById("usersLimit").value,
         });
         const items = data.items || [];
-        if (!items.length) return renderEmpty("usersList", "暂无成员画像或关系记录。");
+        if (!items.length) return renderEmpty("usersList", "暂无成员画像、FACT 或关系记录。");
         document.getElementById("usersList").innerHTML = items.map((item) => {
           const relation = item.relationship || {};
-          const profile = item.profile || [];
+          const profile = item.profile || null;
+          const facts = item.facts || [];
           const nickname = item.nickname || item.display_name || "";
           const memberLabel = nickname ? `${nickname} (${item.user_id})` : `QQ ${item.user_id}`;
           return `
@@ -556,7 +667,16 @@ _DASHBOARD_HTML = r"""<!doctype html>
                 <div class="key">紧张</div><div>${relation.tension ?? 0}</div>
                 <div class="key">关系洞察</div><div>${escapeHtml(relation.summary || "(empty)")}</div>
               </div>
-              ${profile.length ? profile.map(memoryHtml).join("") : `<div class="memory muted">暂无画像记忆。</div>`}
+              ${profile ? `
+                <div class="memory">
+                  <div>
+                    <span class="pill">profile v${escapeHtml(profile.version)}</span>
+                    <span class="pill">facts ${escapeHtml(profile.fact_count)}</span>
+                  </div>
+                  <div class="message-text">${escapeHtml(profile.summary)}</div>
+                  ${traitsHtml(profile.traits) ? `<div class="kv" style="margin-top:10px">${traitsHtml(profile.traits)}</div>` : ""}
+                </div>` : `<div class="memory muted">暂无全局画像。</div>`}
+              ${facts.length ? facts.map(factHtml).join("") : `<div class="memory muted">暂无 accepted FACT。</div>`}
             </div>`;
         }).join("");
         setStatus(`成员认知 ${items.length} 条`);
@@ -601,6 +721,49 @@ _DASHBOARD_HTML = r"""<!doctype html>
       await navigator.clipboard.writeText(text);
       setStatus("已复制命令");
     }
+    async function loadStickers() {
+      clearError();
+      setStatus("读取表情包");
+      try {
+        const data = await api("/stickers", {
+          group_id: document.getElementById("stickersGroup").value,
+          limit: document.getElementById("stickersLimit").value,
+        });
+        const items = data.items || [];
+        if (!items.length) return renderEmpty("stickersList", "暂无可使用表情包。");
+        document.getElementById("stickersList").innerHTML = `
+          <div class="sticker-grid">
+            ${items.map((item) => {
+              const tags = item.tags || [];
+              const command = item.delete_command || `#bot stickers delete ${item.id}`;
+              return `
+                <div class="item sticker-card">
+                  <img class="sticker-media" src="${escapeHtml(stickerImageSrc(item))}" alt="sticker #${escapeHtml(item.id)}" />
+                  <div>
+                    <span class="pill">#${escapeHtml(item.id)}</span>
+                    <span class="pill">group ${escapeHtml(item.group_id)}</span>
+                    ${item.mood ? `<span class="pill">${escapeHtml(item.mood)}</span>` : ""}
+                  </div>
+                  <div class="message-text">${escapeHtml(item.trigger || item.usage || item.description)}</div>
+                  ${tags.length ? `<div>${tags.map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
+                  ${item.description ? `<div class="muted">${escapeHtml(item.description)}</div>` : ""}
+                  <div class="muted">
+                    hits=${Number(item.hit_count || 0)}
+                    conf=${Number(item.confidence || 0).toFixed(2)}
+                    · ${formatTime(item.updated_at)}
+                  </div>
+                  <div class="commands">
+                    <code>${escapeHtml(command)}</code>
+                    <button onclick="copyText('${escapeHtml(command)}')">复制删除</button>
+                  </div>
+                </div>`;
+            }).join("")}
+          </div>`;
+        setStatus(`表情包 ${items.length} 个`);
+      } catch (error) {
+        showError(error);
+      }
+    }
     async function loadPending() {
       clearError();
       setStatus("读取 pending");
@@ -609,16 +772,21 @@ _DASHBOARD_HTML = r"""<!doctype html>
           limit: document.getElementById("pendingLimit").value,
         });
         const items = data.items || [];
-        if (!items.length) return renderEmpty("pendingList", "暂无待确认或冲突记忆。");
+        if (!items.length) return renderEmpty("pendingList", "暂无待确认 FACT 或冲突记忆。");
         document.getElementById("pendingList").innerHTML = items.map((item) => `
           <div class="item">
             <div>
               <span class="pill">#${item.id}</span>
-              <span class="pill">${escapeHtml(item.owner_type)}:${escapeHtml(item.owner_id)}</span>
-              <span class="pill">${escapeHtml(item.kind)}</span>
+              <span class="pill">${escapeHtml(item.item_type || "memory")}</span>
+              <span class="pill">${
+                item.item_type === "fact"
+                  ? `user:${escapeHtml(item.subject_user_id)}`
+                  : `${escapeHtml(item.owner_type)}:${escapeHtml(item.owner_id)}`
+              }</span>
+              <span class="pill">${escapeHtml(item.fact_type || item.kind)}</span>
               ${statusPill(item.status)}
             </div>
-            <div class="message-text">${escapeHtml(item.content)}</div>
+            <div class="message-text">${escapeHtml(item.claim_text || item.content)}</div>
             <div class="muted">
               source=${escapeHtml(item.source_user_id)}
               subject=${escapeHtml(item.subject_user_id)}
@@ -642,7 +810,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       setStatus("读取数据");
       try {
         await loadGroups();
-        await Promise.all([loadPersona(), loadUsers(), loadMessages(), loadPending()]);
+        await Promise.all([loadPersona(), loadUsers(), loadMessages(), loadStickers(), loadPending()]);
         setStatus("数据已更新");
       } catch (error) {
         showError(error);

@@ -57,6 +57,28 @@ class StickerLocalStore:
             content_type=content_type,
         )
 
+    def delete_saved_file(self, local_path: str) -> bool:
+        raw_path = str(local_path).strip()
+        if not raw_path:
+            return False
+        try:
+            target = Path(raw_path).resolve()
+            root = self.root.resolve()
+        except OSError as exc:
+            logger.warning("Sticker path resolve failed for {}: {}", raw_path, exc)
+            return False
+        if not target.is_relative_to(root):
+            logger.warning("Refusing to delete sticker outside storage dir: {}", target)
+            return False
+        if not target.exists() or not target.is_file():
+            return False
+        try:
+            target.unlink()
+        except OSError as exc:
+            logger.warning("Sticker file delete failed for {}: {}", target, exc)
+            return False
+        return True
+
     async def _download(self, url: str) -> tuple[bytes, str]:
         max_bytes = self.config.stickers.max_download_bytes
         timeout = self.config.stickers.download_timeout_seconds

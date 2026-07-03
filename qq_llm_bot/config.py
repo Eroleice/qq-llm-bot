@@ -64,6 +64,14 @@ class ReflectionConfig:
 
 
 @dataclass(frozen=True)
+class FactConfig:
+    fact_confidence_threshold: float = 0.75
+    third_party_trust_threshold: int = 70
+    third_party_confidence_threshold: float = 0.85
+    profile_fact_threshold: int = 5
+
+
+@dataclass(frozen=True)
 class LexiconConfig:
     enabled: bool = False
     provider: str = "disabled"
@@ -131,6 +139,7 @@ class AppConfig:
     bot: BotConfig
     persona: PersonaConfig = field(default_factory=PersonaConfig)
     reflection: ReflectionConfig = field(default_factory=ReflectionConfig)
+    facts: FactConfig = field(default_factory=FactConfig)
     lexicon: LexiconConfig = field(default_factory=LexiconConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
@@ -159,6 +168,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     bot_raw = _section(raw, "bot")
     persona_raw = _section(raw, "persona")
     reflection_raw = _section(raw, "reflection")
+    facts_raw = _section(raw, "facts")
     lexicon_raw = _section(raw, "lexicon")
     dashboard_raw = _section(raw, "dashboard")
     vision_raw = _section(raw, "vision")
@@ -240,6 +250,30 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             min_interval_seconds=_positive_int(
                 reflection_raw.get("min_interval_seconds", 600),
                 "reflection.min_interval_seconds",
+            ),
+        ),
+        facts=FactConfig(
+            fact_confidence_threshold=_float_in_range(
+                facts_raw.get("fact_confidence_threshold", 0.75),
+                "facts.fact_confidence_threshold",
+                0,
+                1,
+            ),
+            third_party_trust_threshold=_int_in_range(
+                facts_raw.get("third_party_trust_threshold", 70),
+                "facts.third_party_trust_threshold",
+                0,
+                100,
+            ),
+            third_party_confidence_threshold=_float_in_range(
+                facts_raw.get("third_party_confidence_threshold", 0.85),
+                "facts.third_party_confidence_threshold",
+                0,
+                1,
+            ),
+            profile_fact_threshold=_positive_int(
+                facts_raw.get("profile_fact_threshold", 5),
+                "facts.profile_fact_threshold",
             ),
         ),
         lexicon=LexiconConfig(

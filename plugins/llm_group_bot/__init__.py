@@ -85,6 +85,12 @@ async def _handle_admin_command(event: GroupMessageEvent, args: Message = Comman
     if topic == "memory":
         await _handle_memory(rest, group_id)
 
+    if topic == "facts":
+        await _handle_facts(rest)
+
+    if topic == "profile":
+        await _handle_profile(rest)
+
     if topic in {"stickers", "sticker", "表情", "表情包"}:
         await _handle_stickers(rest, group_id)
 
@@ -122,10 +128,12 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     snapshot = storage.build_snapshot(context)
     result = await pipeline.run(context, mode, snapshot)
 
+    fact_write = storage.record_fact_candidates(result.facts)
     memory_write = storage.record_memory_candidates(result.memories)
     storage.record_memory_candidates(result.reply_self_memories)
     storage.update_image_descriptions(context.group_id, context.message_id, result.image_descriptions)
     await _record_sticker_candidates(context, result.sticker_candidates)
+    await _maybe_update_profiles([fact.subject_user_id for fact in fact_write.accepted])
     storage.apply_relationship_delta(context.group_id, context.user_id, result.relationship_delta)
     await _maybe_reflect_group(context.group_id)
     conflict_reply = storage.build_conflict_confirmation(memory_write.conflicts, context, mode)
@@ -179,8 +187,7 @@ async def _handle_memory(rest: list[str], group_id: str) -> None:
     if not rest:
         await admin_cmd.finish(_memory_help_text())
     if len(rest) >= 2 and rest[0] == "user":
-        memories = storage.list_user_memories(rest[1])
-        await admin_cmd.finish("\n".join(memories) if memories else "暂无该用户记忆。")
+        await admin_cmd.finish("成员画像已迁移到 FACT：请使用 #bot facts user <qq_id> 或 #bot profile <qq_id>")
     if rest[0] == "lexicon":
         term = " ".join(rest[1:]).strip()
         memories = storage.list_group_lexicon(group_id, term=term)
@@ -206,6 +213,45 @@ async def _handle_memory(rest: list[str], group_id: str) -> None:
     await admin_cmd.finish(_memory_help_text())
 
 
+async def _handle_facts(rest: list[str]) -> None:
+    if not rest:
+        await admin_cmd.finish(_facts_help_text())
+    action = rest[0].lower()
+    if len(rest) >= 2 and action == "user":
+        facts = storage.list_user_facts_text(rest[1], limit=20)
+        await admin_cmd.finish("\n".join(facts) if facts else "暂无该用户 FACT。")
+    if action == "pending":
+        facts = storage.list_pending_facts(limit=20)
+        lines = [
+            f"#{fact.id} [{fact.fact_type}/{fact.claim_scope}] {fact.claim_text} "
+            f"(subject={fact.subject_user_id}, src={fact.source_user_id}, conf={fact.confidence:.2f})"
+            for fact in facts
+        ]
+        await admin_cmd.finish("\n".join(lines) if lines else "暂无待确认 FACT。")
+    if len(rest) >= 2 and action == "approve":
+        fact_id = _parse_memory_id(rest[1])
+        if fact_id is None:
+            await admin_cmd.finish("fact_id 必须是数字，例如：#bot facts approve 12")
+        record = storage.approve_fact(fact_id)
+        if record is None:
+            await admin_cmd.finish("没有找到可批准的 FACT。")
+        await _maybe_update_profiles([record.subject_user_id])
+        await admin_cmd.finish("已批准。")
+    if len(rest) >= 2 and action == "reject":
+        fact_id = _parse_memory_id(rest[1])
+        if fact_id is None:
+            await admin_cmd.finish("fact_id 必须是数字，例如：#bot facts reject 12")
+        ok = storage.reject_fact(fact_id)
+        await admin_cmd.finish("已拒绝。" if ok else "没有找到可拒绝的 FACT。")
+    await admin_cmd.finish(_facts_help_text())
+
+
+async def _handle_profile(rest: list[str]) -> None:
+    if not rest:
+        await admin_cmd.finish("用法：#bot profile <qq_id>")
+    await admin_cmd.finish(storage.format_user_profile(rest[0]))
+
+
 async def _handle_stickers(rest: list[str], group_id: str) -> None:
     action = rest[0].lower() if rest else "list"
     if action == "list":
@@ -218,7 +264,17 @@ async def _handle_stickers(rest: list[str], group_id: str) -> None:
             await admin_cmd.finish("sticker_id 必须是数字，例如：#bot stickers disable 12")
         ok = storage.set_sticker_enabled(sticker_id, action == "enable")
         await admin_cmd.finish("已更新表情状态。" if ok else "没有找到该表情。")
-    await admin_cmd.finish("用法：#bot stickers list [数量]|enable <id>|disable <id>")
+    if len(rest) >= 2 and action in {"delete", "remove", "del", "rm"}:
+        sticker_id = _parse_memory_id(rest[1])
+        if sticker_id is None:
+            await admin_cmd.finish("sticker_id 必须是数字，例如：#bot stickers delete 12")
+        asset = storage.delete_sticker_asset(sticker_id)
+        if asset is None:
+            await admin_cmd.finish("没有找到该表情。")
+        deleted_file = sticker_store.delete_saved_file(asset.local_path)
+        suffix = "，本地图片也已删除。" if deleted_file else "，但没有找到可删除的本地图片。"
+        await admin_cmd.finish(f"已删除表情 #{sticker_id}{suffix}")
+    await admin_cmd.finish("用法：#bot stickers list [数量]|enable <id>|disable <id>|delete <id>")
 
 
 async def _handle_persona(rest: list[str]) -> None:
@@ -316,6 +372,22 @@ async def _maybe_reflect_group(group_id: str) -> None:
     reflection = await pipeline.reflect(group_id, recent_messages, prior_reflections)
     if reflection:
         storage.record_memory_candidates([reflection])
+
+
+async def _maybe_update_profiles(user_ids: list[str]) -> None:
+    seen: set[str] = set()
+    for raw_user_id in user_ids:
+        user_id = str(raw_user_id).strip()
+        if not user_id or user_id in seen:
+            continue
+        seen.add(user_id)
+        if not storage.should_update_user_profile(user_id, config.facts.profile_fact_threshold):
+            continue
+        facts = storage.list_user_facts(user_id, limit=0)
+        draft = await pipeline.profile(user_id, facts, storage.get_user_profile(user_id))
+        if draft is None:
+            continue
+        storage.maybe_update_user_profile(user_id, draft, facts)
 
 
 async def _record_sticker_candidates(
@@ -454,8 +526,10 @@ def _help_text() -> str:
         "#bot mode silent|passive|active\n"
         "#bot whitelist list|add <group_id>|remove <group_id>\n"
         "#bot admin list|add <qq_id>|remove <qq_id>\n"
-        "#bot memory user <qq_id>|lexicon [term]|pending|conflicts|approve <id>|reject <id>\n"
-        "#bot stickers list [数量]|enable <id>|disable <id>\n"
+        "#bot memory lexicon [term]|pending|conflicts|approve <id>|reject <id>\n"
+        "#bot facts user <qq_id>|pending|approve <id>|reject <id>\n"
+        "#bot profile <qq_id>\n"
+        "#bot stickers list [数量]|enable <id>|disable <id>|delete <id>\n"
         "#bot persona show|self [pending|conflicts|approve <id>|reject <id>|forget <id>]\n"
         "#bot llm status|test [prompt]\n"
         "#bot why\n"
@@ -467,12 +541,22 @@ def _help_text() -> str:
 def _memory_help_text() -> str:
     return (
         "用法：\n"
-        "#bot memory user <qq_id>\n"
         "#bot memory lexicon [term]\n"
         "#bot memory pending\n"
         "#bot memory conflicts\n"
         "#bot memory approve <memory_id>\n"
         "#bot memory reject <memory_id>"
+    )
+
+
+def _facts_help_text() -> str:
+    return (
+        "用法：\n"
+        "#bot facts user <qq_id>\n"
+        "#bot facts pending\n"
+        "#bot facts approve <fact_id>\n"
+        "#bot facts reject <fact_id>\n"
+        "#bot profile <qq_id>"
     )
 
 
