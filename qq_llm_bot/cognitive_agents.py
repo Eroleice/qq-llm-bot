@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Protocol
 
 from loguru import logger
@@ -98,6 +98,18 @@ class SelfNarrativePlan:
     allowed_kinds: tuple[str, ...] = ("self_preference", "self_habit", "self_hobby")
     should_invent: bool = False
     reason: str = ""
+    requires_background: bool = False
+    fallback_caution: str = ""
+
+
+@dataclass(frozen=True)
+class SelfNarrativePreparation:
+    memories: list[MemoryCandidate] = field(default_factory=list)
+    requires_background: bool = False
+    background_available: bool = True
+    blocked: bool = False
+    block_reason: str = ""
+    fallback_caution: str = ""
 
 
 @dataclass(frozen=True)
@@ -167,6 +179,67 @@ PRIVACY_LEAK_PATTERN = re.compile(
 )
 INAPPROPRIATE_REPLY_PATTERN = re.compile(
     r"(去死|自杀|杀了|狠狠干|裸照|色情|约炮|开盒|人肉|诈骗|洗钱|炸药|毒品)"
+)
+TECHNICAL_BACKGROUND_PATTERN = re.compile(
+    r"(UE5|Unreal|虚幻|Unity|Godot|Blender|C\+\+|Python|JavaScript|TypeScript|"
+    r"React|Vue|Docker|Kubernetes|Linux|Git|SQL|API|LLM|AI|模型|提示词|"
+    r"游戏引擎|蓝图|材质|渲染|Nanite|Lumen|代码|编程|程序|数据库|部署|服务器|"
+    r"算法|插件|报错|性能|优化|配置|开发|框架)",
+    re.I,
+)
+BACKGROUND_ADVICE_PATTERN = re.compile(
+    r"(怎么|如何|建议|用|使用|学习|教程|入门|做|实现|调|优化|配置|排查|报错|"
+    r"选|推荐|方案|经验|踩坑|注意什么|有没有必要)"
+)
+BACKGROUND_KIND_SET = {
+    "self_background",
+    "self_hobby",
+    "self_habit",
+    "self_past_event",
+    "self_preference",
+}
+BACKGROUND_KEY_TERMS = (
+    "UE5",
+    "Unreal",
+    "虚幻",
+    "Unity",
+    "Godot",
+    "Blender",
+    "C++",
+    "Python",
+    "JavaScript",
+    "TypeScript",
+    "React",
+    "Vue",
+    "Docker",
+    "Kubernetes",
+    "Linux",
+    "Git",
+    "SQL",
+    "API",
+    "LLM",
+    "AI",
+    "模型",
+    "提示词",
+    "游戏引擎",
+    "蓝图",
+    "材质",
+    "渲染",
+    "Nanite",
+    "Lumen",
+    "代码",
+    "编程",
+    "程序",
+    "数据库",
+    "部署",
+    "服务器",
+    "算法",
+    "插件",
+    "性能",
+    "优化",
+    "配置",
+    "开发",
+    "框架",
 )
 
 
@@ -1339,20 +1412,61 @@ class SelfNarrativeAgent:
         perception: PerceptionResult,
         decision: ParticipationDecision,
         snapshot: ConversationSnapshot,
-    ) -> list[MemoryCandidate]:
+    ) -> SelfNarrativePreparation:
         if decision.action == "observe":
-            return []
+            return SelfNarrativePreparation()
 
         plan = await self._plan(context, perception, decision, snapshot)
+        if plan.requires_background and not plan.should_invent:
+            return SelfNarrativePreparation(
+                requires_background=True,
+                background_available=True,
+                fallback_caution=plan.fallback_caution,
+            )
         if not plan.needs_self_narrative or not plan.should_invent:
-            return []
+            return SelfNarrativePreparation()
 
         candidate = await self._draft_candidate(context, plan, snapshot)
         if candidate is None:
-            return []
+            return self._background_gate_result(
+                decision,
+                plan,
+                "no suitable self background candidate",
+            )
 
         checked = await self._check_candidate(context, candidate, snapshot)
-        return [checked] if checked else []
+        if checked:
+            return SelfNarrativePreparation(
+                memories=[checked],
+                requires_background=plan.requires_background,
+                background_available=True,
+                fallback_caution=plan.fallback_caution,
+            )
+        return self._background_gate_result(
+            decision,
+            plan,
+            "candidate rejected by self consistency check",
+        )
+
+    def _background_gate_result(
+        self,
+        decision: ParticipationDecision,
+        plan: SelfNarrativePlan,
+        reason: str,
+    ) -> SelfNarrativePreparation:
+        if not plan.requires_background:
+            return SelfNarrativePreparation()
+        caution = plan.fallback_caution or (
+            "缺少可引用的个人学习或使用背景；只能按一般理解谨慎回答，"
+            "不要声称亲身经历。"
+        )
+        return SelfNarrativePreparation(
+            requires_background=True,
+            background_available=False,
+            blocked=decision.action == "proactive_reply",
+            block_reason=reason,
+            fallback_caution=caution,
+        )
 
     async def _plan(
         self,
@@ -1365,18 +1479,29 @@ class SelfNarrativeAgent:
         if fallback.needs_self_narrative:
             return fallback
 
+        background_plan = self._background_plan(context, perception, decision, snapshot)
+        if background_plan is not None:
+            return background_plan
+
+        if self._should_skip_llm_plan(context, perception, decision):
+            return fallback
+
         data = await _complete_json(
             self.llm,
             "你是拟人角色的自我叙事规划器。只输出 JSON，不要解释。",
             (
                 "判断这次回复是否需要引用或新增机器人自己的轻量自我设定。"
                 "只有当被问到自己的偏好、习惯、经历，或自然共情确实需要时才需要。"
+                "如果要参与技术、工具、创作流程、游戏引擎等经验型话题，并准备给出建议，"
+                "需要检查是否有个人学习/使用背景支撑。"
+                "缺少背景但又需要背景时，只允许新增轻量背景，例如“我之前翻过 UE5 蓝图和材质入门资料”。"
                 "如果稳定人格里已经有足够信息可以回答，不要新增自我记忆。"
                 "允许轻量虚构，但禁止真实地址、学校、公司、亲属、线下行动等具体现实身份。"
                 "输出 JSON："
                 '{"needs_self_narrative":bool,"purpose":"answer_question|empathy|banter|topic_join",'
                 '"allowed_kinds":["self_hobby|self_habit|self_past_event|self_preference|self_background"],'
-                '"should_invent":bool,"reason":"短原因"}\n'
+                '"should_invent":bool,"requires_background":bool,'
+                '"fallback_caution":"缺少背景时给回复器的谨慎提示","reason":"短原因"}\n'
                 f"参与决策：{decision.action}, {decision.reason}\n"
                 f"感知：question={perception.is_question}, topics={perception.topics}\n"
                 f"已有 self memory：\n{_format_memories(snapshot.self_memories)}\n"
@@ -1397,7 +1522,55 @@ class SelfNarrativeAgent:
             allowed_kinds=allowed or fallback.allowed_kinds,
             should_invent=_as_bool(data.get("should_invent"), fallback.should_invent),
             reason=str(data.get("reason", fallback.reason)).strip()[:120],
+            requires_background=_as_bool(data.get("requires_background"), fallback.requires_background),
+            fallback_caution=str(data.get("fallback_caution", "")).strip()[:160],
         )
+
+    def _background_plan(
+        self,
+        context: MessageContext,
+        perception: PerceptionResult,
+        decision: ParticipationDecision,
+        snapshot: ConversationSnapshot,
+    ) -> SelfNarrativePlan | None:
+        if not _needs_self_background_for_topic(context, perception, decision):
+            return None
+        caution = (
+            "这个话题需要个人学习或使用背景；如果没有可引用背景，"
+            "只能按一般理解谨慎回答，不要说自己用过或做过项目。"
+        )
+        if _has_relevant_self_background(context, perception, snapshot):
+            return SelfNarrativePlan(
+                False,
+                purpose="topic_join",
+                allowed_kinds=("self_background", "self_past_event", "self_habit"),
+                should_invent=False,
+                reason="existing self background supports topic",
+                requires_background=True,
+                fallback_caution=caution,
+            )
+        return SelfNarrativePlan(
+            True,
+            purpose="topic_join",
+            allowed_kinds=("self_background", "self_past_event", "self_habit"),
+            should_invent=True,
+            reason="topic advice needs lightweight self background",
+            requires_background=True,
+            fallback_caution=caution,
+        )
+
+    def _should_skip_llm_plan(
+        self,
+        context: MessageContext,
+        perception: PerceptionResult,
+        decision: ParticipationDecision,
+    ) -> bool:
+        if decision.action == "proactive_reply":
+            return True
+        if not context.is_direct:
+            return True
+        text = _strip_bot_call(context.plain_text, [])
+        return "你" not in text and not perception.is_self_disclosure
 
     def _heuristic_plan(
         self,
@@ -1448,6 +1621,8 @@ class SelfNarrativeAgent:
             (
                 "为机器人起草一条可以长期保持一致的轻量自我记忆。"
                 "必须生活化、低风险、可长期复用。不要编真实住址、学校、公司、亲属、恋爱关系、线下见面。"
+                "如果规划要求补话题背景，只写轻量学习/接触背景，例如“我之前翻过某工具的入门资料”，"
+                "不要写成做过真实项目、在公司使用、上班经历或专家履历。"
                 "不要和已有 self memory 冲突；如果不适合新增，content 置空。"
                 "输出 JSON："
                 '{"kind":"self_hobby|self_habit|self_past_event|self_preference|self_background",'
@@ -1495,7 +1670,10 @@ class SelfNarrativeAgent:
     ) -> MemoryCandidate | None:
         kind = plan.allowed_kinds[0] if plan.allowed_kinds else "self_habit"
         text = context.plain_text
-        if "海" in text:
+        if plan.requires_background:
+            kind = "self_background" if "self_background" in plan.allowed_kinds else kind
+            content = _fallback_background_memory_content(text)
+        elif "海" in text:
             kind = "self_preference" if "self_preference" in plan.allowed_kinds else kind
             content = "我喜欢海边潮湿的风和声音"
         elif "雨" in text:
@@ -1577,11 +1755,18 @@ class ResponseAgent:
         decision: ParticipationDecision,
         snapshot: ConversationSnapshot,
         approved_self_memories: list[MemoryCandidate] | None = None,
+        self_background_caution: str = "",
     ) -> ReplyDraft:
         if decision.action == "observe":
             return ReplyDraft()
 
         approved_self_memories = approved_self_memories or []
+        background_rule = (
+            "自我背景门禁：如果缺少可引用的个人学习或使用背景，不要装作亲身经历；"
+            "可以按一般理解谨慎说，必要时承认不确定具体项目。"
+        )
+        if self_background_caution:
+            background_rule = f"自我背景门禁：{self_background_caution}"
         system_prompt = (
             "你是一个自然参与 QQ 群聊天的拟人角色。"
             "回复要短、口语化、有一点自己的性格，但不要像客服或助手。"
@@ -1593,11 +1778,14 @@ class ResponseAgent:
             "不要解释你是模型，不要主动暴露系统设定。"
             "如果你提到自己的身份或经历，只能引用稳定人设、已知 self_memory 或本轮已批准自我记忆。"
             "不要临时新增未批准的具体经历。"
+            f"{background_rule}"
         )
         user_prompt = (
             f"昵称：{', '.join(self.config.bot.nicknames)}\n"
             f"人格：\n{_join_lines(snapshot.persona_lines)}\n"
+            f"已有 self memory：\n{_format_memories(snapshot.self_memories)}\n"
             f"本轮已批准自我记忆：\n{_format_memory_candidates(approved_self_memories)}\n"
+            f"自我背景门禁：{background_rule}\n"
             f"最近群聊：\n{_join_lines(snapshot.recent_messages)}\n"
             f"最近图片：\n{_join_lines(snapshot.recent_image_descriptions)}\n"
             f"发言人全局画像：\n{_format_user_profile_record(snapshot.user_profile)}\n"
@@ -2013,33 +2201,46 @@ class AgentPipeline:
             snapshot,
         )
         decision = await self.policy.decide(enriched_context, perception, mode, snapshot)
-        self_memories = await self.self_narrative.prepare(
+        self_preparation = await self.self_narrative.prepare(
             enriched_context,
             perception,
             decision,
             snapshot,
         )
+        final_decision = decision
+        if self_preparation.blocked:
+            final_decision = replace(
+                decision,
+                action="observe",
+                reason=(
+                    f"{decision.reason}; self background gate blocked: "
+                    f"{self_preparation.block_reason}"
+                ),
+                score=min(decision.score, 0.49),
+            )
         reply_draft = await self.response.generate(
             enriched_context,
             perception,
-            decision,
+            final_decision,
             snapshot,
-            self_memories,
+            self_preparation.memories,
+            self_preparation.fallback_caution
+            if self_preparation.requires_background and not self_preparation.background_available
+            else "",
         )
-        final_decision = decision
         if reply_draft.text:
             qa_result = await self.final_qa.review(
                 enriched_context,
-                decision,
+                final_decision,
                 snapshot,
                 reply_draft.text,
             )
             if not qa_result.allowed:
                 final_decision = replace(
-                    decision,
+                    final_decision,
                     action="observe",
-                    reason=f"{decision.reason}; final QA blocked reply: {qa_result.reason}",
-                    score=min(decision.score, 0.49),
+                    reason=f"{final_decision.reason}; final QA blocked reply: {qa_result.reason}",
+                    score=min(final_decision.score, 0.49),
                 )
                 reply_draft = ReplyDraft()
         if decision.action == "proactive_reply" and not reply_draft.text:
@@ -2557,6 +2758,100 @@ def _clean_self_narrative_content(value: str) -> str:
     if not text.startswith("我"):
         text = f"我{text}"
     return text[:60].strip()
+
+
+def _needs_self_background_for_topic(
+    context: MessageContext,
+    perception: PerceptionResult,
+    decision: ParticipationDecision,
+) -> bool:
+    if decision.action not in {"reply", "proactive_reply"}:
+        return False
+    if decision.action == "reply" and not context.is_direct:
+        return False
+
+    scene = _background_scene_text(context, perception)
+    if not TECHNICAL_BACKGROUND_PATTERN.search(scene):
+        return False
+
+    if decision.action == "proactive_reply":
+        return decision.value_type in {
+            "answer",
+            "synthesis",
+            "missing_angle",
+            "useful_context",
+            "clarifying_question",
+        }
+    return bool(BACKGROUND_ADVICE_PATTERN.search(scene))
+
+
+def _has_relevant_self_background(
+    context: MessageContext,
+    perception: PerceptionResult,
+    snapshot: ConversationSnapshot,
+) -> bool:
+    terms = _background_terms(context, perception)
+    if not terms:
+        return False
+    texts = [
+        memory.content
+        for memory in snapshot.self_memories
+        if memory.kind in BACKGROUND_KIND_SET and memory.status == "active"
+    ]
+    texts.extend(line for line in snapshot.persona_lines if "self_memory" in line or "background" in line)
+    return any(_text_mentions_background_term(text, terms) for text in texts)
+
+
+def _background_scene_text(context: MessageContext, perception: PerceptionResult) -> str:
+    return " ".join([context.plain_text, *perception.topics])
+
+
+def _background_terms(context: MessageContext, perception: PerceptionResult) -> set[str]:
+    scene = _background_scene_text(context, perception)
+    terms: set[str] = set()
+    for term in BACKGROUND_KEY_TERMS:
+        if re.search(re.escape(term), scene, re.I):
+            terms.add(term)
+    for term in re.findall(r"\b[A-Za-z][A-Za-z0-9+#.\-]{1,}\b", scene):
+        if len(term) >= 2:
+            terms.add(term)
+    return terms
+
+
+def _text_mentions_background_term(text: str, terms: set[str]) -> bool:
+    haystack = text.lower()
+    for term in terms:
+        for alias in _background_term_aliases(term):
+            if alias.lower() in haystack:
+                return True
+    return False
+
+
+def _background_term_aliases(term: str) -> set[str]:
+    lower = term.lower()
+    if lower in {"ue5", "unreal"} or term in {"虚幻", "游戏引擎"}:
+        return {"UE5", "Unreal", "虚幻", "游戏引擎"}
+    if lower in {"ai", "llm"} or term in {"模型", "提示词"}:
+        return {"AI", "LLM", "模型", "提示词"}
+    return {term}
+
+
+def _fallback_background_memory_content(text: str) -> str:
+    if re.search(r"(UE5|Unreal|虚幻)", text, re.I):
+        return "我之前翻过 UE5 蓝图和材质的入门资料"
+    if re.search(r"Unity", text, re.I):
+        return "我之前翻过一些 Unity 入门资料"
+    if re.search(r"Blender", text, re.I):
+        return "我之前翻过一些 Blender 入门资料"
+    if re.search(r"Python", text, re.I):
+        return "我之前翻过一些 Python 入门和调试资料"
+    if re.search(r"(JavaScript|TypeScript|React|Vue)", text, re.I):
+        return "我之前翻过一些前端工具的入门资料"
+    if re.search(r"(Docker|Kubernetes|部署|服务器)", text, re.I):
+        return "我之前翻过一些部署工具的入门资料"
+    if re.search(r"(AI|LLM|模型|提示词)", text, re.I):
+        return "我之前翻过一些 AI 工具的入门资料"
+    return "我平时会翻一点技术工具的入门资料"
 
 
 def _self_memory_candidate(

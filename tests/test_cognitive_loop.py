@@ -448,6 +448,191 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.reply)
         self.assertEqual(result.reply_self_memories, [])
 
+    async def test_direct_technical_advice_creates_lightweight_self_background(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"is_question":true,"is_self_disclosure":false,"topics":["UE5","蓝图"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":1,"trust":0,"familiarity":2,"tension":0,'
+                '"summary_patch":"","reason":"direct"}',
+                '{"kind":"self_background","content":"我之前翻过 UE5 蓝图和材质的入门资料",'
+                '"fictionality":"fictional_light","confidence":0.84,"importance":0.58}',
+                "我之前翻过一点 UE5 蓝图资料，蓝图先拆清输入输出会稳一点。",
+            ]
+        )
+        config = test_config(Path("unused.sqlite3"))
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-ue5-direct",
+            plain_text="可可 UE5 蓝图怎么组织比较好？",
+            raw_message="可可 UE5 蓝图怎么组织比较好？",
+            is_direct=True,
+        )
+
+        result = await pipeline.run(context, "passive", ConversationSnapshot())
+
+        self.assertTrue(result.reply)
+        self.assertEqual(result.decision.action, "reply")
+        self.assertEqual(len(result.reply_self_memories), 1)
+        self.assertEqual(result.reply_self_memories[0].kind, "self_background")
+        self.assertIn("UE5", result.reply_self_memories[0].content)
+
+    async def test_proactive_technical_reply_creates_lightweight_self_background(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"is_question":false,"is_self_disclosure":false,"topics":["UE5","材质"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
+                '"summary_patch":"","reason":"observed"}',
+                '{"action":"proactive_reply","score":0.86,"value_type":"useful_context",'
+                '"value_score":0.82,"reason":"可以补一个材质组织角度"}',
+                '{"kind":"self_background","content":"我之前翻过 UE5 蓝图和材质的入门资料",'
+                '"fictionality":"fictional_light","confidence":0.84,"importance":0.58}',
+                "UE5 材质可以先把复用节点收成函数，后面改参数会轻松点。",
+            ]
+        )
+        config = test_config(Path("unused.sqlite3"))
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-ue5-proactive",
+            plain_text="UE5 材质这块越堆越乱，感觉后面不好维护",
+            raw_message="UE5 材质这块越堆越乱，感觉后面不好维护",
+        )
+
+        result = await pipeline.run(
+            context,
+            "active",
+            ConversationSnapshot(recent_human_messages_60s=2),
+        )
+
+        self.assertEqual(result.decision.action, "proactive_reply")
+        self.assertTrue(result.reply)
+        self.assertEqual(result.reply_self_memories[0].kind, "self_background")
+
+    async def test_proactive_technical_reply_is_blocked_when_background_is_too_specific(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"is_question":false,"is_self_disclosure":false,"topics":["UE5","蓝图"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
+                '"summary_patch":"","reason":"observed"}',
+                '{"action":"proactive_reply","score":0.86,"value_type":"useful_context",'
+                '"value_score":0.82,"reason":"可以补一个蓝图经验"}',
+                '{"kind":"self_background","content":"我在某公司用 UE5 上班做过项目",'
+                '"fictionality":"fictional_light","confidence":0.9,"importance":0.8}',
+                "这句不应该被生成",
+            ]
+        )
+        config = test_config(Path("unused.sqlite3"))
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-ue5-block",
+            plain_text="UE5 蓝图通信这里大家说法不一样",
+            raw_message="UE5 蓝图通信这里大家说法不一样",
+        )
+
+        result = await pipeline.run(
+            context,
+            "active",
+            ConversationSnapshot(recent_human_messages_60s=2),
+        )
+
+        self.assertIsNone(result.reply)
+        self.assertEqual(result.decision.action, "observe")
+        self.assertIn("self background gate blocked", result.decision.reason)
+        self.assertEqual(result.reply_self_memories, [])
+        self.assertEqual(llm.replies, ["这句不应该被生成"])
+
+    async def test_existing_self_background_prevents_duplicate_topic_memory(self) -> None:
+        existing = MemoryRecord(
+            id=7,
+            owner_type="self",
+            owner_id="bot",
+            kind="self_background",
+            content="我之前翻过 UE5 蓝图和材质入门资料",
+            confidence=0.86,
+            importance=0.6,
+            status="active",
+            updated_at=1,
+            source_user_id="bot",
+            source_group_id="100",
+            subject_user_id="bot",
+            claim_scope="bot_directed",
+            verification_status="accepted",
+        )
+        llm = FakeLLM(
+            [
+                '{"is_question":true,"is_self_disclosure":false,"topics":["UE5","蓝图"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":1,"trust":0,"familiarity":2,"tension":0,'
+                '"summary_patch":"","reason":"direct"}',
+                "可以先把蓝图职责拆开，别让一个 Actor 管太多事。",
+            ]
+        )
+        config = test_config(Path("unused.sqlite3"))
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-ue5-existing",
+            plain_text="可可 UE5 蓝图职责怎么拆？",
+            raw_message="可可 UE5 蓝图职责怎么拆？",
+            is_direct=True,
+        )
+
+        result = await pipeline.run(
+            context,
+            "passive",
+            ConversationSnapshot(self_memories=[existing]),
+        )
+
+        self.assertEqual(result.reply, "可以先把蓝图职责拆开，别让一个 Actor 管太多事。")
+        self.assertEqual(result.reply_self_memories, [])
+
+    async def test_direct_technical_reply_degrades_when_background_candidate_is_rejected(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"is_question":true,"is_self_disclosure":false,"topics":["UE5","蓝图"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":1,"trust":0,"familiarity":2,"tension":0,'
+                '"summary_patch":"","reason":"direct"}',
+                '{"kind":"self_background","content":"我在某公司用 UE5 上班做过项目",'
+                '"fictionality":"fictional_light","confidence":0.9,"importance":0.8}',
+                "按一般理解，蓝图先分清输入输出和事件边界会好维护些。",
+            ]
+        )
+        config = test_config(Path("unused.sqlite3"))
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-ue5-degrade",
+            plain_text="可可 UE5 蓝图通信怎么处理？",
+            raw_message="可可 UE5 蓝图通信怎么处理？",
+            is_direct=True,
+        )
+
+        result = await pipeline.run(context, "passive", ConversationSnapshot())
+        response_system_prompt, response_user_prompt = llm.text_calls[-2]
+
+        self.assertEqual(result.decision.action, "reply")
+        self.assertEqual(result.reply_self_memories, [])
+        self.assertIn("按一般理解", result.reply or "")
+        self.assertIn("不要说自己用过或做过项目", response_system_prompt)
+        self.assertIn("自我背景门禁", response_user_prompt)
+        self.assertIn("不要说自己用过或做过项目", response_user_prompt)
+
     async def test_lexicon_learning_disabled_does_not_search(self) -> None:
         config = test_config(Path("unused.sqlite3"))
         search = FakeSearch(
