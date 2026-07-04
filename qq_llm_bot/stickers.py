@@ -9,7 +9,7 @@ import httpx
 from loguru import logger
 
 from qq_llm_bot.config import AppConfig
-from qq_llm_bot.models import MessageContext, StickerCandidate
+from qq_llm_bot.models import MessageContext, StickerAssetRecord, StickerCandidate
 
 
 @dataclass(frozen=True)
@@ -107,6 +107,18 @@ class StickerLocalStore:
                     chunks.append(chunk)
 
         return b"".join(chunks), content_type
+
+
+def sticker_file_ref(sticker: StickerAssetRecord) -> str:
+    local_path = sticker.local_path.strip()
+    if local_path:
+        try:
+            path = Path(local_path)
+            if path.exists():
+                return str(path.resolve())
+        except OSError as exc:
+            logger.warning("Sticker path resolve failed for {}: {}", local_path, exc)
+    return sticker.url.strip()
 
 
 def _image_suffix(content_type: str, url: str) -> str:

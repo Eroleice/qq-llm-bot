@@ -45,6 +45,9 @@ http://127.0.0.1:8080/dashboard
 #bot admin list
 #bot admin add <qq_id>
 #bot admin remove <qq_id>
+#bot ignore list
+#bot ignore add <qq_id>
+#bot ignore remove <qq_id>
 #bot memory lexicon [term]
 #bot memory pending
 #bot memory conflicts
@@ -84,9 +87,12 @@ proactive_cooldown_seconds = 90
 proactive_value_threshold = 0.65
 proactive_busy_value_threshold = 0.78
 proactive_busy_human_messages = 6
+final_qa_enabled = true
 ```
 
 `active` 模式下，机器人只有在能回答问题、总结分歧、提出遗漏角度、补充有用上下文或问一个能推进讨论的问题时才主动插话；聊天密集时阈值更高，轻量接梗也会被压住。
+
+发送前会进行最后 QA：把最近群聊、当前触发消息和机器人拟发送文本合并判断。审核不通过时不会发送，重点拦截上下文不合、政治立场话题和其它不恰当内容。
 
 ## 当前落地范围
 
@@ -95,6 +101,7 @@ proactive_busy_human_messages = 6
 - 已实现群状态机：`silent | passive | active`。
 - 已实现群消息 SQLite 记录、上下文检索、成员 FACT、全局成员画像、自我记忆、群复盘和关系记录。
 - 已实现结构化 LLM agents pipeline：感知、FACT 抽取、关系变化、增量价值参与决策、回复生成、回复后自我记忆账本。
+- 已实现发送前最终 QA：结合最近群聊和拟发送文本审核是否合理、贴合上下文且不涉及政治立场或其它不当内容。
 - 已实现保守记忆写入：低置信候选拒绝，冲突候选标记为 `conflict`，不会覆盖旧记忆。
 - 已实现成员认知防投毒策略：本人 FACT 达阈值直接采信，第三方转述按信任度进入 `accepted` 或 `pending_confirmation`，管理员可批准或拒绝。
 - 已实现受控词条学习：发现疑似网络用语、玩梗或圈层黑话时，可按配置联网搜索并形成 `group/lexicon` 记忆。

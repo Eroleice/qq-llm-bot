@@ -610,6 +610,17 @@ _DASHBOARD_HTML = r"""<!doctype html>
           </div>`;
       }).join("");
     }
+    function mentionsHtml(mentions) {
+      if (!mentions || !mentions.length) return "";
+      return `<div style="margin-top:8px">${
+        mentions.map((item) => {
+          const name = item.display_name && item.display_name !== item.user_id
+            ? `${item.display_name} / QQ ${item.user_id}`
+            : `QQ ${item.user_id}`;
+          return `<span class="pill">@${escapeHtml(name)}${item.is_bot ? " bot" : ""}</span>`;
+        }).join(" ")
+      }</div>`;
+    }
     function renderEmpty(target, text) {
       document.getElementById(target).innerHTML = `<div class="empty">${escapeHtml(text)}</div>`;
     }
@@ -709,6 +720,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
               ${formatTime(item.time)} · message=${escapeHtml(item.message_id)}
             </div>
             <div class="message-text">${escapeHtml(item.plain_text || item.raw_message)}</div>
+            ${mentionsHtml(item.mentions)}
             ${attachmentsHtml(item.attachments)}
           </div>
         `).join("");

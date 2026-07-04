@@ -26,6 +26,7 @@ class BotConfig:
     nicknames: list[str] = field(default_factory=lambda: ["小祈"])
     command_start: list[str] = field(default_factory=lambda: ["#", "/"])
     admin_ids: list[str] = field(default_factory=list)
+    ignored_user_ids: list[str] = field(default_factory=list)
     enabled_groups: list[str] = field(default_factory=list)
     default_group_mode: ParticipationMode = "passive"
     proactive_cooldown_seconds: int = 90
@@ -33,6 +34,7 @@ class BotConfig:
     proactive_busy_value_threshold: float = 0.78
     proactive_busy_human_messages: int = 6
     max_reply_chars: int = 180
+    final_qa_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         nicknames=nicknames,
         command_start=_string_list(bot_raw.get("command_start", ["#", "/"])),
         admin_ids=_string_list(bot_raw.get("admin_ids", [])),
+        ignored_user_ids=_string_list(bot_raw.get("ignored_user_ids", [])),
         enabled_groups=_string_list(bot_raw.get("enabled_groups", [])),
         default_group_mode=mode,  # type: ignore[arg-type]
         proactive_cooldown_seconds=_positive_int(
@@ -217,6 +220,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             "bot.proactive_busy_human_messages",
         ),
         max_reply_chars=_positive_int(bot_raw.get("max_reply_chars", 180), "bot.max_reply_chars"),
+        final_qa_enabled=_bool_value(bot_raw.get("final_qa_enabled", True)),
     )
 
     return AppConfig(

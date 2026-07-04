@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 from nonebot import get_driver, on_command, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
+from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 
@@ -16,7 +19,12 @@ from qq_llm_bot.config import ParticipationMode, load_config
 from qq_llm_bot.dashboard import register_dashboard_routes
 from qq_llm_bot.llm import build_llm_client, is_llm_configured, normalize_chat_completions_url
 from qq_llm_bot.models import MessageAttachment, MessageContext, StickerAssetRecord, StickerCandidate
-from qq_llm_bot.stickers import StickerLocalStore
+from qq_llm_bot.onebot_messages import (
+    parse_outgoing_mention_parts,
+    render_message_text_and_mentions,
+    render_message_text_and_mentions_with_forwards,
+)
+from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
 
 __plugin_meta__ = PluginMetadata(
     name="llm-group-bot",
@@ -48,6 +56,9 @@ async def _handle_admin_command(event: GroupMessageEvent, args: Message = Comman
     user_id = str(event.user_id)
     group_id = str(event.group_id)
     text = args.extract_plain_text().strip()
+
+    if storage.is_user_ignored(user_id):
+        return
 
     if not storage.is_admin(user_id):
         await admin_cmd.finish("权限不足。")
@@ -81,6 +92,9 @@ async def _handle_admin_command(event: GroupMessageEvent, args: Message = Comman
 
     if topic == "admin":
         await _handle_admin(rest, user_id)
+
+    if topic in {"ignore", "ignored"}:
+        await _handle_ignore(rest)
 
     if topic == "memory":
         await _handle_memory(rest, group_id)
@@ -121,8 +135,10 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if not storage.is_group_enabled(group_id):
         return
 
-    context = _build_context(bot, event)
+    context = await _build_context(bot, event)
     storage.record_message(context)
+    if storage.is_user_ignored(context.user_id):
+        return
 
     mode = storage.get_group_mode(group_id, config.bot.default_group_mode)
     snapshot = storage.build_snapshot(context)
@@ -130,7 +146,6 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 
     fact_write = storage.record_fact_candidates(result.facts)
     memory_write = storage.record_memory_candidates(result.memories)
-    storage.record_memory_candidates(result.reply_self_memories)
     storage.update_image_descriptions(context.group_id, context.message_id, result.image_descriptions)
     await _record_sticker_candidates(context, result.sticker_candidates)
     await _maybe_update_profiles([fact.subject_user_id for fact in fact_write.accepted])
@@ -139,14 +154,30 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     conflict_reply = storage.build_conflict_confirmation(memory_write.conflicts, context, mode)
     final_reply = conflict_reply or result.reply
     selected_sticker = None if conflict_reply else result.selected_sticker
-    decision_reply = _reply_record_text(final_reply, selected_sticker)
-    storage.record_decision(context, result.decision, decision_reply)
 
-    if final_reply:
-        storage.record_bot_reply(context.group_id, str(bot.self_id), decision_reply)
-        if selected_sticker:
-            storage.record_sticker_sent(selected_sticker.id)
-        await group_message.finish(_reply_message(final_reply, selected_sticker))
+    if not final_reply:
+        storage.record_decision(context, result.decision, "")
+        return
+
+    if conflict_reply:
+        qa_result = await pipeline.review_reply(context, result.decision, snapshot, final_reply)
+        if not qa_result.allowed:
+            storage.record_decision(
+                context,
+                _final_qa_blocked_decision(result.decision, qa_result.reason),
+                "",
+            )
+            return
+    else:
+        storage.record_memory_candidates(result.reply_self_memories)
+
+    sent_sticker = await _send_group_reply(final_reply, selected_sticker)
+    decision_reply = _reply_record_text(final_reply, sent_sticker)
+    storage.record_decision(context, result.decision, decision_reply)
+    storage.record_bot_reply(context.group_id, str(bot.self_id), decision_reply)
+    if sent_sticker:
+        storage.record_sticker_sent(sent_sticker.id)
+    await group_message.finish()
 
 
 async def _handle_whitelist(rest: list[str]) -> None:
@@ -181,6 +212,24 @@ async def _handle_admin(rest: list[str], current_user_id: str) -> None:
 
     storage.remove_admin(target)
     await admin_cmd.finish(f"已移除管理员：{target}")
+
+
+async def _handle_ignore(rest: list[str]) -> None:
+    if not rest or rest[0] == "list":
+        ignored_users = storage.list_ignored_users()
+        await admin_cmd.finish("ignored users: " + (", ".join(ignored_users) if ignored_users else "(none)"))
+
+    action = rest[0].lower()
+    if len(rest) < 2 or action not in {"add", "remove"}:
+        await admin_cmd.finish("Usage: #bot ignore list|add <qq_id>|remove <qq_id>")
+
+    target = rest[1]
+    if action == "add":
+        storage.add_ignored_user(target)
+        await admin_cmd.finish(f"ignored user added: {target}")
+
+    storage.remove_ignored_user(target)
+    await admin_cmd.finish(f"ignored user removed: {target}")
 
 
 async def _handle_memory(rest: list[str], group_id: str) -> None:
@@ -395,38 +444,92 @@ async def _record_sticker_candidates(
     if not config.stickers.enabled or not candidates:
         return
     for candidate in candidates:
+        existing = storage.find_existing_sticker_asset(context.group_id, candidate)
+        if existing is not None:
+            storage.upsert_sticker_asset(
+                context,
+                candidate,
+                local_path=existing.local_path,
+                sha256=existing.sha256,
+            )
+            continue
         saved = await sticker_store.save_candidate(context, candidate)
         if saved is None:
             continue
-        storage.upsert_sticker_asset(
+        asset = storage.upsert_sticker_asset(
             context,
             candidate,
             local_path=saved.local_path,
             sha256=saved.sha256,
         )
+        if asset is not None and not _same_local_path(asset.local_path, saved.local_path):
+            sticker_store.delete_saved_file(saved.local_path)
+
+
+async def _send_group_reply(
+    reply: str,
+    sticker: StickerAssetRecord | None,
+) -> StickerAssetRecord | None:
+    message = _reply_message(reply, sticker)
+    sticker_included = _message_contains_image(message)
+    try:
+        await group_message.send(message)
+    except ActionFailed as exc:
+        if sticker is None or not sticker_included:
+            raise
+        logger.warning(
+            "Sticker send failed for asset #{} ({}): {}",
+            sticker.id,
+            sticker.local_path or sticker.url,
+            exc,
+        )
+        await group_message.send(_reply_message(reply, None))
+        return None
+    return sticker if sticker_included else None
 
 
 def _reply_message(reply: str, sticker: StickerAssetRecord | None) -> Message | str:
-    if sticker is None:
-        return reply
-    file_ref = _sticker_file_ref(sticker)
+    text_message = _reply_text_message(reply)
+    file_ref = _sticker_file_ref(sticker) if sticker is not None else ""
     if not file_ref:
-        return reply
+        return text_message
     message = Message()
     if reply:
-        message += MessageSegment.text(reply)
+        if isinstance(text_message, Message):
+            message += text_message
+        else:
+            message += MessageSegment.text(reply)
         message += MessageSegment.text("\n")
     message += MessageSegment.image(file=file_ref)
     return message
 
 
+def _reply_text_message(reply: str) -> Message | str:
+    parts = parse_outgoing_mention_parts(reply)
+    if not any(part.kind == "at" for part in parts):
+        return reply
+    message = Message()
+    for part in parts:
+        if part.kind == "at":
+            message += MessageSegment.at(part.user_id)
+        elif part.text:
+            message += MessageSegment.text(part.text)
+    return message
+
+
+def _message_contains_image(message: Message | str) -> bool:
+    return isinstance(message, Message) and any(segment.type == "image" for segment in message)
+
+
 def _sticker_file_ref(sticker: StickerAssetRecord) -> str:
-    local_path = sticker.local_path.strip()
-    if local_path:
-        path = Path(local_path)
-        if path.exists():
-            return path.resolve().as_uri()
-    return sticker.url.strip()
+    return sticker_file_ref(sticker)
+
+
+def _same_local_path(left: str, right: str) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return str(left).strip() == str(right).strip()
 
 
 def _reply_record_text(reply: str | None, sticker: StickerAssetRecord | None) -> str:
@@ -438,8 +541,22 @@ def _reply_record_text(reply: str | None, sticker: StickerAssetRecord | None) ->
     return f"{text}\n{marker}".strip()
 
 
-def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
-    plain_text = event.get_plaintext().strip()
+def _final_qa_blocked_decision(decision: Any, reason: str) -> Any:
+    return replace(
+        decision,
+        action="observe",
+        reason=f"{decision.reason}; final QA blocked reply: {reason}",
+        score=min(decision.score, 0.49),
+    )
+
+
+async def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
+    top_level_text, _ = render_message_text_and_mentions(event.message, str(bot.self_id))
+    plain_text, mentions = await render_message_text_and_mentions_with_forwards(
+        event.message,
+        str(bot.self_id),
+        _fetch_forward_message(bot),
+    )
     sender = getattr(event, "sender", None)
     sender_nickname = _sender_field(sender, "nickname")
     sender_name = _sender_field(sender, "card") or sender_nickname
@@ -454,10 +571,22 @@ def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
         sender_name=sender_name,
         sender_nickname=sender_nickname,
         sender_role=sender_role,
-        is_direct=_is_direct_message(bot, event, plain_text),
+        is_direct=_is_direct_message(bot, event, top_level_text),
         timestamp=int(getattr(event, "time", 0) or time.time()),
         attachments=_extract_attachments(event),
+        mentions=mentions,
     )
+
+
+def _fetch_forward_message(bot: Bot):
+    async def _fetch(forward_id: str) -> Any:
+        try:
+            return await bot.get_forward_msg(id=forward_id)
+        except Exception as exc:
+            logger.warning("Failed to fetch forwarded message {}: {}", forward_id, exc)
+            return None
+
+    return _fetch
 
 
 def _is_direct_message(bot: Bot, event: GroupMessageEvent, plain_text: str) -> bool:
@@ -524,6 +653,7 @@ def _help_text() -> str:
         "#bot mode silent|passive|active\n"
         "#bot whitelist list|add <group_id>|remove <group_id>\n"
         "#bot admin list|add <qq_id>|remove <qq_id>\n"
+        "#bot ignore list|add <qq_id>|remove <qq_id>\n"
         "#bot memory lexicon [term]|pending|conflicts|approve <id>|reject <id>\n"
         "#bot facts user <qq_id>|pending|approve <id>|reject <id>\n"
         "#bot profile <qq_id>\n"

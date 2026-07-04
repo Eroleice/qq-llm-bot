@@ -52,6 +52,7 @@ class BotStorage:
         self,
         db_path: Path,
         initial_admins: Iterable[str],
+        initial_ignored_users: Iterable[str],
         initial_groups: Iterable[str],
         initial_persona: dict[str, str],
         sticker_context_limit: int = 24,
@@ -62,6 +63,8 @@ class BotStorage:
     ) -> None:
         self.db_path = db_path
         self.initial_admins = {str(item) for item in initial_admins}
+        self.initial_ignored_users = {_dashboard_user_id(str(item)) for item in initial_ignored_users}
+        self.initial_ignored_users.discard("")
         self.initial_groups = {str(item) for item in initial_groups}
         self.initial_persona = initial_persona
         self.sticker_context_limit = max(1, int(sticker_context_limit))
@@ -105,6 +108,7 @@ class BotStorage:
         return cls(
             config.resolve_path(config.storage.sqlite_path),
             config.bot.admin_ids,
+            config.bot.ignored_user_ids,
             config.bot.enabled_groups,
             persona,
             config.stickers.max_context_stickers,
@@ -141,6 +145,18 @@ class BotStorage:
                     file TEXT NOT NULL DEFAULT '',
                     url TEXT NOT NULL DEFAULT '',
                     summary TEXT NOT NULL DEFAULT '',
+                    raw_data TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS message_mentions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time INTEGER NOT NULL,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    mentioned_user_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    is_bot INTEGER NOT NULL DEFAULT 0,
                     raw_data TEXT NOT NULL DEFAULT ''
                 );
 
@@ -204,6 +220,12 @@ class BotStorage:
                 CREATE TABLE IF NOT EXISTS admins (
                     user_id TEXT PRIMARY KEY,
                     added_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ignored_users (
+                    user_id TEXT PRIMARY KEY,
+                    ignored INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS memory_items (
@@ -317,6 +339,7 @@ class BotStorage:
             )
             self._upsert_user_profile(conn, context, now)
             self._record_attachments(conn, context)
+            self._record_mentions(conn, context)
 
     def _upsert_user_profile(
         self,
@@ -388,6 +411,33 @@ class BotStorage:
                     attachment.raw_data,
                 )
                 for attachment in context.attachments
+            ],
+        )
+
+    def _record_mentions(self, conn: sqlite3.Connection, context: MessageContext) -> None:
+        if not context.mentions:
+            return
+        now = context.timestamp or int(time.time())
+        conn.executemany(
+            """
+            INSERT INTO message_mentions (
+                time, group_id, user_id, message_id, mentioned_user_id,
+                display_name, is_bot, raw_data
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    now,
+                    context.group_id,
+                    context.user_id,
+                    context.message_id,
+                    mention.user_id,
+                    mention.display_name,
+                    1 if mention.is_bot else 0,
+                    mention.raw_data,
+                )
+                for mention in context.mentions
             ],
         )
 
@@ -526,8 +576,14 @@ class BotStorage:
         tags_json = json.dumps(_compact_string_list(candidate.tags, limit=12), ensure_ascii=False)
         with self._connect() as conn:
             existing = self._find_sticker_asset(conn, group_id, sha256=sha256, url=url)
+            preserve_existing_file = False
+            if existing is None:
+                existing = self._find_similar_sticker_asset(conn, group_id, candidate)
+                preserve_existing_file = existing is not None
             if existing is not None:
                 asset_id = int(existing["id"])
+                next_local_path = "" if preserve_existing_file else local_path
+                next_sha256 = "" if preserve_existing_file else sha256
                 conn.execute(
                     """
                     UPDATE sticker_assets
@@ -555,10 +611,10 @@ class BotStorage:
                         url,
                         file,
                         file,
-                        local_path,
-                        local_path,
-                        sha256,
-                        sha256,
+                        next_local_path,
+                        next_local_path,
+                        next_sha256,
+                        next_sha256,
                         candidate.description[:1000],
                         candidate.ocr_text[:1000],
                         candidate.mood[:80],
@@ -613,6 +669,34 @@ class BotStorage:
                 (asset_id,),
             ).fetchone()
         return _sticker_asset_record(row) if row is not None else None
+
+    def find_existing_sticker_asset(
+        self,
+        group_id: str,
+        candidate: StickerCandidate,
+    ) -> StickerAssetRecord | None:
+        group_id = str(group_id)
+        if not group_id:
+            return None
+        url = str(candidate.url).strip()
+        with self._connect() as conn:
+            row = self._find_sticker_asset(conn, group_id, url=url)
+            if row is None:
+                row = self._find_similar_sticker_asset(conn, group_id, candidate)
+            if row is None:
+                return None
+            asset_row = conn.execute(
+                """
+                SELECT id, group_id, source_user_id, source_message_id, url, file,
+                       local_path, sha256, description, ocr_text, mood, usage,
+                       tags, confidence, enabled, created_at, updated_at,
+                       last_seen_at, hit_count
+                FROM sticker_assets
+                WHERE id = ?
+                """,
+                (int(row["id"]),),
+            ).fetchone()
+        return _sticker_asset_record(asset_row) if asset_row is not None else None
 
     def list_sticker_assets(
         self,
@@ -721,6 +805,31 @@ class BotStorage:
                 """,
                 (str(group_id), str(url)),
             ).fetchone()
+        return None
+
+    def _find_similar_sticker_asset(
+        self,
+        conn: sqlite3.Connection,
+        group_id: str,
+        candidate: StickerCandidate,
+    ) -> sqlite3.Row | None:
+        ocr_key = _sticker_text_key(candidate.ocr_text)
+        if not _useful_sticker_text_key(ocr_key):
+            return None
+        rows = conn.execute(
+            """
+            SELECT id, ocr_text
+            FROM sticker_assets
+            WHERE group_id = ?
+              AND ocr_text != ''
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 300
+            """,
+            (str(group_id),),
+        ).fetchall()
+        for row in rows:
+            if _sticker_text_key(str(row["ocr_text"] or "")) == ocr_key:
+                return row
         return None
 
     def record_memories(self, memories: Iterable[MemoryCandidate]) -> None:
@@ -1696,10 +1805,12 @@ class BotStorage:
                 "sender_name": str(row["sender_name"] or ""),
                 "sender_role": str(row["sender_role"] or ""),
                 "attachments": [],
+                "mentions": [],
             }
             for row in rows
         ]
         self._attach_dashboard_attachments(messages)
+        self._attach_dashboard_mentions(messages)
         return messages
 
     def _attach_dashboard_attachments(self, messages: list[dict[str, object]]) -> None:
@@ -1735,6 +1846,39 @@ class BotStorage:
         for item in messages:
             key = (str(item["group_id"]), str(item["message_id"]))
             item["attachments"] = by_key.get(key, [])
+
+    def _attach_dashboard_mentions(self, messages: list[dict[str, object]]) -> None:
+        if not messages:
+            return
+        pairs = [(str(item["group_id"]), str(item["message_id"])) for item in messages]
+        clauses = " OR ".join("(group_id = ? AND message_id = ?)" for _ in pairs)
+        params: list[object] = []
+        for group_id, message_id in pairs:
+            params.extend([group_id, message_id])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT group_id, message_id, mentioned_user_id, display_name, is_bot, raw_data
+                FROM message_mentions
+                WHERE {clauses}
+                ORDER BY id
+                """,
+                params,
+            ).fetchall()
+        by_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for row in rows:
+            key = (str(row["group_id"]), str(row["message_id"]))
+            by_key.setdefault(key, []).append(
+                {
+                    "user_id": str(row["mentioned_user_id"] or ""),
+                    "display_name": str(row["display_name"] or ""),
+                    "is_bot": bool(row["is_bot"]),
+                    "raw_data": str(row["raw_data"] or ""),
+                }
+            )
+        for item in messages:
+            key = (str(item["group_id"]), str(item["message_id"]))
+            item["mentions"] = by_key.get(key, [])
 
     def list_dashboard_stickers(
         self,
@@ -2118,6 +2262,58 @@ class BotStorage:
             rows = conn.execute("SELECT user_id FROM admins ORDER BY user_id").fetchall()
         return [str(row["user_id"]) for row in rows]
 
+    def is_user_ignored(self, user_id: str) -> bool:
+        user_id = _dashboard_user_id(user_id)
+        if not user_id:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT ignored FROM ignored_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return bool(row["ignored"]) if row is not None else False
+
+    def add_ignored_user(self, user_id: str) -> None:
+        user_id = _dashboard_user_id(user_id)
+        if not user_id:
+            return
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ignored_users (user_id, ignored, updated_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    ignored = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, now),
+            )
+
+    def remove_ignored_user(self, user_id: str) -> None:
+        user_id = _dashboard_user_id(user_id)
+        if not user_id:
+            return
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ignored_users (user_id, ignored, updated_at)
+                VALUES (?, 0, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    ignored = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, now),
+            )
+
+    def list_ignored_users(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id FROM ignored_users WHERE ignored = 1 ORDER BY user_id"
+            ).fetchall()
+        return [str(row["user_id"]) for row in rows]
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
@@ -2146,6 +2342,14 @@ class BotStorage:
             ON CONFLICT(group_id) DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
             """,
             [(group_id, now) for group_id in self.initial_groups],
+        )
+        conn.executemany(
+            """
+            INSERT INTO ignored_users (user_id, ignored, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(user_id) DO UPDATE SET ignored = 1, updated_at = excluded.updated_at
+            """,
+            [(user_id, now) for user_id in self.initial_ignored_users],
         )
         conn.executemany(
             """
@@ -2839,6 +3043,14 @@ def _compact_string_list(values: Iterable[str], limit: int = 10) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def _sticker_text_key(value: str) -> str:
+    return "".join(ch for ch in str(value).casefold() if ch.isalnum())
+
+
+def _useful_sticker_text_key(value: str) -> bool:
+    return len(value) >= 8 and len(set(value)) >= 3
 
 
 def _decode_string_list(value: str) -> list[str]:

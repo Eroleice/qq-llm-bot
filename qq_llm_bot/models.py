@@ -35,6 +35,14 @@ class MessageAttachment:
 
 
 @dataclass(frozen=True)
+class MessageMention:
+    user_id: str
+    display_name: str = ""
+    is_bot: bool = False
+    raw_data: str = ""
+
+
+@dataclass(frozen=True)
 class ImageVisionCacheRecord:
     url: str
     description: str
@@ -98,6 +106,7 @@ class MessageContext:
     is_direct: bool = False
     timestamp: int = 0
     attachments: list[MessageAttachment] = field(default_factory=list)
+    mentions: list[MessageMention] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
