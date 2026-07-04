@@ -4,13 +4,26 @@
 
 ## 快速开始
 
-1. 修改 [config.toml](config.toml)：
+运行环境需要 Python 3.10+。
+
+1. 复制示例配置：
+
+```powershell
+Copy-Item config.example.toml config.toml
+Copy-Item .env.example .env
+```
+
+`config.toml` 和 `.env` 已在 `.gitignore` 中排除，可放心填写本地群号、token 和 API key。
+
+2. 修改 `config.toml`：
    - `napcat.ws_url`：NapCat OneBot V11 正向 WebSocket 地址。
    - `napcat.access_token`：NapCat 端配置的 token。
    - `bot.admin_ids`：管理员 QQ ID。
    - `bot.enabled_groups`：允许生效的群号。
 
-2. 安装依赖：
+3. 如果要启用 LLM，把 `.env` 里的 `OPENAI_API_KEY` 改成实际 key，并在 `config.toml` 的 `[llm]` 段填写模型、API 地址等配置。
+
+4. 安装依赖：
 
 ```powershell
 python -m venv .venv
@@ -18,17 +31,19 @@ python -m venv .venv
 python -m pip install -e .
 ```
 
-3. 启动：
+5. 启动：
 
 ```powershell
 python bot.py
 ```
 
-4. 打开本地看板：
+6. 打开本地看板：
 
 ```text
 http://127.0.0.1:8080/dashboard
 ```
+
+如果要使用其它配置文件，可以设置环境变量 `QQ_LLM_BOT_CONFIG` 指向对应 TOML 文件。
 
 ## 管理指令
 
@@ -67,6 +82,9 @@ http://127.0.0.1:8080/dashboard
 #bot persona self
 #bot persona self pending
 #bot persona self conflicts
+#bot persona self approve <memory_id>
+#bot persona self reject <memory_id>
+#bot persona self forget <memory_id>
 #bot why
 #bot forget <memory_id>
 #bot llm status
@@ -166,7 +184,7 @@ profile_fact_threshold = 5
 
 ## 接入 OpenAI-compatible LLM
 
-1. 在 [config.toml](config.toml) 中修改：
+1. 在 `config.toml` 中修改（可参考 [config.example.toml](config.example.toml)）：
 
 ```toml
 [llm]
@@ -179,7 +197,7 @@ max_tokens = 256
 timeout_seconds = 30.0
 ```
 
-2. 新建 `.env`，写入：
+2. 修改 `.env`，写入：
 
 ```text
 OPENAI_API_KEY=你的 API key
@@ -272,7 +290,7 @@ send_cooldown_seconds = 120
 
 ## 词条联网学习
 
-默认关闭真实联网搜索。需要启用时修改 [config.toml](config.toml)：
+默认关闭真实联网搜索。需要启用时修改 `config.toml`：
 
 ```toml
 [lexicon]
@@ -292,3 +310,18 @@ WEB_SEARCH_API_KEY=你的搜索 API key
 ```
 
 词条会写入本群的 `lexicon` 记忆，可用 `#bot memory lexicon` 或 `#bot memory lexicon <term>` 查看。`silent` 模式下仍可学习，但不会因此发言。
+
+## 开发与校验
+
+安装开发依赖：
+
+```powershell
+python -m pip install -e ".[dev]"
+```
+
+运行测试和静态检查：
+
+```powershell
+python -m pytest
+python -m ruff check .
+```
