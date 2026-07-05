@@ -103,6 +103,7 @@ class BotStorage:
         target_user_limit: int = 5,
         low_importance_threshold: float = 0.35,
         fact_context_ttl_days: int = 30,
+        interaction_followup_seconds: int = 180,
     ) -> None:
         self.db_path = db_path
         self.initial_admins = {str(item) for item in initial_admins}
@@ -119,6 +120,7 @@ class BotStorage:
         self.target_user_limit = max(1, int(target_user_limit))
         self.low_importance_threshold = _clamp_float(low_importance_threshold)
         self.fact_context_ttl_seconds = max(1, int(fact_context_ttl_days)) * 24 * 60 * 60
+        self.interaction_followup_seconds = max(1, int(interaction_followup_seconds))
         self._lock = RLock()
 
     @classmethod
@@ -167,6 +169,7 @@ class BotStorage:
             config.facts.target_user_limit,
             config.facts.low_importance_threshold,
             config.facts.fact_context_ttl_days,
+            config.bot.interaction_followup_seconds,
         )
 
     def setup(self) -> None:
@@ -1758,6 +1761,35 @@ class BotStorage:
         ]
         return speaker_lines, other_lines
 
+    def get_recent_bot_reply_to_user(
+        self,
+        group_id: str,
+        user_id: str,
+        window_seconds: int,
+    ) -> tuple[str, int]:
+        now = int(time.time())
+        cutoff = now - max(1, int(window_seconds))
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT time, reply
+                FROM bot_decisions
+                WHERE group_id = ?
+                  AND user_id = ?
+                  AND reply != ''
+                  AND time >= ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(group_id), str(user_id), cutoff),
+            ).fetchone()
+        if row is None:
+            return "", 0
+        reply = str(row["reply"] or "").strip()
+        if not reply:
+            return "", 0
+        return reply, max(0, now - int(row["time"]))
+
     def get_recent_activity_counts(
         self,
         group_id: str,
@@ -2325,10 +2357,17 @@ class BotStorage:
             context.group_id,
             context.user_id,
         )
+        recent_bot_reply, recent_bot_reply_seconds = self.get_recent_bot_reply_to_user(
+            context.group_id,
+            context.user_id,
+            self.interaction_followup_seconds,
+        )
         return ConversationSnapshot(
             recent_messages=self.get_recent_messages(context.group_id, limit=12),
             speaker_recent_messages=speaker_messages,
             other_recent_messages=other_messages,
+            recent_bot_reply_to_user=recent_bot_reply,
+            recent_bot_reply_to_user_seconds=recent_bot_reply_seconds,
             recent_human_messages_60s=human_count,
             recent_bot_messages_120s=bot_count,
             recent_image_descriptions=self.get_recent_image_descriptions(context.group_id, limit=8),

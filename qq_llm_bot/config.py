@@ -33,6 +33,7 @@ class BotConfig:
     proactive_value_threshold: float = 0.65
     proactive_busy_value_threshold: float = 0.78
     proactive_busy_human_messages: int = 6
+    interaction_followup_seconds: int = 180
     max_reply_chars: int = 180
     final_qa_enabled: bool = True
 
@@ -222,6 +223,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         proactive_busy_human_messages=_positive_int(
             bot_raw.get("proactive_busy_human_messages", 6),
             "bot.proactive_busy_human_messages",
+        ),
+        interaction_followup_seconds=_positive_int(
+            bot_raw.get("interaction_followup_seconds", 180),
+            "bot.interaction_followup_seconds",
         ),
         max_reply_chars=_positive_int(bot_raw.get("max_reply_chars", 180), "bot.max_reply_chars"),
         final_qa_enabled=_bool_value(bot_raw.get("final_qa_enabled", True)),

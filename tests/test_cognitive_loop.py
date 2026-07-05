@@ -1093,6 +1093,80 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.traffic_level, "busy")
         self.assertEqual(decision.value_type, "humor")
 
+    async def test_passive_recent_interaction_followup_can_reply_without_name(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM(
+            [
+                '{"action":"reply","confidence":0.84,"value_type":"answer",'
+                '"reason":"用户在继续追问刚才的抽卡建议"}'
+            ]
+        )
+        agent = ParticipationPolicyAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-followup",
+            plain_text="那我是不是先别抽？",
+            raw_message="那我是不是先别抽？",
+        )
+        perception = PerceptionResult(
+            is_question=True,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["抽卡"],
+            confidence=0.82,
+        )
+        snapshot = ConversationSnapshot(
+            recent_messages=["bot: 预算不多的话可以先等", "alice: 那我是不是先别抽？"],
+            speaker_recent_messages=["alice: 我预算不多", "alice: 那我是不是先别抽？"],
+            recent_bot_reply_to_user="预算不多的话可以先等",
+            recent_bot_reply_to_user_seconds=24,
+        )
+
+        decision = await agent.decide(context, perception, "passive", snapshot)
+        _, user_prompt = llm.text_calls[0]
+
+        self.assertEqual(decision.action, "reply")
+        self.assertEqual(decision.value_type, "answer")
+        self.assertIn("recent interaction follow-up", decision.reason)
+        self.assertIn("上次机器人回复该用户", user_prompt)
+
+    async def test_passive_recent_interaction_observes_non_followup(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM(
+            [
+                '{"action":"observe","confidence":0.9,"value_type":"none",'
+                '"reason":"用户换了新话题"}'
+            ]
+        )
+        agent = ParticipationPolicyAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-not-followup",
+            plain_text="今晚有人打游戏吗",
+            raw_message="今晚有人打游戏吗",
+        )
+        perception = PerceptionResult(
+            is_question=True,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["游戏"],
+            confidence=0.82,
+        )
+        snapshot = ConversationSnapshot(
+            recent_messages=["bot: 预算不多的话可以先等", "alice: 今晚有人打游戏吗"],
+            speaker_recent_messages=["alice: 今晚有人打游戏吗"],
+            recent_bot_reply_to_user="预算不多的话可以先等",
+            recent_bot_reply_to_user_seconds=35,
+        )
+
+        decision = await agent.decide(context, perception, "passive", snapshot)
+
+        self.assertEqual(decision.action, "observe")
+        self.assertEqual(decision.reason, "passive mode requires direct mention")
+        self.assertEqual(len(llm.text_calls), 1)
+
     async def test_active_participation_observes_live_event_context(self) -> None:
         config = test_config(Path("unused.sqlite3"))
         llm = FakeLLM(
@@ -1616,6 +1690,37 @@ class MemoryStorageTests(unittest.TestCase):
                     "alice: 那我是不是先别抽",
                 ],
             )
+
+    def test_snapshot_includes_recent_bot_reply_to_same_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            original_context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-direct",
+                plain_text="可可我预算不多还抽吗",
+                raw_message="可可我预算不多还抽吗",
+                is_direct=True,
+            )
+            storage.record_decision(
+                original_context,
+                ParticipationDecision("reply", "message is directed to the bot", "passive", 1.0),
+                "预算不多的话可以先等。",
+            )
+            followup_context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-followup",
+                plain_text="那我是不是先别抽",
+                raw_message="那我是不是先别抽",
+            )
+
+            snapshot = storage.build_snapshot(followup_context)
+
+            self.assertEqual(snapshot.recent_bot_reply_to_user, "预算不多的话可以先等。")
+            self.assertGreaterEqual(snapshot.recent_bot_reply_to_user_seconds, 0)
 
     def test_sticker_asset_is_saved_and_can_be_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

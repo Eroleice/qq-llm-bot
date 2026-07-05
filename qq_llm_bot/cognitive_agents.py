@@ -231,6 +231,10 @@ BACKGROUND_ADVICE_PATTERN = re.compile(
     r"(怎么|如何|建议|用|使用|学习|教程|入门|做|实现|调|优化|配置|排查|报错|"
     r"选|推荐|方案|经验|踩坑|注意什么|有没有必要)"
 )
+FOLLOWUP_CUE_PATTERN = re.compile(
+    r"^(那|所以|然后|还有|这个|这呢|那我|那你|为啥|为什么|咋|怎么|能不能|"
+    r"可以吗|要不要|是不是|所以呢|细说|展开|继续|刚才|前面|上面|你说)"
+)
 BACKGROUND_KIND_SET = {
     "self_background",
     "self_hobby",
@@ -1340,6 +1344,15 @@ class ParticipationPolicyAgent:
                 self._traffic_level(snapshot),
             )
 
+        followup_decision = await self._recent_interaction_followup_decision(
+            context,
+            perception,
+            mode,
+            snapshot,
+        )
+        if followup_decision is not None:
+            return followup_decision
+
         if mode == "passive":
             return ParticipationDecision("observe", "passive mode requires direct mention", mode, 0.0)
 
@@ -1447,6 +1460,69 @@ class ParticipationPolicyAgent:
         if self._traffic_level(snapshot) == "busy":
             return self.config.bot.proactive_busy_value_threshold
         return self.config.bot.proactive_value_threshold
+
+    async def _recent_interaction_followup_decision(
+        self,
+        context: MessageContext,
+        perception: PerceptionResult,
+        mode: ParticipationMode,
+        snapshot: ConversationSnapshot,
+    ) -> ParticipationDecision | None:
+        recent_reply = snapshot.recent_bot_reply_to_user.strip()
+        current_text = context.plain_text.strip()
+        if not recent_reply or not current_text:
+            return None
+
+        traffic_level = self._traffic_level(snapshot)
+        data = await _complete_json(
+            self.llm,
+            "你是 QQ 群机器人续聊门禁。只输出 JSON，不要解释。",
+            (
+                "判断当前这条没有点名机器人的消息，是否是在延续同一用户刚才和机器人的互动。"
+                "只有当用户明显在追问、补充、回应机器人上一句，或省略了机器人名字但仍接着上一轮聊时才 reply。"
+                "如果是换新话题、对其他群友说话、自言自语、纯表情/感叹、或上下文不够明确，必须 observe。"
+                "输出 JSON："
+                '{"action":"reply|observe","confidence":0.0,'
+                '"value_type":"answer|direct_reply|clarifying_question|none","reason":"短原因"}\n'
+                f"上次机器人回复该用户（约 {snapshot.recent_bot_reply_to_user_seconds} 秒前）："
+                f"{recent_reply}\n"
+                f"最近消息：\n{_format_recent_context(snapshot)}\n"
+                f"感知：question={perception.is_question}, topics={perception.topics}, "
+                f"emotion={perception.emotion_hint}\n"
+                f"当前消息：{current_text}"
+            ),
+        )
+        if data:
+            action = str(data.get("action", "observe")).strip().lower()
+            confidence = _clamp_float(data.get("confidence", 0.0))
+            value_type = _safe_participation_value_type(
+                str(data.get("value_type", "answer" if perception.is_question else "direct_reply"))
+            )
+            if action == "reply" and confidence >= 0.62 and value_type != "none":
+                reason = str(data.get("reason", "")).strip()[:140] or "recent interaction follow-up"
+                return ParticipationDecision(
+                    "reply",
+                    f"recent interaction follow-up: {reason}",
+                    mode,
+                    confidence,
+                    value_type,
+                    confidence,
+                    traffic_level,
+                )
+            return None
+
+        if _looks_like_recent_interaction_followup(current_text, perception):
+            value_type = "answer" if perception.is_question else "direct_reply"
+            return ParticipationDecision(
+                "reply",
+                "recent interaction follow-up: heuristic continuation cue",
+                mode,
+                0.66,
+                value_type,
+                0.66,
+                traffic_level,
+            )
+        return None
 
 
 class SelfNarrativeAgent:
@@ -3373,6 +3449,20 @@ def _format_recent_context(snapshot: ConversationSnapshot) -> str:
             f"{_join_lines(snapshot.other_recent_messages)}"
         )
     return "\n\n".join(sections)
+
+
+def _looks_like_recent_interaction_followup(
+    text: str,
+    perception: PerceptionResult,
+) -> bool:
+    compact = re.sub(r"\s+", "", text.strip())
+    if len(compact) < 2 or len(compact) > 80:
+        return False
+    if FOLLOWUP_CUE_PATTERN.search(compact):
+        return True
+    if perception.is_question and re.search(r"(那|这个|这样|所以|然后|还|再|刚才|前面|上面|你说)", compact):
+        return True
+    return False
 
 
 def _as_bool(value: Any, fallback: bool) -> bool:

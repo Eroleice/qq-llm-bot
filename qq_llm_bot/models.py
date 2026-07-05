@@ -280,6 +280,8 @@ class ConversationSnapshot:
     ambiguous_name_refs: dict[str, list[str]] = field(default_factory=dict)
     speaker_recent_messages: list[str] = field(default_factory=list)
     other_recent_messages: list[str] = field(default_factory=list)
+    recent_bot_reply_to_user: str = ""
+    recent_bot_reply_to_user_seconds: int = 0
 
 
 @dataclass(frozen=True)

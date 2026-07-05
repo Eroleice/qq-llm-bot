@@ -114,7 +114,7 @@ http://127.0.0.1:8080/dashboard
 三种群状态：
 
 - `silent`：只记录与观察，普通消息不回复。
-- `passive`：仅在被 @、被叫昵称、或被明确提及时回复。
+- `passive`：被 @、被叫昵称、或被明确提及时回复；刚和机器人互动过的用户，短时间内的下一句会先判断是否为续聊。
 - `active`：允许主动参与，但必须通过“增量价值”门控；只附和、共情、复述或说热闹时会继续旁听。
 
 主动参与阈值：
@@ -125,6 +125,7 @@ proactive_cooldown_seconds = 90
 proactive_value_threshold = 0.65
 proactive_busy_value_threshold = 0.78
 proactive_busy_human_messages = 6
+interaction_followup_seconds = 180
 final_qa_enabled = true
 ```
 
