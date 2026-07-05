@@ -1093,6 +1093,36 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.traffic_level, "busy")
         self.assertEqual(decision.value_type, "humor")
 
+    async def test_active_participation_observes_live_event_context(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM(
+            [
+                '{"action":"proactive_reply","score":0.9,"value_type":"useful_context",'
+                '"value_score":0.95,"reason":"想补充赛况"}'
+            ]
+        )
+        agent = ParticipationPolicyAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-live-event",
+            plain_text="现在比分 2:1，刚刚又进球了",
+            raw_message="现在比分 2:1，刚刚又进球了",
+        )
+        perception = PerceptionResult(
+            is_question=False,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["比赛"],
+            confidence=0.85,
+        )
+
+        decision = await agent.decide(context, perception, "active", ConversationSnapshot(recent_human_messages_60s=4))
+
+        self.assertEqual(decision.action, "observe")
+        self.assertIn("live event", decision.reason)
+        self.assertEqual(llm.text_calls, [])
+
     async def test_active_participation_accepts_synthesis_value(self) -> None:
         config = test_config(Path("unused.sqlite3"))
         agent = ParticipationPolicyAgent(
@@ -1193,6 +1223,8 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(draft.text, "懂，先短短说一句就好。")
         self.assertIn("一两句群聊短句", system_prompt)
         self.assertIn("小作文", system_prompt)
+        self.assertIn("共享内容默认信任", system_prompt)
+        self.assertIn("实时事件克制", system_prompt)
         self.assertIn("max_reply_chars 只是硬上限，不是目标长度", user_prompt)
         self.assertIn("通常不超过 40 个字", user_prompt)
 
@@ -1223,6 +1255,87 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("当前触发消息：可可你看这个方案合理吗？", user_prompt)
         self.assertIn("机器人拟发送文本：可以先按预算拆一下，别一次压太满。", user_prompt)
         self.assertIn("政治立场", user_prompt)
+
+    async def test_final_qa_blocks_unsolicited_truth_doubt_for_shared_screenshot(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM()
+        agent = FinalQAAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-truth-doubt",
+            plain_text="[图片解读] 一张自媒体新闻截图，内容是某队临时换人",
+            raw_message="[CQ:image,url=https://example.test/news.png]",
+        )
+        decision = ParticipationDecision("reply", "direct request", "passive", 1.0, "answer", 1.0)
+        snapshot = ConversationSnapshot(
+            recent_image_descriptions=["alice: [图片] 一张自媒体新闻截图，内容是某队临时换人"]
+        )
+
+        result = await agent.review(context, decision, snapshot, "这个真实性存疑，最好先等官方确认。")
+
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.reason, "unsolicited_truth_doubt")
+        self.assertEqual(llm.text_calls, [])
+
+    async def test_final_qa_allows_truth_caution_when_user_asks_to_verify(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        agent = FinalQAAgent(config, FakeLLM())
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-verify-image",
+            plain_text="可可这个图真的假的？\n[图片解读] 一张自媒体新闻截图",
+            raw_message="[CQ:image,url=https://example.test/news.png]",
+            is_direct=True,
+        )
+        decision = ParticipationDecision("reply", "direct request", "passive", 1.0, "answer", 1.0)
+
+        result = await agent.review(context, decision, ConversationSnapshot(), "来源不明，最好等官方确认一下。")
+
+        self.assertTrue(result.allowed)
+
+    async def test_final_qa_blocks_ungrounded_live_score_claim(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM()
+        agent = FinalQAAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-live-score",
+            plain_text="可可现在比分多少？",
+            raw_message="可可现在比分多少？",
+            is_direct=True,
+        )
+        decision = ParticipationDecision("reply", "direct request", "passive", 1.0, "answer", 1.0)
+
+        result = await agent.review(context, decision, ConversationSnapshot(), "现在是 3:1，刚刚又进球了。")
+
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.reason, "ungrounded_live_event_claim")
+        self.assertEqual(llm.text_calls, [])
+
+    async def test_final_qa_allows_live_event_limitation_reply(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        agent = FinalQAAgent(config, FakeLLM())
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-live-limitation",
+            plain_text="可可现在比分多少？",
+            raw_message="可可现在比分多少？",
+            is_direct=True,
+        )
+        decision = ParticipationDecision("reply", "direct request", "passive", 1.0, "answer", 1.0)
+
+        result = await agent.review(
+            context,
+            decision,
+            ConversationSnapshot(),
+            "我没有实时赛况，按群里刚才说的聊；你发下比分我跟着看。",
+        )
+
+        self.assertTrue(result.allowed)
 
     async def test_pipeline_suppresses_reply_blocked_by_final_qa(self) -> None:
         llm = FakeLLM(
