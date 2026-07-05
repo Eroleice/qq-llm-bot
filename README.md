@@ -45,6 +45,23 @@ http://127.0.0.1:8080/dashboard
 
 如果要使用其它配置文件，可以设置环境变量 `QQ_LLM_BOT_CONFIG` 指向对应 TOML 文件。
 
+## 用户自助指令
+
+默认支持 `#...` 和 `/...`：
+
+```text
+#relation
+#ignore
+#pending
+#approval <fact_id>
+#reject <fact_id>
+```
+
+- `#relation`：查询机器人在当前群对自己的关系参数，不返回画像或 FACT。
+- `#ignore`：切换自己的忽略状态；已忽略时再次执行会取消忽略。
+- `#pending`：查看关于自己的 pending FACT，并显示可用的批准/拒绝命令。
+- `#approval <fact_id>` / `#reject <fact_id>`：批准或拒绝关于自己的 pending FACT。
+
 ## 管理指令
 
 默认支持 `#bot ...` 和 `/bot ...`：

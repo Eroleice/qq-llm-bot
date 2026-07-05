@@ -2382,6 +2382,65 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.list_user_facts("77"), [])
             self.assertEqual(storage.list_user_facts("77", status="pending_confirmation")[0].claim_text, "用户77喜欢吃鱼")
 
+    def test_user_can_manage_only_own_pending_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+
+            write = storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="77",
+                        fact_type="preference",
+                        claim_text="用户77喜欢喝茶",
+                        topic="喝茶",
+                        stance="positive",
+                        confidence=0.9,
+                        evidence_message_id="m1",
+                        evidence_text="77喜欢喝茶",
+                        source_user_id="42",
+                        source_group_id="100",
+                        claim_scope="third_party",
+                    ),
+                    FactCandidate(
+                        subject_user_id="88",
+                        fact_type="preference",
+                        claim_text="用户88喜欢咖啡",
+                        topic="咖啡",
+                        stance="positive",
+                        confidence=0.9,
+                        evidence_message_id="m2",
+                        evidence_text="88喜欢咖啡",
+                        source_user_id="42",
+                        source_group_id="100",
+                        claim_scope="third_party",
+                    ),
+                ]
+            )
+            pending_by_subject = {fact.subject_user_id: fact for fact in write.pending}
+            fact_77 = pending_by_subject["77"]
+            fact_88 = pending_by_subject["88"]
+
+            self.assertIsNone(storage.approve_user_pending_fact("77", fact_88.id))
+            record_88 = storage.get_fact_record(fact_88.id)
+            self.assertIsNotNone(record_88)
+            self.assertEqual(record_88.status, "pending_confirmation")  # type: ignore[union-attr]
+
+            approved = storage.approve_user_pending_fact("QQ:77", fact_77.id)
+            self.assertIsNotNone(approved)
+            self.assertEqual(approved.status, "accepted")  # type: ignore[union-attr]
+
+            self.assertFalse(storage.reject_user_pending_fact("77", fact_88.id))
+            record_88 = storage.get_fact_record(fact_88.id)
+            self.assertIsNotNone(record_88)
+            self.assertEqual(record_88.status, "pending_confirmation")  # type: ignore[union-attr]
+
+            self.assertTrue(storage.reject_user_pending_fact("88", fact_88.id))
+            record_88 = storage.get_fact_record(fact_88.id)
+            self.assertIsNotNone(record_88)
+            self.assertEqual(record_88.status, "rejected")  # type: ignore[union-attr]
+
     def test_high_trust_third_party_fact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")

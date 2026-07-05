@@ -1237,6 +1237,38 @@ class BotStorage:
                 self._sync_aliases_for_fact(conn, record)
         return record
 
+    def approve_user_pending_fact(self, user_id: str, fact_id: int) -> FactRecord | None:
+        subject = _dashboard_user_id(user_id)
+        if not subject:
+            return None
+        now = int(time.time())
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE member_facts
+                SET status = 'accepted', updated_at = ?, last_seen_at = ?
+                WHERE id = ? AND subject_user_id = ? AND status = 'pending_confirmation'
+                """,
+                (now, now, int(fact_id), subject),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            row = conn.execute(
+                """
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at,
+                       importance, last_seen_at, superseded_by_fact_id, forget_reason
+                FROM member_facts
+                WHERE id = ?
+                """,
+                (int(fact_id),),
+            ).fetchone()
+            record = _fact_record(row) if row else None
+            if record is not None:
+                self._sync_aliases_for_fact(conn, record)
+        return record
+
     def reject_fact(self, fact_id: int) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -1246,6 +1278,21 @@ class BotStorage:
                 WHERE id = ? AND status = 'pending_confirmation'
                 """,
                 (int(time.time()), int(fact_id)),
+            )
+        return cursor.rowcount > 0
+
+    def reject_user_pending_fact(self, user_id: str, fact_id: int) -> bool:
+        subject = _dashboard_user_id(user_id)
+        if not subject:
+            return False
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE member_facts
+                SET status = 'rejected', updated_at = ?
+                WHERE id = ? AND subject_user_id = ? AND status = 'pending_confirmation'
+                """,
+                (int(time.time()), int(fact_id), subject),
             )
         return cursor.rowcount > 0
 

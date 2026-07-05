@@ -18,7 +18,13 @@ from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import ParticipationMode, load_config
 from qq_llm_bot.dashboard import register_dashboard_routes
 from qq_llm_bot.llm import build_llm_client, is_llm_configured, normalize_chat_completions_url
-from qq_llm_bot.models import MessageAttachment, MessageContext, StickerAssetRecord, StickerCandidate
+from qq_llm_bot.models import (
+    FactRecord,
+    MessageAttachment,
+    MessageContext,
+    StickerAssetRecord,
+    StickerCandidate,
+)
 from qq_llm_bot.onebot_messages import (
     parse_outgoing_mention_parts,
     render_message_text_and_mentions,
@@ -49,6 +55,11 @@ async def _startup() -> None:
 
 
 admin_cmd = on_command("bot", priority=5, block=True)
+user_relation_cmd = on_command("relation", priority=5, block=True)
+user_ignore_cmd = on_command("ignore", priority=5, block=True)
+user_pending_cmd = on_command("pending", priority=5, block=True)
+user_approval_cmd = on_command("approval", priority=5, block=True)
+user_reject_cmd = on_command("reject", priority=5, block=True)
 
 
 @admin_cmd.handle()
@@ -124,6 +135,51 @@ async def _handle_admin_command(event: GroupMessageEvent, args: Message = Comman
         await _handle_forget(rest)
 
     await admin_cmd.finish(_help_text())
+
+
+@user_relation_cmd.handle()
+async def _handle_user_relation_command(event: GroupMessageEvent) -> None:
+    user_id = str(event.user_id)
+    if storage.is_user_ignored(user_id):
+        return
+    await user_relation_cmd.finish(_format_user_relation(str(event.group_id), user_id))
+
+
+@user_ignore_cmd.handle()
+async def _handle_user_ignore_command(event: GroupMessageEvent) -> None:
+    user_id = str(event.user_id)
+    if storage.is_user_ignored(user_id):
+        storage.remove_ignored_user(user_id)
+        await user_ignore_cmd.finish("已取消忽略。之后普通消息会重新进入机器人处理。")
+    storage.add_ignored_user(user_id)
+    await user_ignore_cmd.finish("已加入忽略名单。之后普通消息不会进入机器人处理。")
+
+
+@user_pending_cmd.handle()
+async def _handle_user_pending_command(event: GroupMessageEvent) -> None:
+    user_id = str(event.user_id)
+    if storage.is_user_ignored(user_id):
+        return
+    facts = storage.list_user_facts(user_id, limit=0, status="pending_confirmation")
+    if not facts:
+        await user_pending_cmd.finish("暂无关于你的 pending FACT。")
+    await user_pending_cmd.finish("\n".join(_format_user_pending_fact(fact) for fact in facts))
+
+
+@user_approval_cmd.handle()
+async def _handle_user_approval_command(
+    event: GroupMessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    await _handle_user_fact_decision(user_approval_cmd, event, args, approve=True)
+
+
+@user_reject_cmd.handle()
+async def _handle_user_reject_command(
+    event: GroupMessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    await _handle_user_fact_decision(user_reject_cmd, event, args, approve=False)
 
 
 group_message = on_message(priority=50, block=False)
@@ -421,6 +477,58 @@ async def _handle_forget(rest: list[str]) -> None:
         await admin_cmd.finish("memory_id 必须是数字，例如：#bot forget 12")
     ok = storage.forget_memory(memory_id)
     await admin_cmd.finish("已遗忘。" if ok else "没有找到可遗忘的记忆。")
+
+
+async def _handle_user_fact_decision(
+    matcher: Any,
+    event: GroupMessageEvent,
+    args: Message,
+    *,
+    approve: bool,
+) -> None:
+    user_id = str(event.user_id)
+    if storage.is_user_ignored(user_id):
+        return
+
+    command = "#approval" if approve else "#reject"
+    parts = args.extract_plain_text().strip().split()
+    if not parts:
+        await matcher.finish(f"用法：{command} <fact_id>")
+
+    fact_id = _parse_memory_id(parts[0])
+    if fact_id is None:
+        await matcher.finish(f"fact_id 必须是数字，例如：{command} 12")
+
+    if approve:
+        accepted = storage.approve_user_pending_fact(user_id, fact_id)
+        if accepted is None:
+            await matcher.finish("没有找到属于你的 pending FACT。")
+        await _maybe_update_profiles([user_id], force=True)
+        await matcher.finish(f"已批准 FACT #{fact_id}。")
+
+    ok = storage.reject_user_pending_fact(user_id, fact_id)
+    await matcher.finish(f"已拒绝 FACT #{fact_id}。" if ok else "没有找到属于你的 pending FACT。")
+
+
+def _format_user_relation(group_id: str, user_id: str) -> str:
+    relation = storage.get_relationship(group_id, user_id)
+    return (
+        f"group={relation.group_id}\n"
+        f"QQ={relation.user_id}\n"
+        f"closeness={relation.closeness}\n"
+        f"trust={relation.trust}\n"
+        f"familiarity={relation.familiarity}\n"
+        f"tension={relation.tension}"
+    )
+
+
+def _format_user_pending_fact(fact: FactRecord) -> str:
+    return (
+        f"#{fact.id} [{fact.fact_type}/{fact.claim_scope}] {fact.claim_text}\n"
+        f"topic={fact.topic or '-'}, source={fact.source_user_id or '-'}, "
+        f"conf={fact.confidence:.2f}\n"
+        f"#approval {fact.id} | #reject {fact.id}"
+    )
 
 
 async def _maybe_reflect_group(group_id: str) -> None:
