@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 import httpx
 from loguru import logger
@@ -19,8 +20,28 @@ class GeneratedImage:
     mime_type: str = "image/png"
 
 
+@dataclass(frozen=True)
+class LLMUsageRecord:
+    purpose: str
+    model: str
+    prompt_chars: int
+    completion_chars: int
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    created_at: int = 0
+
+
+LLMUsageRecorder = Callable[[LLMUsageRecord], None]
+
+
 class LLMClient(Protocol):
-    async def complete_text(self, system_prompt: str, user_prompt: str) -> str | None:
+    async def complete_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        purpose: str = "",
+    ) -> str | None:
         ...
 
     async def complete_vision(
@@ -29,6 +50,7 @@ class LLMClient(Protocol):
         user_prompt: str,
         image_urls: list[str],
         vision_config: VisionConfig,
+        purpose: str = "vision",
     ) -> str | None:
         ...
 
@@ -41,7 +63,12 @@ class LLMClient(Protocol):
 
 
 class DisabledLLMClient:
-    async def complete_text(self, system_prompt: str, user_prompt: str) -> str | None:
+    async def complete_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        purpose: str = "",
+    ) -> str | None:
         return None
 
     async def complete_vision(
@@ -50,6 +77,7 @@ class DisabledLLMClient:
         user_prompt: str,
         image_urls: list[str],
         vision_config: VisionConfig,
+        purpose: str = "vision",
     ) -> str | None:
         return None
 
@@ -62,15 +90,25 @@ class DisabledLLMClient:
 
 
 class OpenAICompatibleLLMClient:
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(
+        self,
+        config: LLMConfig,
+        usage_recorder: LLMUsageRecorder | None = None,
+    ) -> None:
         self.config = config
+        self.usage_recorder = usage_recorder
         self.api_key = resolve_api_key(config)
         self.chat_completions_url = (
             normalize_chat_completions_url(config.base_url) if config.base_url else ""
         )
         self.responses_url = normalize_responses_url(config.base_url) if config.base_url else ""
 
-    async def complete_text(self, system_prompt: str, user_prompt: str) -> str | None:
+    async def complete_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        purpose: str = "",
+    ) -> str | None:
         missing = self._missing_config_items()
         if missing:
             logger.warning("LLM is not configured; missing: {}", ", ".join(missing))
@@ -85,7 +123,12 @@ class OpenAICompatibleLLMClient:
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
-        return await self._post_chat_completion(payload, self.config.timeout_seconds)
+        return await self._post_chat_completion(
+            payload,
+            self.config.timeout_seconds,
+            purpose or "text",
+            len(system_prompt) + len(user_prompt),
+        )
 
     async def complete_vision(
         self,
@@ -93,6 +136,7 @@ class OpenAICompatibleLLMClient:
         user_prompt: str,
         image_urls: list[str],
         vision_config: VisionConfig,
+        purpose: str = "vision",
     ) -> str | None:
         missing = self._missing_config_items()
         if missing:
@@ -122,7 +166,12 @@ class OpenAICompatibleLLMClient:
             "temperature": 0.2,
             "max_tokens": max(self.config.max_tokens, 512),
         }
-        return await self._post_chat_completion(payload, vision_config.timeout_seconds)
+        return await self._post_chat_completion(
+            payload,
+            vision_config.timeout_seconds,
+            purpose or "vision",
+            len(system_prompt) + len(user_prompt),
+        )
 
     async def generate_image(
         self,
@@ -153,7 +202,13 @@ class OpenAICompatibleLLMClient:
         }
         return await self._post_image_generation_response(payload, image_config.timeout_seconds)
 
-    async def _post_chat_completion(self, payload: dict, timeout_seconds: float) -> str | None:
+    async def _post_chat_completion(
+        self,
+        payload: dict,
+        timeout_seconds: float,
+        purpose: str,
+        prompt_chars: int,
+    ) -> str | None:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -173,7 +228,17 @@ class OpenAICompatibleLLMClient:
 
         try:
             data = response.json()
-            return extract_chat_completion_text(data)
+            text = extract_chat_completion_text(data)
+            record = _chat_usage_record(
+                purpose=purpose,
+                model=str(payload.get("model", "")),
+                prompt_chars=prompt_chars,
+                completion_chars=len(text or ""),
+                usage=data.get("usage") if isinstance(data.get("usage"), dict) else {},
+            )
+            _log_chat_usage(record)
+            self._record_chat_usage(record)
+            return text
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning("LLM response parse failed: {}", exc)
             return None
@@ -239,13 +304,24 @@ class OpenAICompatibleLLMClient:
             missing.append(f"{self.config.api_key_env}/llm.api_key")
         return missing
 
+    def _record_chat_usage(self, record: LLMUsageRecord) -> None:
+        if self.usage_recorder is None:
+            return
+        try:
+            self.usage_recorder(record)
+        except Exception as exc:  # pragma: no cover - usage telemetry must not break replies
+            logger.warning("LLM usage record failed: {}", exc)
 
-def build_llm_client(config: LLMConfig) -> LLMClient:
+
+def build_llm_client(
+    config: LLMConfig,
+    usage_recorder: LLMUsageRecorder | None = None,
+) -> LLMClient:
     provider = config.provider.lower().replace("_", "-")
     if provider == "disabled":
         return DisabledLLMClient()
     if provider in {"openai-compatible", "openai"}:
-        return OpenAICompatibleLLMClient(config)
+        return OpenAICompatibleLLMClient(config, usage_recorder=usage_recorder)
     raise ValueError(
         f"Unsupported llm.provider={config.provider!r}. "
         "Supported providers: disabled, openai-compatible."
@@ -322,6 +398,51 @@ def _generated_image_from_result(result: str) -> GeneratedImage:
 
 def _response_request_id(response: httpx.Response) -> str:
     return response.headers.get("x-request-id", "") or response.headers.get("openai-request-id", "")
+
+
+def _chat_usage_record(
+    *,
+    purpose: str,
+    model: str,
+    prompt_chars: int,
+    completion_chars: int,
+    usage: dict,
+) -> LLMUsageRecord:
+    prompt_tokens = _usage_int(usage.get("prompt_tokens"))
+    completion_tokens = _usage_int(usage.get("completion_tokens"))
+    total_tokens = _usage_int(usage.get("total_tokens")) or prompt_tokens + completion_tokens
+    return LLMUsageRecord(
+        purpose=purpose or "(unspecified)",
+        model=model,
+        prompt_chars=max(0, int(prompt_chars)),
+        completion_chars=max(0, int(completion_chars)),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        created_at=int(time.time()),
+    )
+
+
+def _usage_int(value: object) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
+def _log_chat_usage(record: LLMUsageRecord) -> None:
+    logger.info(
+        "LLM chat usage purpose={} model={} prompt_chars={} completion_chars={} "
+        "prompt_tokens={} completion_tokens={} total_tokens={}",
+        record.purpose,
+        record.model or "(empty)",
+        record.prompt_chars,
+        record.completion_chars,
+        record.prompt_tokens,
+        record.completion_tokens,
+        record.total_tokens,
+    )
 
 
 def _response_output_types(data: dict) -> list[str]:

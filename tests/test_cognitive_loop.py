@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ast
 import base64
+import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +14,7 @@ from nonebot.adapters.onebot.v11 import Message
 
 from qq_llm_bot.cognitive_agents import (
     AgentPipeline,
+    BatchObservationAgent,
     FactExtractorAgent,
     FinalQAAgent,
     MemoryCuratorAgent,
@@ -52,7 +56,12 @@ from qq_llm_bot.models import (
     UserProfileDraft,
 )
 from qq_llm_bot.image_generation import GeneratedImageStore
-from qq_llm_bot.llm import GeneratedImage, extract_generated_image, normalize_responses_url
+from qq_llm_bot.llm import (
+    GeneratedImage,
+    LLMUsageRecord,
+    extract_generated_image,
+    normalize_responses_url,
+)
 from qq_llm_bot.onebot_messages import (
     FORWARDED_RECORD_END,
     FORWARDED_RECORD_START,
@@ -76,11 +85,18 @@ class FakeLLM:
         self.vision_replies = vision_replies or []
         self.image_replies = image_replies or []
         self.text_calls: list[tuple[str, str]] = []
+        self.text_call_purposes: list[str] = []
         self.vision_calls: list[list[str]] = []
         self.image_calls: list[str] = []
 
-    async def complete_text(self, system_prompt: str, user_prompt: str) -> str | None:
+    async def complete_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        purpose: str = "",
+    ) -> str | None:
         self.text_calls.append((system_prompt, user_prompt))
+        self.text_call_purposes.append(purpose)
         if self.replies:
             return self.replies.pop(0)
         return None
@@ -91,6 +107,7 @@ class FakeLLM:
         user_prompt: str,
         image_urls: list[str],
         vision_config: VisionConfig,
+        purpose: str = "vision",
     ) -> str | None:
         self.vision_calls.append(image_urls)
         if self.vision_replies:
@@ -123,6 +140,29 @@ class FakeSearch:
         if self.should_raise:
             raise RuntimeError("search unavailable")
         return self.results[: max_results or len(self.results)]
+
+
+class InMemoryBotStorage(BotStorage):
+    def __init__(self) -> None:
+        super().__init__(
+            Path(":memory:"),
+            initial_admins=[],
+            initial_ignored_users=[],
+            initial_groups=[],
+            initial_persona={},
+        )
+        self.connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
+
+    @contextmanager
+    def _connect(self):
+        with self._lock:
+            try:
+                yield self.connection
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
 
 
 def test_config(db_path: Path) -> AppConfig:
@@ -172,6 +212,19 @@ def _first_attribute_call_line(node: ast.AST, attribute_name: str) -> int:
     ]
     if not lines:
         raise AssertionError(f"Call not found: {attribute_name}")
+    return min(lines)
+
+
+def _first_name_call_line(node: ast.AST, function_name: str) -> int:
+    lines = [
+        child.lineno
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Name)
+        and child.func.id == function_name
+    ]
+    if not lines:
+        raise AssertionError(f"Call not found: {function_name}")
     return min(lines)
 
 
@@ -323,6 +376,81 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(strip_forwarded_records(text), "summarize this")
+
+    async def test_batch_observation_agent_parses_structured_summary(self) -> None:
+        llm = FakeLLM(
+            [
+                json.dumps(
+                    {
+                        "memories": [
+                            {
+                                "message_id": "m1",
+                                "owner_type": "user",
+                                "subject_user_id": "42",
+                                "claim_scope": "self_report",
+                                "kind": "preference",
+                                "content": "User 42 prefers Rust for backend tools.",
+                                "confidence": 0.91,
+                                "importance": 0.7,
+                            }
+                        ],
+                        "facts": [
+                            {
+                                "message_id": "m1",
+                                "subject_user_id": "42",
+                                "fact_type": "preference",
+                                "claim_text": "User 42 prefers Rust for backend tools.",
+                                "topic": "Rust",
+                                "stance": "positive",
+                                "confidence": 0.91,
+                                "importance": 0.7,
+                                "claim_scope": "self_report",
+                                "evidence_text": "I prefer Rust for backend tools.",
+                            }
+                        ],
+                        "reflection": {
+                            "summary": "Alice discussed backend language preferences.",
+                            "topics": ["Rust", "backend"],
+                            "importance": 0.65,
+                        },
+                    }
+                )
+            ]
+        )
+        agent = BatchObservationAgent(test_config(Path("unused.sqlite3")), llm)
+        contexts = [
+            MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m1",
+                plain_text="I prefer Rust for backend tools.",
+                raw_message="I prefer Rust for backend tools.",
+                sender_name="Alice",
+            ),
+            MessageContext(
+                group_id="100",
+                user_id="7",
+                message_id="m2",
+                plain_text="same",
+                raw_message="same",
+                sender_name="Bob",
+            ),
+        ]
+
+        result = await agent.summarize("100", contexts, [], [])
+
+        self.assertEqual(llm.text_call_purposes, ["batch_observation"])
+        self.assertEqual(len(result.memories), 1)
+        self.assertEqual(result.memories[0].owner_id, "42")
+        self.assertEqual(result.memories[0].subject_user_id, "42")
+        self.assertEqual(result.memories[0].evidence_message_id, "m1")
+        self.assertEqual(len(result.facts), 1)
+        self.assertEqual(result.facts[0].subject_user_id, "42")
+        self.assertEqual(result.facts[0].topic, "Rust")
+        self.assertEqual(result.facts[0].evidence_message_id, "m1")
+        self.assertIsNotNone(result.reflection)
+        self.assertEqual(result.reflection.evidence_message_id, "batch-m1-m2")  # type: ignore[union-attr]
+        self.assertIn("Rust", result.reflection.content)  # type: ignore[union-attr]
 
     def test_outgoing_qq_label_is_parsed_as_at_segment(self) -> None:
         parts = parse_outgoing_mention_parts("ask @QQ:3856199161 about it")
@@ -1759,6 +1887,84 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.count_image_generation_usage("42", "2026-07-06"), 1)
             self.assertEqual(storage.count_image_generation_usage("7", "2026-07-05"), 0)
 
+    def test_llm_usage_is_recorded_for_dashboard(self) -> None:
+        storage = InMemoryBotStorage()
+        try:
+            storage.setup()
+
+            storage.record_llm_usage(
+                LLMUsageRecord(
+                    purpose="perception",
+                    model="test-model",
+                    prompt_chars=100,
+                    completion_chars=20,
+                    prompt_tokens=10,
+                    completion_tokens=2,
+                    total_tokens=12,
+                    created_at=100,
+                )
+            )
+            storage.record_llm_usage(
+                LLMUsageRecord(
+                    purpose="response",
+                    model="test-model",
+                    prompt_chars=300,
+                    completion_chars=40,
+                    prompt_tokens=30,
+                    completion_tokens=4,
+                    total_tokens=34,
+                    created_at=200,
+                )
+            )
+
+            data = storage.list_dashboard_llm_usage(since=50, limit=1)
+
+            self.assertEqual(data["summary"]["calls"], 2)  # type: ignore[index]
+            self.assertEqual(data["summary"]["total_tokens"], 46)  # type: ignore[index]
+            self.assertEqual(data["summary"]["prompt_chars"], 400)  # type: ignore[index]
+            by_purpose = {
+                (str(item["purpose"]), str(item["model"])): item
+                for item in data["by_purpose"]  # type: ignore[index]
+            }
+            self.assertEqual(by_purpose[("response", "test-model")]["total_tokens"], 34)
+            self.assertEqual(by_purpose[("perception", "test-model")]["calls"], 1)
+            self.assertEqual(len(data["recent"]), 1)  # type: ignore[arg-type]
+            self.assertEqual(data["recent"][0]["purpose"], "response")  # type: ignore[index]
+        finally:
+            storage.connection.close()
+
+    def test_dashboard_api_exposes_llm_usage(self) -> None:
+        FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
+        storage = InMemoryBotStorage()
+        try:
+            storage.setup()
+            storage.record_llm_usage(
+                LLMUsageRecord(
+                    purpose="batch_observation",
+                    model="test-model",
+                    prompt_chars=800,
+                    completion_chars=120,
+                    prompt_tokens=80,
+                    completion_tokens=12,
+                    total_tokens=92,
+                    created_at=1_800_000_000,
+                )
+            )
+            app = FastAPI()
+            register_dashboard_routes(FakeDashboardDriver(app), storage, test_config(Path("unused.sqlite3")))
+
+            with TestClient(app) as client:
+                response = client.get("/api/dashboard/llm-usage", params={"hours": 2160, "limit": 10})
+
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["summary"]["calls"], 1)
+            self.assertEqual(data["summary"]["total_tokens"], 92)
+            self.assertEqual(data["by_purpose"][0]["purpose"], "batch_observation")
+            self.assertEqual(data["recent"][0]["prompt_chars"], 800)
+        finally:
+            storage.connection.close()
+
     def test_group_handler_records_ignored_user_messages_before_skip(self) -> None:
         plugin_path = (
             Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
@@ -1773,9 +1979,16 @@ class MemoryStorageTests(unittest.TestCase):
 
         record_line = _first_attribute_call_line(handler, "record_message")
         ignore_line = _first_attribute_call_line(handler, "is_user_ignored")
+        defer_check_line = _first_name_call_line(handler, "_should_defer_realtime_pipeline")
+        defer_line = _first_name_call_line(handler, "_defer_observation")
+        flush_line = _first_name_call_line(handler, "_flush_observation_batch")
         pipeline_line = _first_attribute_call_line(handler, "run")
 
         self.assertLess(record_line, ignore_line)
+        self.assertLess(record_line, defer_check_line)
+        self.assertLess(defer_check_line, defer_line)
+        self.assertLess(defer_line, pipeline_line)
+        self.assertLess(flush_line, pipeline_line)
         self.assertLess(ignore_line, pipeline_line)
 
     def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:

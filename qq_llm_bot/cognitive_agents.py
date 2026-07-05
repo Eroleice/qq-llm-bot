@@ -120,6 +120,13 @@ class FinalQAResult:
     confidence: float = 0.0
 
 
+@dataclass(frozen=True)
+class BatchObservationResult:
+    memories: list[MemoryCandidate] = field(default_factory=list)
+    facts: list[FactCandidate] = field(default_factory=list)
+    reflection: MemoryCandidate | None = None
+
+
 SELF_NARRATIVE_KINDS = {
     "self_background",
     "self_hobby",
@@ -308,6 +315,7 @@ class PerceptionAgent:
                 f"最近上下文：\n{_format_recent_context(snapshot)}\n"
                 f"消息：{context.plain_text}"
             ),
+            purpose="perception",
         )
         if not data:
             return fallback
@@ -384,6 +392,7 @@ class MemoryCuratorAgent:
                 f"说话人已有记忆：\n{_format_memories(snapshot.user_memories)}\n"
                 f"消息：{context.plain_text}"
             ),
+            purpose="memory_curator",
         )
         if not data:
             return fallback
@@ -585,6 +594,7 @@ class FactExtractorAgent:
                 f"最近上下文：\n{_format_recent_context(snapshot)}\n"
                 f"当前消息：{context.plain_text}"
             ),
+            purpose="fact_extract",
         )
         facts: list[FactCandidate] = []
         if data:
@@ -781,6 +791,7 @@ class LexiconAgent:
                 f"已知群内词条：\n{_format_memories(snapshot.group_lexicon)}\n"
                 f"消息：{context.plain_text}"
             ),
+            purpose="lexicon_detect",
         )
         parsed: list[LexiconTermCandidate] = []
         if data:
@@ -861,6 +872,7 @@ class LexiconAgent:
                 f"搜索查询：{query}\n"
                 f"搜索结果：\n{search_text}"
             ),
+            purpose="lexicon_summarize",
         )
         if data:
             should_remember = _as_bool(data.get("should_remember"), False)
@@ -957,6 +969,7 @@ class VisionAgent:
                     f"随图文字：{context.plain_text or '(none)'}"
                 ),
                 missing_urls,
+                purpose="vision",
             )
             if data:
                 fresh_results = self._parse_fresh_results(missing_urls, data)
@@ -1293,6 +1306,7 @@ class RelationshipAgent:
                 f"感知：topics={perception.topics}, emotion={perception.emotion_hint}, direct={context.is_direct}\n"
                 f"消息：{context.plain_text}"
             ),
+            purpose="relationship",
         )
         if not data:
             return fallback
@@ -1385,6 +1399,7 @@ class ParticipationPolicyAgent:
                 f"感知：topics={perception.topics}, emotion={perception.emotion_hint}\n"
                 f"当前消息：{context.plain_text}"
             ),
+            purpose="participation_policy",
         )
         if data:
             action = str(data.get("action", "observe"))
@@ -1491,6 +1506,7 @@ class ParticipationPolicyAgent:
                 f"emotion={perception.emotion_hint}\n"
                 f"当前消息：{current_text}"
             ),
+            purpose="followup_gate",
         )
         if data:
             action = str(data.get("action", "observe")).strip().lower()
@@ -1630,6 +1646,7 @@ class SelfNarrativeAgent:
                 f"已有 self memory：\n{_format_memories(snapshot.self_memories)}\n"
                 f"消息：{context.plain_text}"
             ),
+            purpose="self_narrative_plan",
         )
         if not data:
             return fallback
@@ -1757,6 +1774,7 @@ class SelfNarrativeAgent:
                 f"群聊上下文：\n{_format_recent_context(snapshot)}\n"
                 f"用户消息：{context.plain_text}"
             ),
+            purpose="self_narrative_draft",
         )
         candidate = self._candidate_from_json(data, context, plan) if data else None
         return candidate or self._fallback_candidate(context, plan)
@@ -1851,6 +1869,7 @@ class SelfNarrativeAgent:
                 f"候选：[{candidate.kind}] {candidate.content}\n"
                 f"触发消息：{context.plain_text}"
             ),
+            purpose="self_narrative_check",
         )
         if not data:
             return candidate if heuristic_status == "accepted" else None
@@ -1934,7 +1953,7 @@ class ResponseAgent:
             "长度规则：max_reply_chars 只是硬上限，不是目标长度；不要为了接近上限而展开。\n"
             f"请直接给出要发送到群里的中文回复，最多 {self.config.bot.max_reply_chars} 个字。"
         )
-        llm_reply = await self.llm.complete_text(system_prompt, user_prompt)
+        llm_reply = await self.llm.complete_text(system_prompt, user_prompt, purpose="response")
         if llm_reply:
             reply = _sanitize_reply(llm_reply, self.config.bot.max_reply_chars)
             guarded_reply = await self._guard_unapproved_self_claims(
@@ -1991,6 +2010,7 @@ class ResponseAgent:
                 f"可引用自我记忆：\n{_format_memory_candidates(approved_self_memories)}\n"
                 f"原回复：{reply}"
             ),
+            purpose="self_claim_rewrite",
         )
         if rewrite:
             cleaned = _sanitize_reply(rewrite, self.config.bot.max_reply_chars)
@@ -2069,6 +2089,7 @@ class FinalQAAgent:
                 f"主动价值：{decision.value_type}:{decision.value_score:.2f}，聊天密度：{decision.traffic_level}\n"
                 f"机器人拟发送文本：{cleaned_reply}"
             ),
+            purpose="final_qa",
         )
         if data:
             verdict = str(data.get("verdict", "block")).strip().lower()
@@ -2131,6 +2152,7 @@ class StickerSelectorAgent:
                 f"机器人文字回复：{reply}\n"
                 f"可用表情：\n{_format_sticker_assets(snapshot.sticker_assets)}"
             ),
+            purpose="sticker_select",
         )
         selected = self._asset_from_json(data, snapshot.sticker_assets) if data else fallback
         if selected is None:
@@ -2244,6 +2266,7 @@ class ReflectionAgent:
                 f"已有复盘：\n{_format_memories(prior_reflections)}\n"
                 f"最近消息：\n{_join_lines(recent_messages)}"
             ),
+            purpose="reflection",
         )
         if data:
             summary = str(data.get("summary", "")).strip()
@@ -2300,6 +2323,7 @@ class ProfileAggregatorAgent:
                 f"当前画像：\n{_format_user_profile_record(current_profile)}\n"
                 f"FACT：\n{_format_fact_records(facts)}"
             ),
+            purpose="profile_aggregate",
         )
         if not data:
             return None
@@ -2314,6 +2338,218 @@ class ProfileAggregatorAgent:
             traits=traits,
             supporting_fact_ids=supporting_ids,
         )
+
+
+class BatchObservationAgent:
+    def __init__(self, config: AppConfig, llm: LLMClient) -> None:
+        self.config = config
+        self.llm = llm
+
+    async def summarize(
+        self,
+        group_id: str,
+        contexts: list[MessageContext],
+        prior_reflections: list[MemoryRecord],
+        group_lexicon: list[MemoryRecord],
+    ) -> BatchObservationResult:
+        clean_contexts = [context for context in contexts if context.plain_text or context.attachments]
+        if not clean_contexts:
+            return BatchObservationResult()
+
+        by_message_id = {context.message_id: context for context in clean_contexts}
+        data = await _complete_json(
+            self.llm,
+            "你是 QQ 群聊观察批处理器。只输出 JSON，不要解释。",
+            (
+                "请批量整理这些群消息，只保留稳定、明确、之后有用的信息。"
+                "不要逐条复述，不要记录寒暄、表情、哈哈、流水账、一次性情绪或普通聊天动作。"
+                "成员 FACT 只记录观点、偏好、身份、习惯、技能、边界或对对象/事件的稳定评价。"
+                "记忆只记录群内长期有用的词条、群事实或很明确的成员自述。"
+                "如果某条信息主体、话题、结论或证据不明确，就不要抽取。"
+                "reflection 用 80 字以内概括这批消息的主线；如果没有值得长期记住的主线，summary 置空。"
+                "输出 JSON："
+                '{"memories":[{"message_id":"原消息id","owner_type":"user|group|self",'
+                '"owner_id":"可空","subject_user_id":"QQ或group或bot",'
+                '"claim_scope":"self_report|third_party|bot_directed|group_fact",'
+                '"kind":"alias|identity|preference|dislike|location|experience|persona_fact|lexicon|group_fact",'
+                '"content":"短句","confidence":0.0,"importance":0.0}],'
+                '"facts":[{"message_id":"原消息id","subject_user_id":"QQ或name:称呼",'
+                '"fact_type":"preference|dislike|opinion|identity|habit|skill|boundary|event_stance|other",'
+                '"claim_text":"完整结论句","topic":"对象或事件",'
+                '"stance":"positive|negative|neutral|mixed|unknown","confidence":0.0,'
+                '"importance":0.0,"claim_scope":"self_report|third_party",'
+                '"evidence_text":"原消息证据片段"}],'
+                '"reflection":{"summary":"可空","topics":["话题"],"importance":0.0}}\n'
+                f"群号：{group_id}\n"
+                f"已有群复盘：\n{_format_memories(prior_reflections)}\n"
+                f"已有群内词条：\n{_format_memories(group_lexicon)}\n"
+                f"本批消息：\n{self._format_messages(clean_contexts)}"
+            ),
+            purpose="batch_observation",
+        )
+        if not data:
+            return BatchObservationResult()
+
+        memories = self._parse_memories(data.get("memories"), by_message_id)
+        facts = self._parse_facts(data.get("facts"), by_message_id)
+        reflection = self._parse_reflection(group_id, clean_contexts, data.get("reflection"))
+        return BatchObservationResult(
+            memories=memories,
+            facts=_dedupe_fact_candidates(facts),
+            reflection=reflection,
+        )
+
+    def _format_messages(self, contexts: list[MessageContext]) -> str:
+        lines = []
+        max_chars = self.config.observation_batch.max_message_chars
+        for context in contexts[: self.config.observation_batch.max_messages_per_batch]:
+            name = context.sender_name or context.sender_nickname or "-"
+            text = " ".join(context.plain_text.split())
+            if len(text) > max_chars:
+                text = text[:max_chars].rstrip() + "..."
+            if not text and context.attachments:
+                text = f"[图片 x{len(context.attachments)}]"
+            elif context.attachments:
+                text = f"{text} [图片 x{len(context.attachments)}]"
+            lines.append(
+                f"- message_id={context.message_id} user_id={context.user_id} "
+                f"name={name} text={text or '(empty)'}"
+            )
+        return "\n".join(lines) if lines else "(none)"
+
+    def _parse_memories(
+        self,
+        value: Any,
+        by_message_id: dict[str, MessageContext],
+    ) -> list[MemoryCandidate]:
+        if not isinstance(value, list):
+            return []
+        memories: list[MemoryCandidate] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            context = self._context_for_item(item, by_message_id)
+            if context is None:
+                continue
+            owner_type = str(item.get("owner_type", "user")).strip()
+            if owner_type not in {"user", "self", "group"}:
+                owner_type = "user"
+            claim_scope = _safe_claim_scope(str(item.get("claim_scope", "self_report")).strip())
+            subject_user_id = str(item.get("subject_user_id", "")).strip()
+            owner_id = str(item.get("owner_id", "")).strip() or _owner_id_for(
+                owner_type,
+                context,
+                claim_scope,
+                subject_user_id,
+            )
+            if not subject_user_id:
+                subject_user_id = _subject_for(owner_type, owner_id, context, claim_scope)
+            content = _clean_fact_text(str(item.get("content", "")), 300)
+            if not content:
+                continue
+            memories.append(
+                MemoryCandidate(
+                    owner_type=owner_type,  # type: ignore[arg-type]
+                    owner_id=owner_id,
+                    kind=str(item.get("kind", "experience")).strip()[:40] or "experience",
+                    content=content,
+                    confidence=_clamp_float(item.get("confidence", 0.0)),
+                    importance=_clamp_float(item.get("importance", 0.5)),
+                    evidence_message_id=context.message_id,
+                    source_text=context.plain_text,
+                    source_user_id=context.user_id,
+                    source_group_id=context.group_id,
+                    subject_user_id=subject_user_id,
+                    claim_scope=claim_scope,  # type: ignore[arg-type]
+                )
+            )
+        return memories
+
+    def _parse_facts(
+        self,
+        value: Any,
+        by_message_id: dict[str, MessageContext],
+    ) -> list[FactCandidate]:
+        if not isinstance(value, list):
+            return []
+        facts: list[FactCandidate] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            context = self._context_for_item(item, by_message_id)
+            if context is None:
+                continue
+            claim_scope = _safe_claim_scope(str(item.get("claim_scope", "self_report")).strip())
+            subject_user_id = str(item.get("subject_user_id", "")).strip()
+            if not subject_user_id and claim_scope == "self_report":
+                subject_user_id = context.user_id
+            claim_text = _clean_fact_text(str(item.get("claim_text", "")), 300)
+            topic = _clean_fact_text(str(item.get("topic", "")), 120)
+            evidence_text = _clean_fact_text(
+                str(item.get("evidence_text", "") or context.plain_text),
+                1000,
+            )
+            if not subject_user_id or not claim_text or not topic or not evidence_text:
+                continue
+            if _looks_low_value_fact_text(claim_text, topic, evidence_text):
+                continue
+            facts.append(
+                _fact_candidate(
+                    context=context,
+                    subject_user_id=subject_user_id,
+                    fact_type=str(item.get("fact_type", "other")).strip(),
+                    claim_text=claim_text,
+                    topic=topic,
+                    stance=str(item.get("stance", "unknown")).strip(),
+                    confidence=_clamp_float(item.get("confidence", 0.0)),
+                    claim_scope=claim_scope,
+                    evidence_text=evidence_text,
+                    importance=_clamp_float(item.get("importance", 0.5)),
+                )
+            )
+        return facts
+
+    def _parse_reflection(
+        self,
+        group_id: str,
+        contexts: list[MessageContext],
+        value: Any,
+    ) -> MemoryCandidate | None:
+        if not isinstance(value, dict):
+            return None
+        summary = _clean_fact_text(str(value.get("summary", "")), 120)
+        if not summary:
+            return None
+        topics = _clean_list(value.get("topics"))[:5]
+        content = summary if not topics else f"{summary}；话题：{'、'.join(topics)}"
+        first = contexts[0]
+        last = contexts[-1]
+        return MemoryCandidate(
+            owner_type="group",
+            owner_id=str(group_id),
+            kind="reflection",
+            content=content,
+            confidence=0.82,
+            importance=_clamp_float(value.get("importance", 0.62)),
+            evidence_message_id=f"batch-{first.message_id}-{last.message_id}",
+            source_text="\n".join(context.plain_text for context in contexts[-20:]),
+            source_user_id="bot",
+            source_group_id=str(group_id),
+            subject_user_id=str(group_id),
+            claim_scope="group_fact",
+        )
+
+    def _context_for_item(
+        self,
+        item: dict[str, Any],
+        by_message_id: dict[str, MessageContext],
+    ) -> MessageContext | None:
+        message_id = str(item.get("message_id", "")).strip()
+        if message_id:
+            return by_message_id.get(message_id)
+        if len(by_message_id) == 1:
+            return next(iter(by_message_id.values()))
+        return None
 
 
 class AgentPipeline:
@@ -2336,6 +2572,7 @@ class AgentPipeline:
         self.stickers = StickerSelectorAgent(config, llm)
         self.reflection = ReflectionAgent(llm)
         self.profile_aggregator = ProfileAggregatorAgent(llm)
+        self.batch_observation = BatchObservationAgent(config, llm)
 
     async def run(
         self,
@@ -2448,9 +2685,28 @@ class AgentPipeline:
     ) -> FinalQAResult:
         return await self.final_qa.review(context, decision, snapshot, reply)
 
+    async def observe_batch(
+        self,
+        group_id: str,
+        contexts: list[MessageContext],
+        prior_reflections: list[MemoryRecord],
+        group_lexicon: list[MemoryRecord],
+    ) -> BatchObservationResult:
+        return await self.batch_observation.summarize(
+            group_id,
+            contexts,
+            prior_reflections,
+            group_lexicon,
+        )
 
-async def _complete_json(llm: LLMClient, system_prompt: str, user_prompt: str) -> dict[str, Any] | None:
-    text = await llm.complete_text(system_prompt, user_prompt)
+
+async def _complete_json(
+    llm: LLMClient,
+    system_prompt: str,
+    user_prompt: str,
+    purpose: str = "structured_json",
+) -> dict[str, Any] | None:
+    text = await llm.complete_text(system_prompt, user_prompt, purpose=purpose)
     if not text:
         return None
     try:
@@ -2466,8 +2722,15 @@ async def _complete_vision_json(
     system_prompt: str,
     user_prompt: str,
     image_urls: list[str],
+    purpose: str = "vision",
 ) -> dict[str, Any] | None:
-    text = await llm.complete_vision(system_prompt, user_prompt, image_urls, config.vision)
+    text = await llm.complete_vision(
+        system_prompt,
+        user_prompt,
+        image_urls,
+        config.vision,
+        purpose=purpose,
+    )
     if not text:
         return None
     try:

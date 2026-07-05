@@ -33,6 +33,8 @@ from qq_llm_bot.models import (
     MemoryRecord,
     MessageAttachment,
     MessageContext,
+    ParticipationDecision,
+    RelationDelta,
     StickerAssetRecord,
     StickerCandidate,
     TargetUserContext,
@@ -53,11 +55,13 @@ __plugin_meta__ = PluginMetadata(
 
 config = load_config()
 storage = BotStorage.from_config(config)
-llm = build_llm_client(config.llm)
+llm = build_llm_client(config.llm, usage_recorder=storage.record_llm_usage)
 pipeline = AgentPipeline(config, llm, vision_cache=storage)
 sticker_store = StickerLocalStore(config)
 generated_image_store = GeneratedImageStore(config)
 driver = get_driver()
+observation_buffers: dict[str, list[MessageContext]] = {}
+observation_last_flush_at: dict[str, int] = {}
 
 if config.dashboard.enabled:
     register_dashboard_routes(
@@ -399,6 +403,11 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     mode = storage.get_group_mode(group_id, config.bot.default_group_mode)
+    if _should_defer_realtime_pipeline(context, mode):
+        await _defer_observation(context, mode)
+        return
+
+    await _flush_observation_batch(group_id)
     snapshot = storage.build_snapshot(context)
     result = await pipeline.run(context, mode, snapshot)
 
@@ -439,6 +448,141 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if sent_sticker:
         storage.record_sticker_sent(sent_sticker.id)
     await group_message.finish()
+
+
+def _should_defer_realtime_pipeline(context: MessageContext, mode: ParticipationMode) -> bool:
+    if not config.observation_batch.enabled:
+        return False
+    if context.is_direct:
+        return False
+    if _has_recent_bot_reply_context(context):
+        return False
+    if mode == "silent":
+        return True
+    if mode == "passive":
+        return True
+    if mode == "active":
+        return not _looks_like_active_realtime_candidate(context)
+    return False
+
+
+def _has_recent_bot_reply_context(context: MessageContext) -> bool:
+    text = context.plain_text.strip()
+    if not text or len(text) > 160:
+        return False
+    recent_reply, _ = storage.get_recent_bot_reply_to_user(
+        context.group_id,
+        context.user_id,
+        config.bot.interaction_followup_seconds,
+    )
+    return bool(recent_reply)
+
+
+def _looks_like_active_realtime_candidate(context: MessageContext) -> bool:
+    text = " ".join(context.plain_text.split())
+    compact = "".join(text.split())
+    if len(compact) < 6:
+        return False
+    realtime_cues = (
+        "?",
+        "？",
+        "吗",
+        "么",
+        "怎么",
+        "如何",
+        "为什么",
+        "咋",
+        "要不要",
+        "该不该",
+        "有没有",
+        "谁",
+        "哪",
+        "啥",
+        "求",
+        "建议",
+        "推荐",
+        "帮",
+        "分析",
+        "看法",
+        "方案",
+    )
+    return any(cue in compact for cue in realtime_cues)
+
+
+async def _defer_observation(context: MessageContext, mode: ParticipationMode) -> None:
+    buffer = observation_buffers.setdefault(context.group_id, [])
+    if context.group_id not in observation_last_flush_at:
+        observation_last_flush_at[context.group_id] = int(time.time())
+    buffer.append(context)
+    storage.apply_relationship_delta(
+        context.group_id,
+        context.user_id,
+        RelationDelta(familiarity=1, reason="deferred batch observation"),
+    )
+    storage.record_decision(
+        context,
+        ParticipationDecision("observe", _deferred_observation_reason(mode), mode, 0.0),
+        "",
+    )
+    await _flush_observation_batch(context.group_id)
+
+
+def _deferred_observation_reason(mode: ParticipationMode) -> str:
+    if mode == "silent":
+        return "silent mode deferred to batch observation"
+    if mode == "passive":
+        return "passive non-direct message deferred to batch observation"
+    return "active low-priority message deferred to batch observation"
+
+
+async def _flush_observation_batch(group_id: str, force: bool = False) -> None:
+    if not config.observation_batch.enabled:
+        return
+    buffer = observation_buffers.get(group_id, [])
+    if not buffer:
+        return
+
+    now = int(time.time())
+    last_flush = observation_last_flush_at.get(group_id, now)
+    due_by_size = len(buffer) >= config.observation_batch.batch_size
+    due_by_time = now - last_flush >= config.observation_batch.max_interval_seconds
+    if not force and not due_by_size and not due_by_time:
+        return
+
+    batch_size = min(len(buffer), config.observation_batch.max_messages_per_batch)
+    batch = list(buffer[:batch_size])
+    try:
+        result = await pipeline.observe_batch(
+            group_id,
+            batch,
+            storage.list_memories("group", group_id, limit=3),
+            storage.list_group_lexicon_records(group_id, limit=10),
+        )
+    except Exception as exc:  # pragma: no cover - batch observation must never break chat handling
+        observation_last_flush_at[group_id] = now
+        logger.warning("Batch observation failed for group {}: {}", group_id, exc)
+        return
+
+    del buffer[:batch_size]
+    if not buffer:
+        observation_buffers.pop(group_id, None)
+    observation_last_flush_at[group_id] = now
+
+    memories = list(result.memories)
+    if result.reflection is not None:
+        memories.append(result.reflection)
+    fact_write = storage.record_fact_candidates(result.facts)
+    memory_write = storage.record_memory_candidates(memories)
+    if memory_write.conflicts:
+        logger.info(
+            "Batch observation recorded {} memory conflicts in group {}; waiting for manual review",
+            len(memory_write.conflicts),
+            group_id,
+        )
+    await _maybe_update_profiles(
+        [fact.subject_user_id for fact in fact_write.accepted],
+        force=bool(fact_write.accepted),
+    )
 
 
 async def _handle_whitelist(rest: list[str]) -> None:
@@ -670,6 +814,7 @@ async def _handle_llm(rest: list[str]) -> None:
         reply = await llm.complete_text(
             "你是 QQ 群里的拟人角色，说话自然、简短。",
             prompt,
+            purpose="llm_test",
         )
         await _finish_command(admin_cmd, reply or "LLM 没有返回内容，请检查 provider/base_url/model/key。")
 
@@ -785,7 +930,7 @@ async def _compose_draw_prompt(
         "但不要把 appearance_prompt 明确排除的场景或穿着固化进去；"
         "如果用户请求很简单，也不要过度添加不相关记忆。"
     )
-    text = await llm.complete_text(system_prompt, user_prompt)
+    text = await llm.complete_text(system_prompt, user_prompt, purpose="draw_prompt")
     return _extract_draw_prompt(text)
 
 

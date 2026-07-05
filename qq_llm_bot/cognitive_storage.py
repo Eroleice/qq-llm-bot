@@ -11,6 +11,7 @@ from threading import RLock
 from typing import Iterator, Iterable
 
 from qq_llm_bot.config import AppConfig, ParticipationMode
+from qq_llm_bot.llm import LLMUsageRecord
 from qq_llm_bot.models import (
     ConversationSnapshot,
     FactCandidate,
@@ -393,6 +394,18 @@ class BotStorage:
                     image_ref TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS llm_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    purpose TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    prompt_chars INTEGER NOT NULL DEFAULT 0,
+                    completion_chars INTEGER NOT NULL DEFAULT 0,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._migrate_schema(conn)
@@ -424,6 +437,10 @@ class BotStorage:
                 ON member_aliases(user_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_image_generation_usage_user_date
                 ON image_generation_usage(user_id, usage_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_created_at
+                ON llm_usage(created_at);
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_purpose_created_at
+                ON llm_usage(purpose, created_at);
             """
         )
 
@@ -1899,6 +1916,89 @@ class BotStorage:
                     now,
                 ),
             )
+
+    def record_llm_usage(self, record: LLMUsageRecord) -> None:
+        created_at = int(record.created_at or time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO llm_usage (
+                    created_at, purpose, model, prompt_chars, completion_chars,
+                    prompt_tokens, completion_tokens, total_tokens
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    str(record.purpose)[:80],
+                    str(record.model)[:120],
+                    max(0, int(record.prompt_chars)),
+                    max(0, int(record.completion_chars)),
+                    max(0, int(record.prompt_tokens)),
+                    max(0, int(record.completion_tokens)),
+                    max(0, int(record.total_tokens)),
+                ),
+            )
+
+    def list_dashboard_llm_usage(
+        self,
+        since: int,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        since = max(0, int(since))
+        limit = max(1, int(limit))
+        with self._connect() as conn:
+            summary = conn.execute(
+                """
+                SELECT
+                    COUNT(1) AS calls,
+                    COALESCE(SUM(prompt_chars), 0) AS prompt_chars,
+                    COALESCE(SUM(completion_chars), 0) AS completion_chars,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    MIN(created_at) AS first_at,
+                    MAX(created_at) AS last_at
+                FROM llm_usage
+                WHERE created_at >= ?
+                """,
+                (since,),
+            ).fetchone()
+            by_purpose_rows = conn.execute(
+                """
+                SELECT
+                    purpose,
+                    model,
+                    COUNT(1) AS calls,
+                    COALESCE(SUM(prompt_chars), 0) AS prompt_chars,
+                    COALESCE(SUM(completion_chars), 0) AS completion_chars,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    MAX(created_at) AS last_at
+                FROM llm_usage
+                WHERE created_at >= ?
+                GROUP BY purpose, model
+                ORDER BY total_tokens DESC, calls DESC, purpose ASC
+                """,
+                (since,),
+            ).fetchall()
+            recent_rows = conn.execute(
+                """
+                SELECT id, created_at, purpose, model, prompt_chars, completion_chars,
+                       prompt_tokens, completion_tokens, total_tokens
+                FROM llm_usage
+                WHERE created_at >= ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (since, limit),
+            ).fetchall()
+        return {
+            "summary": _llm_usage_summary_to_dict(summary, since),
+            "by_purpose": [_llm_usage_group_to_dict(row) for row in by_purpose_rows],
+            "recent": [_llm_usage_row_to_dict(row) for row in recent_rows],
+        }
 
     def get_dashboard_persona(self) -> dict[str, object]:
         with self._connect() as conn:
@@ -3449,6 +3549,60 @@ def _sticker_asset_to_dict(asset: StickerAssetRecord) -> dict[str, object]:
         "last_seen_at": asset.last_seen_at,
         "hit_count": asset.hit_count,
         "delete_command": f"#bot stickers delete {asset.id}",
+    }
+
+
+def _llm_usage_summary_to_dict(row: sqlite3.Row | None, since: int) -> dict[str, object]:
+    if row is None:
+        return {
+            "since": since,
+            "calls": 0,
+            "prompt_chars": 0,
+            "completion_chars": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "first_at": 0,
+            "last_at": 0,
+        }
+    return {
+        "since": since,
+        "calls": int(row["calls"] or 0),
+        "prompt_chars": int(row["prompt_chars"] or 0),
+        "completion_chars": int(row["completion_chars"] or 0),
+        "prompt_tokens": int(row["prompt_tokens"] or 0),
+        "completion_tokens": int(row["completion_tokens"] or 0),
+        "total_tokens": int(row["total_tokens"] or 0),
+        "first_at": int(row["first_at"] or 0),
+        "last_at": int(row["last_at"] or 0),
+    }
+
+
+def _llm_usage_group_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "purpose": str(row["purpose"] or ""),
+        "model": str(row["model"] or ""),
+        "calls": int(row["calls"] or 0),
+        "prompt_chars": int(row["prompt_chars"] or 0),
+        "completion_chars": int(row["completion_chars"] or 0),
+        "prompt_tokens": int(row["prompt_tokens"] or 0),
+        "completion_tokens": int(row["completion_tokens"] or 0),
+        "total_tokens": int(row["total_tokens"] or 0),
+        "last_at": int(row["last_at"] or 0),
+    }
+
+
+def _llm_usage_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": int(row["id"]),
+        "created_at": int(row["created_at"]),
+        "purpose": str(row["purpose"] or ""),
+        "model": str(row["model"] or ""),
+        "prompt_chars": int(row["prompt_chars"] or 0),
+        "completion_chars": int(row["completion_chars"] or 0),
+        "prompt_tokens": int(row["prompt_tokens"] or 0),
+        "completion_tokens": int(row["completion_tokens"] or 0),
+        "total_tokens": int(row["total_tokens"] or 0),
     }
 
 

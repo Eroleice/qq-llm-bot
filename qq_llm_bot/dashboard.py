@@ -91,6 +91,23 @@ def register_dashboard_routes(
         _ensure_authorized(request, config)
         return {"items": storage.list_dashboard_pending(limit=_clamp_limit(limit, 10, 300))}
 
+    @app.get(f"{api_prefix}/llm-usage")
+    async def dashboard_llm_usage(
+        request: Request,
+        hours: int = 24,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        safe_hours = _clamp_limit(hours, 1, 24 * 90)
+        now = int(datetime.now().timestamp())
+        data = storage.list_dashboard_llm_usage(
+            since=now - safe_hours * 3600,
+            limit=_clamp_limit(limit, 10, 500),
+        )
+        data["hours"] = safe_hours
+        data["now"] = now
+        return data
+
     @app.post(f"{api_prefix}/pending/bulk")
     async def dashboard_bulk_pending(request: Request) -> dict[str, object]:
         _ensure_authorized(request, config)
@@ -529,6 +546,44 @@ _DASHBOARD_HTML = r"""<!doctype html>
       gap: 10px;
       align-content: start;
     }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel);
+    }
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .metric-value {
+      font-size: 22px;
+      font-weight: 700;
+      margin-top: 4px;
+    }
+    .usage-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    .usage-table th,
+    .usage-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .usage-table th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
     .sticker-media {
       width: 100%;
       aspect-ratio: 1;
@@ -583,6 +638,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       <button class="tab" data-tab="users">成员认知</button>
       <button class="tab" data-tab="messages">群聊记录</button>
       <button class="tab" data-tab="stickers">表情包</button>
+      <button class="tab" data-tab="llmUsage">LLM 用量</button>
       <button class="tab" data-tab="pending">Pending</button>
     </nav>
     <section class="content">
@@ -649,6 +705,26 @@ _DASHBOARD_HTML = r"""<!doctype html>
         </div>
         <div id="stickersList"></div>
       </div>
+
+      <div id="llmUsage" class="section">
+        <h2>LLM token 用量</h2>
+        <div class="toolbar">
+          <label>时间范围
+            <select id="llmUsageHours">
+              <option value="1">最近 1 小时</option>
+              <option value="6">最近 6 小时</option>
+              <option value="24" selected>最近 24 小时</option>
+              <option value="168">最近 7 天</option>
+              <option value="720">最近 30 天</option>
+            </select>
+          </label>
+          <label>明细数量<input id="llmUsageLimit" type="number" value="100" min="10" max="500" /></label>
+          <button class="primary" id="loadLlmUsageBtn">刷新</button>
+        </div>
+        <div id="llmUsageSummary"></div>
+        <div id="llmUsageByPurpose"></div>
+        <div id="llmUsageRecent"></div>
+      </div>
     </section>
   </main>
   <script>
@@ -675,6 +751,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
     document.getElementById("loadUsersBtn").addEventListener("click", loadUsers);
     document.getElementById("loadMessagesBtn").addEventListener("click", loadMessages);
     document.getElementById("loadStickersBtn").addEventListener("click", loadStickers);
+    document.getElementById("loadLlmUsageBtn").addEventListener("click", loadLlmUsage);
     document.getElementById("loadPendingBtn").addEventListener("click", loadPending);
     document.getElementById("selectAllPendingBtn").addEventListener("click", selectAllPending);
     document.getElementById("clearPendingSelectionBtn").addEventListener("click", clearPendingSelection);
@@ -734,6 +811,9 @@ _DASHBOARD_HTML = r"""<!doctype html>
     function formatTime(seconds) {
       if (!seconds) return "";
       return new Date(seconds * 1000).toLocaleString();
+    }
+    function formatInteger(value) {
+      return Number(value || 0).toLocaleString();
     }
     function tokenParam() {
       const token = localStorage.getItem("qqBotDashboardToken") || "";
@@ -953,6 +1033,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       if (tab === "users") return loadUsers();
       if (tab === "messages") return loadMessages();
       if (tab === "stickers") return loadStickers();
+      if (tab === "llmUsage") return loadLlmUsage();
       if (tab === "pending") return loadPending();
     }
     async function runAction(path, options = {}, doneText = "操作已完成") {
@@ -1094,6 +1175,113 @@ _DASHBOARD_HTML = r"""<!doctype html>
         showError(error);
       }
     }
+    async function loadLlmUsage() {
+      clearError();
+      setStatus("读取 LLM 用量");
+      try {
+        const data = await api("/llm-usage", {
+          hours: document.getElementById("llmUsageHours").value,
+          limit: document.getElementById("llmUsageLimit").value,
+        });
+        const summary = data.summary || {};
+        const calls = Number(summary.calls || 0);
+        const avgTokens = calls ? Math.round(Number(summary.total_tokens || 0) / calls) : 0;
+        document.getElementById("llmUsageSummary").innerHTML = `
+          <div class="metric-grid">
+            <div class="metric">
+              <div class="metric-label">调用次数</div>
+              <div class="metric-value">${formatInteger(calls)}</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">总 token</div>
+              <div class="metric-value">${formatInteger(summary.total_tokens)}</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Prompt token</div>
+              <div class="metric-value">${formatInteger(summary.prompt_tokens)}</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Completion token</div>
+              <div class="metric-value">${formatInteger(summary.completion_tokens)}</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">平均 token / 次</div>
+              <div class="metric-value">${formatInteger(avgTokens)}</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">字符数</div>
+              <div class="metric-value">${formatInteger(Number(summary.prompt_chars || 0) + Number(summary.completion_chars || 0))}</div>
+            </div>
+          </div>
+          <div class="muted">
+            范围：${formatTime(summary.first_at) || "无记录"} - ${formatTime(summary.last_at) || "无记录"}。
+            provider 不返回 token 时，token 会显示为 0，可参考字符数。
+          </div>
+        `;
+
+        const byPurpose = data.by_purpose || [];
+        document.getElementById("llmUsageByPurpose").innerHTML = byPurpose.length ? `
+          <div class="panel">
+            <h3>按 purpose / model 汇总</h3>
+            <table class="usage-table">
+              <thead>
+                <tr>
+                  <th>purpose</th>
+                  <th>model</th>
+                  <th>calls</th>
+                  <th>prompt</th>
+                  <th>completion</th>
+                  <th>total</th>
+                  <th>chars</th>
+                  <th>last</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${byPurpose.map((item) => `
+                  <tr>
+                    <td><span class="pill">${escapeHtml(item.purpose || "(empty)")}</span></td>
+                    <td>${escapeHtml(item.model || "-")}</td>
+                    <td>${formatInteger(item.calls)}</td>
+                    <td>${formatInteger(item.prompt_tokens)}</td>
+                    <td>${formatInteger(item.completion_tokens)}</td>
+                    <td>${formatInteger(item.total_tokens)}</td>
+                    <td>${formatInteger(Number(item.prompt_chars || 0) + Number(item.completion_chars || 0))}</td>
+                    <td>${formatTime(item.last_at)}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        ` : `<div class="empty">暂无 LLM 用量记录。</div>`;
+
+        const recent = data.recent || [];
+        document.getElementById("llmUsageRecent").innerHTML = recent.length ? `
+          <div class="panel">
+            <h3>最近调用</h3>
+            ${recent.map((item) => `
+              <div class="item">
+                <div>
+                  <span class="pill">#${escapeHtml(item.id)}</span>
+                  <span class="pill">${escapeHtml(item.purpose || "(empty)")}</span>
+                  <span class="pill">${escapeHtml(item.model || "-")}</span>
+                </div>
+                <div class="muted" style="margin-top:6px">${formatTime(item.created_at)}</div>
+                <div class="kv" style="margin-top:10px">
+                  <div class="key">prompt tokens</div><div>${formatInteger(item.prompt_tokens)}</div>
+                  <div class="key">completion tokens</div><div>${formatInteger(item.completion_tokens)}</div>
+                  <div class="key">total tokens</div><div>${formatInteger(item.total_tokens)}</div>
+                  <div class="key">prompt chars</div><div>${formatInteger(item.prompt_chars)}</div>
+                  <div class="key">completion chars</div><div>${formatInteger(item.completion_chars)}</div>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        ` : "";
+        setStatus(`LLM 用量 ${calls} 次`);
+      } catch (error) {
+        showError(error);
+      }
+    }
     async function loadPending() {
       clearError();
       setStatus("读取 pending");
@@ -1158,7 +1346,14 @@ _DASHBOARD_HTML = r"""<!doctype html>
       setStatus("读取数据");
       try {
         await loadGroups();
-        await Promise.all([loadPersona(), loadUsers(), loadMessages(), loadStickers(), loadPending()]);
+        await Promise.all([
+          loadPersona(),
+          loadUsers(),
+          loadMessages(),
+          loadStickers(),
+          loadLlmUsage(),
+          loadPending(),
+        ]);
         setStatus("数据已更新");
       } catch (error) {
         showError(error);

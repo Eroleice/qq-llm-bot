@@ -45,6 +45,14 @@ message_threshold = 30
 recent_limit = 40
 min_interval_seconds = 600
 
+[observation_batch]
+# Non-reply observation messages are buffered and summarized together to save LLM tokens.
+enabled = true
+batch_size = 30
+max_interval_seconds = 600
+max_messages_per_batch = 40
+max_message_chars = 300
+
 [facts]
 fact_confidence_threshold = 0.75
 third_party_trust_threshold = 70
