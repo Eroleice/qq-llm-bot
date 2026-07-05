@@ -46,7 +46,12 @@ sticker_store = StickerLocalStore(config)
 driver = get_driver()
 
 if config.dashboard.enabled:
-    register_dashboard_routes(driver, storage, config)
+    register_dashboard_routes(
+        driver,
+        storage,
+        config,
+        on_fact_changed=lambda user_ids: _maybe_update_profiles(user_ids, force=True),
+    )
 
 
 @driver.on_startup

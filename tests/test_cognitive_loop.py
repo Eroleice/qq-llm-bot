@@ -130,6 +130,21 @@ def test_config(db_path: Path) -> AppConfig:
 test_config.__test__ = False
 
 
+class FakeDashboardDriver:
+    def __init__(self, app: object) -> None:
+        self.server_app = app
+
+
+def _dashboard_test_tools() -> tuple[object, object, object]:
+    try:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from qq_llm_bot.dashboard import register_dashboard_routes
+    except ModuleNotFoundError as exc:
+        raise unittest.SkipTest("fastapi is not installed in this environment") from exc
+    return FastAPI, TestClient, register_dashboard_routes
+
+
 def _first_attribute_call_line(node: ast.AST, attribute_name: str) -> int:
     lines = [
         child.lineno
@@ -3132,6 +3147,154 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(pending[0]["item_type"], "fact")
             self.assertEqual(pending[0]["approve_command"], f"#bot facts approve {pending[0]['id']}")
             self.assertEqual(pending[0]["reject_command"], f"#bot facts reject {pending[0]['id']}")
+
+    def test_dashboard_api_can_manage_pending_fact(self) -> None:
+        FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            changed_users: list[str] = []
+
+            async def on_fact_changed(user_ids: list[str]) -> None:
+                changed_users.extend(user_ids)
+
+            app = FastAPI()
+            register_dashboard_routes(
+                FakeDashboardDriver(app),
+                storage,
+                config,
+                on_fact_changed=on_fact_changed,
+            )
+            write = storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="77",
+                        fact_type="preference",
+                        claim_text="user 77 likes seaside",
+                        topic="seaside",
+                        stance="positive",
+                        confidence=0.86,
+                        evidence_message_id="m1",
+                        evidence_text="77 likes seaside",
+                        source_user_id="42",
+                        source_group_id="100",
+                        claim_scope="third_party",
+                    )
+                ]
+            )
+            fact_id = write.pending[0].id
+
+            with TestClient(app) as client:
+                response = client.post(f"/api/dashboard/facts/{fact_id}/approve")
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["ok"])
+                self.assertEqual(storage.get_fact_record(fact_id).status, "accepted")  # type: ignore[union-attr]
+
+                response = client.delete(f"/api/dashboard/facts/{fact_id}")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(storage.get_fact_record(fact_id).status, "forgotten")  # type: ignore[union-attr]
+
+            self.assertEqual(changed_users, ["77", "77"])
+
+    def test_dashboard_api_can_reject_pending_memory_and_fact(self) -> None:
+        FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            app = FastAPI()
+            register_dashboard_routes(FakeDashboardDriver(app), storage, config)
+            fact_write = storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="88",
+                        fact_type="preference",
+                        claim_text="user 88 likes shrimp",
+                        topic="shrimp",
+                        stance="positive",
+                        confidence=0.86,
+                        evidence_message_id="m2",
+                        evidence_text="88 likes shrimp",
+                        source_user_id="42",
+                        source_group_id="100",
+                        claim_scope="third_party",
+                    )
+                ]
+            )
+            memory = MemoryCandidate(
+                owner_type="user",
+                owner_id="name:alice",
+                kind="preference",
+                content="likes fish",
+                confidence=0.86,
+                importance=0.5,
+                evidence_message_id="m3",
+                source_user_id="42",
+                source_group_id="100",
+                subject_user_id="name:alice",
+                claim_scope="third_party",
+            )
+            storage.record_memory_candidates([memory])
+            memory_id = storage.list_memories(
+                "user",
+                "name:alice",
+                status="pending_confirmation",
+            )[0].id
+
+            with TestClient(app) as client:
+                response = client.post(f"/api/dashboard/facts/{fact_write.pending[0].id}/reject")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    storage.get_fact_record(fact_write.pending[0].id).status,  # type: ignore[union-attr]
+                    "rejected",
+                )
+
+                response = client.post(f"/api/dashboard/memories/{memory_id}/reject")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    storage.list_memories("user", "name:alice", status="pending_confirmation"),
+                    [],
+                )
+
+    def test_dashboard_api_deletes_sticker_asset_and_file(self) -> None:
+        FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            sticker_dir = config.resolve_path(config.stickers.storage_dir) / "100"
+            sticker_dir.mkdir(parents=True)
+            sticker_file = sticker_dir / "meme.png"
+            sticker_file.write_bytes(b"fake image")
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-sticker",
+                plain_text="",
+                raw_message="[CQ:image]",
+            )
+            asset = storage.upsert_sticker_asset(
+                context,
+                StickerCandidate(
+                    url="https://example.test/meme.png",
+                    file="meme.png",
+                    description="meme",
+                    confidence=0.86,
+                ),
+                local_path=str(sticker_file),
+                sha256="abc",
+            )
+            app = FastAPI()
+            register_dashboard_routes(FakeDashboardDriver(app), storage, config)
+
+            with TestClient(app) as client:
+                response = client.delete(f"/api/dashboard/stickers/{asset.id}")  # type: ignore[union-attr]
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()["deleted_file"])
+            self.assertIsNone(storage.get_sticker_asset(asset.id if asset else 0))
+            self.assertFalse(sticker_file.exists())
 
     def test_last_decision_includes_proactive_value_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

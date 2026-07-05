@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -10,9 +12,16 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import AppConfig
+from qq_llm_bot.models import FactRecord
+from qq_llm_bot.stickers import StickerLocalStore
 
 
-def register_dashboard_routes(driver: Any, storage: BotStorage, config: AppConfig) -> None:
+def register_dashboard_routes(
+    driver: Any,
+    storage: BotStorage,
+    config: AppConfig,
+    on_fact_changed: Callable[[list[str]], Awaitable[None]] | None = None,
+) -> None:
     app = getattr(driver, "server_app", None)
     if app is None:
         return
@@ -22,6 +31,7 @@ def register_dashboard_routes(driver: Any, storage: BotStorage, config: AppConfi
 
     route_prefix = config.dashboard.route_prefix
     api_prefix = config.dashboard.api_prefix
+    sticker_store = StickerLocalStore(config)
 
     @app.get(route_prefix, response_class=HTMLResponse)
     async def dashboard_page(request: Request) -> HTMLResponse:
@@ -81,6 +91,56 @@ def register_dashboard_routes(driver: Any, storage: BotStorage, config: AppConfi
         _ensure_authorized(request, config)
         return {"items": storage.list_dashboard_pending(limit=_clamp_limit(limit, 10, 300))}
 
+    @app.post(f"{api_prefix}/facts/{{fact_id}}/approve")
+    async def dashboard_approve_fact(request: Request, fact_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        record = storage.approve_fact(fact_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="pending fact not found")
+        await _notify_fact_changed(on_fact_changed, record)
+        return {"ok": True, "item": asdict(record)}
+
+    @app.post(f"{api_prefix}/facts/{{fact_id}}/reject")
+    async def dashboard_reject_fact(request: Request, fact_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        if not storage.reject_fact(fact_id):
+            raise HTTPException(status_code=404, detail="pending fact not found")
+        return {"ok": True}
+
+    @app.post(f"{api_prefix}/facts/{{fact_id}}/forget")
+    async def dashboard_forget_fact(request: Request, fact_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        record = storage.forget_fact(fact_id, reason="dashboard")
+        if record is None:
+            raise HTTPException(status_code=404, detail="fact not found")
+        await _notify_fact_changed(on_fact_changed, record)
+        return {"ok": True, "item": asdict(record)}
+
+    @app.delete(f"{api_prefix}/facts/{{fact_id}}")
+    async def dashboard_delete_fact(request: Request, fact_id: int) -> dict[str, object]:
+        return await dashboard_forget_fact(request, fact_id)
+
+    @app.post(f"{api_prefix}/memories/{{memory_id}}/approve")
+    async def dashboard_approve_memory(request: Request, memory_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        if not storage.approve_memory(memory_id):
+            raise HTTPException(status_code=404, detail="pending memory not found")
+        return {"ok": True}
+
+    @app.post(f"{api_prefix}/memories/{{memory_id}}/reject")
+    async def dashboard_reject_memory(request: Request, memory_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        if not storage.reject_memory(memory_id):
+            raise HTTPException(status_code=404, detail="pending memory not found")
+        return {"ok": True}
+
+    @app.post(f"{api_prefix}/memories/{{memory_id}}/forget")
+    async def dashboard_forget_memory(request: Request, memory_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        if not storage.forget_memory(memory_id):
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"ok": True}
+
     @app.get(f"{api_prefix}/stickers")
     async def dashboard_stickers(
         request: Request,
@@ -111,6 +171,29 @@ def register_dashboard_routes(driver: Any, storage: BotStorage, config: AppConfi
             raise HTTPException(status_code=404, detail="sticker image not found")
         return FileResponse(image_path)
 
+    @app.post(f"{api_prefix}/stickers/{{sticker_id}}/enable")
+    async def dashboard_enable_sticker(request: Request, sticker_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        if not storage.set_sticker_enabled(sticker_id, True):
+            raise HTTPException(status_code=404, detail="sticker not found")
+        return {"ok": True}
+
+    @app.post(f"{api_prefix}/stickers/{{sticker_id}}/disable")
+    async def dashboard_disable_sticker(request: Request, sticker_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        if not storage.set_sticker_enabled(sticker_id, False):
+            raise HTTPException(status_code=404, detail="sticker not found")
+        return {"ok": True}
+
+    @app.delete(f"{api_prefix}/stickers/{{sticker_id}}")
+    async def dashboard_delete_sticker(request: Request, sticker_id: int) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        asset = storage.delete_sticker_asset(sticker_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="sticker not found")
+        deleted_file = sticker_store.delete_saved_file(asset.local_path)
+        return {"ok": True, "deleted_file": deleted_file, "item": asdict(asset)}
+
 
 def _ensure_authorized(request: Request, config: AppConfig) -> None:
     expected = _dashboard_token(config)
@@ -123,6 +206,15 @@ def _ensure_authorized(request: Request, config: AppConfig) -> None:
 
 def _dashboard_token(config: AppConfig) -> str:
     return config.dashboard.access_token or os.getenv(config.dashboard.access_token_env, "")
+
+
+async def _notify_fact_changed(
+    on_fact_changed: Callable[[list[str]], Awaitable[None]] | None,
+    record: FactRecord,
+) -> None:
+    if on_fact_changed is None or not record.subject_user_id:
+        return
+    await on_fact_changed([record.subject_user_id])
 
 
 def _date_to_timestamp(value: str, end: bool) -> int | None:
@@ -278,6 +370,20 @@ _DASHBOARD_HTML = r"""<!doctype html>
       background: var(--accent);
       border-color: var(--accent);
       color: #fff;
+    }
+    button.danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: #fff;
+    }
+    button.warn {
+      background: #fff8e1;
+      border-color: #f0c36a;
+      color: var(--warn);
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: wait;
     }
     .grid {
       display: grid;
@@ -495,7 +601,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
     document.getElementById("loadStickersBtn").addEventListener("click", loadStickers);
     document.getElementById("loadPendingBtn").addEventListener("click", loadPending);
 
-    async function api(path, params = {}) {
+    async function api(path, params = {}, options = {}) {
       const url = new URL(API_PREFIX + path, location.origin);
       Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined && value !== null && String(value).trim() !== "") {
@@ -504,11 +610,24 @@ _DASHBOARD_HTML = r"""<!doctype html>
       });
       const token = localStorage.getItem("qqBotDashboardToken") || "";
       if (token) url.searchParams.set("token", token);
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`${response.status} ${await response.text()}`);
+      const fetchOptions = { method: options.method || "GET" };
+      if (options.body !== undefined) {
+        fetchOptions.headers = { "content-type": "application/json" };
+        fetchOptions.body = JSON.stringify(options.body);
       }
-      return response.json();
+      const response = await fetch(url, fetchOptions);
+      const text = await response.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = {};
+      }
+      if (!response.ok) {
+        const detail = data.detail || text || response.statusText;
+        throw new Error(`${response.status} ${detail}`);
+      }
+      return data;
     }
 
     function showError(error) {
@@ -562,6 +681,9 @@ _DASHBOARD_HTML = r"""<!doctype html>
             imp=${Number(memory.importance).toFixed(2)}
             · ${formatTime(memory.updated_at)}
           </div>
+          <div class="commands">
+            <button class="danger" onclick="manageMemory(${Number(memory.id)}, 'forget')">删除</button>
+          </div>
           </div>`;
     }
     function factHtml(fact) {
@@ -579,6 +701,9 @@ _DASHBOARD_HTML = r"""<!doctype html>
             stance=${escapeHtml(fact.stance || "-")}
             conf=${Number(fact.confidence).toFixed(2)}
             · ${formatTime(fact.updated_at)}
+          </div>
+          <div class="commands">
+            <button class="danger" onclick="manageFact(${Number(fact.id)}, 'forget')">删除</button>
           </div>
         </div>`;
     }
@@ -733,6 +858,75 @@ _DASHBOARD_HTML = r"""<!doctype html>
       await navigator.clipboard.writeText(text);
       setStatus("已复制命令");
     }
+    function activeTab() {
+      const active = document.querySelector(".tab.active");
+      return active ? active.dataset.tab : "persona";
+    }
+    function setBusy(isBusy) {
+      document.querySelectorAll("button").forEach((button) => {
+        button.disabled = Boolean(isBusy);
+      });
+    }
+    async function refreshActiveTab() {
+      const tab = activeTab();
+      if (tab === "persona") return loadPersona();
+      if (tab === "users") return loadUsers();
+      if (tab === "messages") return loadMessages();
+      if (tab === "stickers") return loadStickers();
+      if (tab === "pending") return loadPending();
+    }
+    async function runAction(path, options = {}, doneText = "操作已完成") {
+      clearError();
+      setStatus("提交操作");
+      setBusy(true);
+      try {
+        await api(path, {}, options);
+        await refreshActiveTab();
+        setStatus(doneText);
+      } catch (error) {
+        showError(error);
+        setStatus("操作失败");
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function manageFact(factId, action) {
+      const labels = { approve: "批准", reject: "拒绝", forget: "删除" };
+      if (action === "forget" && !confirm(`确认删除 FACT #${factId}？`)) return;
+      await runAction(
+        `/facts/${encodeURIComponent(factId)}/${encodeURIComponent(action)}`,
+        { method: "POST" },
+        `FACT #${factId} 已${labels[action] || "更新"}`
+      );
+    }
+    async function manageMemory(memoryId, action) {
+      const labels = { approve: "批准", reject: "拒绝", forget: "删除" };
+      if (action === "forget" && !confirm(`确认删除记忆 #${memoryId}？`)) return;
+      await runAction(
+        `/memories/${encodeURIComponent(memoryId)}/${encodeURIComponent(action)}`,
+        { method: "POST" },
+        `记忆 #${memoryId} 已${labels[action] || "更新"}`
+      );
+    }
+    async function managePending(itemType, itemId, action) {
+      if (itemType === "fact") return manageFact(itemId, action);
+      return manageMemory(itemId, action);
+    }
+    async function setStickerEnabled(stickerId, enabled) {
+      await runAction(
+        `/stickers/${encodeURIComponent(stickerId)}/${enabled ? "enable" : "disable"}`,
+        { method: "POST" },
+        `表情包 #${stickerId} 已${enabled ? "启用" : "停用"}`
+      );
+    }
+    async function deleteSticker(stickerId) {
+      if (!confirm(`确认删除表情包 #${stickerId}？本地图片也会尝试删除。`)) return;
+      await runAction(
+        `/stickers/${encodeURIComponent(stickerId)}`,
+        { method: "DELETE" },
+        `表情包 #${stickerId} 已删除`
+      );
+    }
     async function loadStickers() {
       clearError();
       setStatus("读取表情包");
@@ -765,6 +959,8 @@ _DASHBOARD_HTML = r"""<!doctype html>
                     · ${formatTime(item.updated_at)}
                   </div>
                   <div class="commands">
+                    <button class="warn" onclick="setStickerEnabled(${Number(item.id)}, false)">停用</button>
+                    <button class="danger" onclick="deleteSticker(${Number(item.id)})">删除</button>
                     <code>${escapeHtml(command)}</code>
                     <button onclick="copyText('${escapeHtml(command)}')">复制删除</button>
                   </div>
@@ -805,6 +1001,8 @@ _DASHBOARD_HTML = r"""<!doctype html>
               · ${formatTime(item.updated_at)}
             </div>
             <div class="commands">
+              <button class="primary" onclick="managePending('${escapeHtml(item.item_type || "memory")}', ${Number(item.id)}, 'approve')">批准</button>
+              <button class="danger" onclick="managePending('${escapeHtml(item.item_type || "memory")}', ${Number(item.id)}, 'reject')">拒绝</button>
               <code>${escapeHtml(item.approve_command)}</code>
               <button onclick="copyText('${escapeHtml(item.approve_command)}')">复制批准</button>
               <code>${escapeHtml(item.reject_command)}</code>
