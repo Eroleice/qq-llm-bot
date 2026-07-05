@@ -2129,6 +2129,16 @@ class MemoryStorageTests(unittest.TestCase):
             for node in module.body
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_group_message"
         )
+        defer_handler = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_defer_observation"
+        )
+        deferred_vision_handler = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_record_deferred_vision"
+        )
 
         record_line = _first_attribute_call_line(handler, "record_message")
         ignore_line = _first_attribute_call_line(handler, "is_user_ignored")
@@ -2136,6 +2146,10 @@ class MemoryStorageTests(unittest.TestCase):
         defer_line = _first_name_call_line(handler, "_defer_observation")
         flush_line = _first_name_call_line(handler, "_flush_observation_batch")
         pipeline_line = _first_attribute_call_line(handler, "run")
+        deferred_vision_line = _first_name_call_line(defer_handler, "_record_deferred_vision")
+        buffer_append_line = _first_attribute_call_line(defer_handler, "append")
+        observe_vision_line = _first_attribute_call_line(deferred_vision_handler, "observe_vision")
+        image_summary_line = _first_attribute_call_line(deferred_vision_handler, "update_image_descriptions")
 
         self.assertLess(record_line, ignore_line)
         self.assertLess(record_line, defer_check_line)
@@ -2143,6 +2157,8 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertLess(defer_line, pipeline_line)
         self.assertLess(flush_line, pipeline_line)
         self.assertLess(ignore_line, pipeline_line)
+        self.assertLess(deferred_vision_line, buffer_append_line)
+        self.assertLess(observe_vision_line, image_summary_line)
 
     def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -548,10 +548,11 @@ def _looks_like_active_realtime_candidate(context: MessageContext) -> bool:
 
 
 async def _defer_observation(context: MessageContext, mode: ParticipationMode) -> None:
+    image_descriptions = await _record_deferred_vision(context)
     buffer = observation_buffers.setdefault(context.group_id, [])
     if context.group_id not in observation_last_flush_at:
         observation_last_flush_at[context.group_id] = int(time.time())
-    buffer.append(context)
+    buffer.append(_context_with_deferred_image_descriptions(context, image_descriptions))
     storage.apply_relationship_delta(
         context.group_id,
         context.user_id,
@@ -563,6 +564,52 @@ async def _defer_observation(context: MessageContext, mode: ParticipationMode) -
         "",
     )
     await _flush_observation_batch(context.group_id)
+
+
+async def _record_deferred_vision(context: MessageContext) -> list[str]:
+    if not context.attachments:
+        return []
+    try:
+        vision = await pipeline.observe_vision(context)
+    except Exception as exc:  # pragma: no cover - image observation must never break chat handling
+        logger.warning(
+            "Deferred image observation failed for group {} message {}: {}",
+            context.group_id,
+            context.message_id,
+            exc,
+        )
+        return []
+
+    image_descriptions = list(vision.attachment_descriptions or tuple(vision.descriptions))
+    storage.update_image_descriptions(context.group_id, context.message_id, image_descriptions)
+    await _record_sticker_candidates(context, list(vision.sticker_candidates))
+    fact_write = storage.record_fact_candidates(list(vision.fact_candidates))
+    memory_write = storage.record_memory_candidates(list(vision.memory_candidates))
+    if memory_write.conflicts:
+        logger.info(
+            "Deferred image observation recorded {} memory conflicts in group {}; waiting for manual review",
+            len(memory_write.conflicts),
+            context.group_id,
+        )
+    await _maybe_update_profiles(
+        [fact.subject_user_id for fact in fact_write.accepted],
+        force=bool(fact_write.accepted),
+    )
+    return image_descriptions
+
+
+def _context_with_deferred_image_descriptions(
+    context: MessageContext,
+    image_descriptions: list[str],
+) -> MessageContext:
+    descriptions = [description.strip() for description in image_descriptions if description.strip()]
+    if not descriptions:
+        return context
+    lines = []
+    if context.plain_text:
+        lines.append(context.plain_text)
+    lines.extend(f"[图片解读] {description}" for description in descriptions)
+    return replace(context, plain_text="\n".join(lines))
 
 
 def _deferred_observation_reason(mode: ParticipationMode) -> str:

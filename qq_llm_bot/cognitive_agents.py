@@ -2685,6 +2685,9 @@ class AgentPipeline:
     ) -> FinalQAResult:
         return await self.final_qa.review(context, decision, snapshot, reply)
 
+    async def observe_vision(self, context: MessageContext) -> VisionAnalysis:
+        return await self.vision.analyze(context)
+
     async def observe_batch(
         self,
         group_id: str,
