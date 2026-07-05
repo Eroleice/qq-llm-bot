@@ -2619,6 +2619,54 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(filtered_user_items[0]["profile"]["summary"], "用户42喜欢海边。")  # type: ignore[index]
             self.assertEqual(filtered_user_items[0]["facts"][0]["claim_text"], "用户42喜欢海边")  # type: ignore[index]
 
+    def test_relationship_ranking_formats_top_five_by_closeness_and_familiarity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_message(
+                MessageContext(
+                    group_id="100",
+                    user_id="2",
+                    message_id="m-name",
+                    plain_text="晚上好",
+                    raw_message="晚上好",
+                    sender_name="Alice",
+                    sender_nickname="Ali",
+                    timestamp=20,
+                )
+            )
+            for user_id, closeness, familiarity, trust in (
+                ("1", 10, 1, 0),
+                ("2", 4, 10, 2),
+                ("3", 6, 6, 0),
+                ("4", 5, 5, 0),
+                ("5", 1, 8, 0),
+                ("6", 8, 0, 0),
+            ):
+                storage.apply_relationship_delta(
+                    "100",
+                    user_id,
+                    RelationDelta(
+                        closeness=closeness,
+                        familiarity=familiarity,
+                        trust=trust,
+                        summary_patch=f"和 {user_id} 聊过",
+                    ),
+                )
+
+            ranking = storage.format_relationship_ranking("100")
+
+            self.assertIn("本群亲密/了解程度 TOP 5", ranking)
+            self.assertIn("Alice(QQ:2)", ranking)
+            self.assertIn("综合=14", ranking)
+            self.assertLess(ranking.index("Alice(QQ:2)"), ranking.index("QQ:3"))
+            self.assertLess(ranking.index("QQ:3"), ranking.index("QQ:1"))
+            self.assertNotIn("聊过", ranking)
+            self.assertNotIn("|", ranking)
+            self.assertNotIn("QQ:6", ranking)
+            self.assertEqual(storage.format_relationship_ranking("404"), "本群暂无关系记录。")
+
     def test_dashboard_user_cognition_uses_latest_qq_nickname(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")

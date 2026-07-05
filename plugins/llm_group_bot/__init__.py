@@ -403,7 +403,13 @@ async def _handle_llm(rest: list[str]) -> None:
 
 async def _handle_relation(rest: list[str], group_id: str) -> None:
     if not rest:
-        await admin_cmd.finish("用法：#bot relation <qq_id>")
+        await admin_cmd.finish("用法：#bot relation <qq_id>|top [数量]|rank [数量]")
+    action = rest[0].lower()
+    if action in {"top", "rank", "ranking", "排行", "排行榜"}:
+        limit = _parse_memory_id(rest[1]) if len(rest) >= 2 else 5
+        if limit is None:
+            await admin_cmd.finish("数量必须是数字，例如：#bot relation top 5")
+        await admin_cmd.finish(storage.format_relationship_ranking(group_id, limit))
     await admin_cmd.finish(storage.format_relationship(group_id, rest[0]))
 
 
@@ -746,7 +752,7 @@ def _help_text() -> str:
         "#bot persona show|self [pending|conflicts|approve <id>|reject <id>|forget <id>]\n"
         "#bot llm status|test [prompt]\n"
         "#bot why\n"
-        "#bot relation <qq_id>\n"
+        "#bot relation <qq_id>|top [数量]|rank [数量]\n"
         "#bot forget <memory_id>"
     )
 

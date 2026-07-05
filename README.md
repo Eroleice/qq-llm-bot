@@ -79,6 +79,8 @@ http://127.0.0.1:8080/dashboard
 #bot stickers disable <sticker_id>
 #bot stickers delete <sticker_id>
 #bot relation <qq_id>
+#bot relation top [数量]
+#bot relation rank [数量]
 #bot persona show
 #bot persona self
 #bot persona self pending

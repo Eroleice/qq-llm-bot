@@ -1606,6 +1606,47 @@ class BotStorage:
             f"summary={relation.summary or '(empty)'}"
         )
 
+    def format_relationship_ranking(self, group_id: str, limit: int = 5) -> str:
+        limit = max(1, min(50, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT group_id, user_id, closeness, trust, familiarity, tension, updated_at,
+                       (closeness + familiarity) AS relationship_score
+                FROM relationships
+                WHERE group_id = ?
+                ORDER BY relationship_score DESC,
+                         closeness DESC,
+                         familiarity DESC,
+                         trust DESC,
+                         updated_at DESC
+                LIMIT ?
+                """,
+                (str(group_id), limit),
+            ).fetchall()
+            profiles = {
+                str(row["user_id"]): self._dashboard_user_profile(conn, str(row["user_id"]))
+                for row in rows
+            }
+
+        if not rows:
+            return "本群暂无关系记录。"
+
+        lines = [f"本群亲密/了解程度 TOP {limit}（按 亲密+了解 排序）："]
+        for index, row in enumerate(rows, start=1):
+            user_id = str(row["user_id"])
+            closeness = int(row["closeness"])
+            familiarity = int(row["familiarity"])
+            trust = int(row["trust"])
+            tension = int(row["tension"])
+            score = int(row["relationship_score"])
+            label = _relationship_rank_label(user_id, profiles.get(user_id))
+            lines.append(
+                f"{index}. {label} "
+                f"亲密={closeness} 了解={familiarity} 信任={trust} 紧张={tension} 综合={score}"
+            )
+        return "\n".join(lines)
+
     def get_recent_messages(self, group_id: str, limit: int = 12) -> list[str]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -3309,6 +3350,21 @@ def _relationship_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
     )
     data["updated_at"] = int(row["updated_at"])
     return data
+
+
+def _relationship_rank_label(user_id: str, profile: dict[str, object] | None) -> str:
+    name = ""
+    if profile:
+        name = str(profile.get("display_name") or profile.get("nickname") or "")
+    name = _compact_display_text(name, 24)
+    return f"{name}(QQ:{user_id})" if name else f"QQ:{user_id}"
+
+
+def _compact_display_text(value: str, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)].rstrip()}..."
 
 
 def _dashboard_relationship_to_dict(
