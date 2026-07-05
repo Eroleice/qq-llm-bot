@@ -48,6 +48,10 @@ fact_confidence_threshold = 0.75
 third_party_trust_threshold = 70
 third_party_confidence_threshold = 0.85
 profile_fact_threshold = 5
+context_fact_limit = 8
+target_user_limit = 5
+low_importance_threshold = 0.35
+fact_context_ttl_days = 30
 
 [lexicon]
 # Learn internet slang/memes by controlled web search. Providers: disabled | duckduckgo | serper | searxng

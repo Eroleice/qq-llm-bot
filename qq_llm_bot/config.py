@@ -74,6 +74,10 @@ class FactConfig:
     third_party_trust_threshold: int = 70
     third_party_confidence_threshold: float = 0.85
     profile_fact_threshold: int = 5
+    context_fact_limit: int = 8
+    target_user_limit: int = 5
+    low_importance_threshold: float = 0.35
+    fact_context_ttl_days: int = 30
 
 
 @dataclass(frozen=True)
@@ -297,6 +301,24 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             profile_fact_threshold=_positive_int(
                 facts_raw.get("profile_fact_threshold", 5),
                 "facts.profile_fact_threshold",
+            ),
+            context_fact_limit=_positive_int(
+                facts_raw.get("context_fact_limit", 8),
+                "facts.context_fact_limit",
+            ),
+            target_user_limit=_positive_int(
+                facts_raw.get("target_user_limit", 5),
+                "facts.target_user_limit",
+            ),
+            low_importance_threshold=_float_in_range(
+                facts_raw.get("low_importance_threshold", 0.35),
+                "facts.low_importance_threshold",
+                0,
+                1,
+            ),
+            fact_context_ttl_days=_positive_int(
+                facts_raw.get("fact_context_ttl_days", 30),
+                "facts.fact_context_ttl_days",
             ),
         ),
         lexicon=LexiconConfig(

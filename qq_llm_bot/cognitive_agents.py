@@ -527,7 +527,7 @@ class FactExtractorAgent:
                 '{"facts":[{"subject_user_id":"QQ或name:称呼","fact_type":"preference|dislike|'
                 'opinion|identity|habit|skill|boundary|event_stance|other",'
                 '"claim_text":"完整结论句","topic":"对象或事件","stance":"positive|negative|neutral|mixed|unknown",'
-                '"confidence":0.0,"claim_scope":"self_report|third_party",'
+                '"confidence":0.0,"importance":0.0,"claim_scope":"self_report|third_party",'
                 '"evidence_text":"原消息中的证据片段"}]}\n'
                 "好例子：我觉得刮刮乐像负期望彩票 -> 用户认为刮刮乐活动像负期望彩票。"
                 "坏例子：继续聊比赛感受、分享截图、哈哈、空消息 -> facts=[]。\n"
@@ -580,6 +580,7 @@ class FactExtractorAgent:
             source_user_id=context.user_id,
             source_group_id=context.group_id,
             claim_scope=claim_scope,  # type: ignore[arg-type]
+            importance=_clamp_float(item.get("importance", 0.5)),
         )
 
     def _heuristic(self, context: MessageContext) -> list[FactCandidate]:
@@ -1376,6 +1377,8 @@ class ParticipationPolicyAgent:
         perception: PerceptionResult,
         snapshot: ConversationSnapshot,
     ) -> str | None:
+        if _has_unresolved_identity_target(snapshot):
+            return "active mode but target identity is unresolved"
         if len(context.plain_text.strip()) < 6:
             return "active mode but message is too short"
         if not perception.is_question and not perception.topics:
@@ -1760,6 +1763,10 @@ class ResponseAgent:
         if decision.action == "observe":
             return ReplyDraft()
 
+        unresolved_reply = _target_confirmation_reply(snapshot)
+        if unresolved_reply:
+            return ReplyDraft(text=unresolved_reply)
+
         approved_self_memories = approved_self_memories or []
         background_rule = (
             "自我背景门禁：如果缺少可引用的个人学习或使用背景，不要装作亲身经历；"
@@ -1790,6 +1797,8 @@ class ResponseAgent:
             f"最近图片：\n{_join_lines(snapshot.recent_image_descriptions)}\n"
             f"发言人全局画像：\n{_format_user_profile_record(snapshot.user_profile)}\n"
             f"发言人 FACT：\n{_format_fact_records(snapshot.user_facts[:10])}\n"
+            f"被询问/提及成员资料（只在当前消息需要时引用，不要主动转移话题）：\n"
+            f"{_format_target_user_contexts(snapshot)}\n"
             f"与发言人关系：{_format_relationship(snapshot)}\n"
             f"群复盘：\n{_format_memories(snapshot.group_reflections)}\n"
             f"群内词条：\n{_format_memories(snapshot.group_lexicon)}\n"
@@ -1811,12 +1820,19 @@ class ResponseAgent:
             )
             if not _reply_has_incremental_value(guarded_reply, decision):
                 return ReplyDraft()
+            if _looks_like_uncertain_reply(guarded_reply):
+                fallback_reply = _target_fact_fallback_reply(context, snapshot)
+                if fallback_reply:
+                    guarded_reply = fallback_reply
             return ReplyDraft(
                 text=guarded_reply,
                 self_memory_candidates=approved_self_memories,
             )
 
         if decision.action == "reply":
+            fallback_reply = _target_fact_fallback_reply(context, snapshot)
+            if fallback_reply:
+                return ReplyDraft(text=fallback_reply)
             if approved_self_memories:
                 return ReplyDraft(
                     text=_fallback_reply_with_self_memory(approved_self_memories[0]),
@@ -2547,6 +2563,7 @@ def _fact_candidate(
     confidence: float,
     claim_scope: str,
     evidence_text: str,
+    importance: float = 0.5,
 ) -> FactCandidate:
     return FactCandidate(
         subject_user_id=subject_user_id,
@@ -2560,6 +2577,7 @@ def _fact_candidate(
         source_user_id=context.user_id,
         source_group_id=context.group_id,
         claim_scope=_safe_claim_scope(claim_scope),  # type: ignore[arg-type]
+        importance=_clamp_float(importance),
     )
 
 
@@ -2960,6 +2978,106 @@ def _format_user_profile_record(profile: UserProfileRecord | None) -> str:
         f"v{profile.version} facts={profile.fact_count}\n"
         f"{profile.summary}\ntraits={traits}"
     )
+
+
+def _format_target_user_contexts(snapshot: ConversationSnapshot) -> str:
+    lines: list[str] = []
+    for target in snapshot.target_users:
+        aliases = "、".join(target.aliases[:8]) or "(none)"
+        lines.append(
+            f"QQ:{target.user_id} status={target.resolution_status} reason={target.match_reason}\n"
+            f"aliases={aliases}\n"
+            f"profile={_format_user_profile_record(target.profile)}\n"
+            f"facts=\n{_format_fact_records(target.facts[:8])}"
+        )
+    if snapshot.unknown_name_refs:
+        lines.append("unknown_names=" + "、".join(snapshot.unknown_name_refs))
+    if snapshot.ambiguous_name_refs:
+        ambiguous = [
+            f"{name}: {', '.join(user_ids)}"
+            for name, user_ids in snapshot.ambiguous_name_refs.items()
+        ]
+        lines.append("ambiguous_names=" + "；".join(ambiguous))
+    return "\n\n".join(lines) if lines else "(none)"
+
+
+def _has_unresolved_identity_target(snapshot: ConversationSnapshot) -> bool:
+    return bool(snapshot.unknown_name_refs or snapshot.ambiguous_name_refs)
+
+
+def _target_confirmation_reply(snapshot: ConversationSnapshot) -> str:
+    if snapshot.ambiguous_name_refs:
+        name, user_ids = next(iter(snapshot.ambiguous_name_refs.items()))
+        choices = "、".join(f"QQ:{user_id}" for user_id in user_ids[:5])
+        return f"我不太确定“{name}”指哪位，是 {choices} 里的谁？"
+    if snapshot.unknown_name_refs:
+        name = snapshot.unknown_name_refs[0]
+        return f"我还不确定“{name}”对应哪位，可以告诉我 QQ 号吗？"
+    return ""
+
+
+def _target_fact_fallback_reply(context: MessageContext, snapshot: ConversationSnapshot) -> str:
+    if not snapshot.target_users or not _looks_like_identity_query(context.plain_text):
+        return ""
+    target = snapshot.target_users[0]
+    alias = _best_target_alias(context.plain_text, target.aliases, target.facts)
+    if re.search(r"(怎么|如何|要怎么|该怎么).{0,6}称呼|叫什么|叫啥|名字|昵称|外号|称呼", context.plain_text):
+        if alias:
+            return f"我记得 QQ:{target.user_id} 可以叫“{alias}”。"
+        return f"我只确认到是 QQ:{target.user_id}，还没记到稳定称呼。"
+    if alias:
+        return f"{alias}是 QQ:{target.user_id}。"
+    identity_fact = _first_identity_fact_text(target.facts)
+    if identity_fact:
+        return identity_fact
+    return f"我能确认指向 QQ:{target.user_id}。"
+
+
+def _best_target_alias(text: str, aliases: list[str], facts: list[FactRecord]) -> str:
+    for alias in aliases:
+        if alias and alias in text:
+            return alias
+    if aliases:
+        return aliases[0]
+    for fact in facts:
+        alias = _alias_from_fact_text(fact.claim_text, fact.evidence_text)
+        if alias:
+            return alias
+    return ""
+
+
+def _alias_from_fact_text(*texts: str) -> str:
+    combined = "\n".join(str(text or "") for text in texts)
+    patterns = (
+        r"(?:称呼|昵称|外号|名字)\s*(?:是|叫|为|：|:)?\s*[“\"']?([^，,。；;、\s”\"']{1,30})",
+        r"(?:叫做|称作|称为|叫)\s*[“\"']?([^，,。；;、\s”\"']{1,30})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, combined)
+        if match:
+            return match.group(1).strip("“”\"'`")
+    return ""
+
+
+def _first_identity_fact_text(facts: list[FactRecord]) -> str:
+    for fact in facts:
+        if fact.fact_type in {"identity", "alias"}:
+            return fact.claim_text
+    return ""
+
+
+def _looks_like_identity_query(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(谁是|是谁|叫啥|叫什么|叫什麼|怎么称呼|如何称呼|要怎么称呼|该怎么称呼|名字|昵称|外号|称呼)",
+            text,
+        )
+    )
+
+
+def _looks_like_uncertain_reply(reply: str) -> bool:
+    compact = re.sub(r"\s+", "", reply)
+    return bool(re.search(r"(不知道|不清楚|没印象|没有记到|没查到|不太确定|不确定|无法确认)", compact))
 
 
 def _parse_fact_ids(value: Any, fallback: tuple[int, ...]) -> tuple[int, ...]:

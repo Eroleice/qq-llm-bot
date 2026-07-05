@@ -22,7 +22,7 @@ ParticipationValueType = Literal[
 MemoryStatus = Literal["active", "candidate", "pending_confirmation", "conflict", "rejected", "forgotten"]
 ClaimScope = Literal["self_report", "third_party", "bot_directed", "group_fact"]
 VerificationStatus = Literal["accepted", "pending_confirmation", "conflict", "rejected"]
-FactStatus = Literal["candidate", "accepted", "pending_confirmation", "rejected"]
+FactStatus = Literal["candidate", "accepted", "pending_confirmation", "rejected", "superseded", "forgotten"]
 
 
 @dataclass(frozen=True)
@@ -178,6 +178,7 @@ class FactCandidate:
     source_group_id: str
     claim_scope: ClaimScope = "self_report"
     status: FactStatus = "candidate"
+    importance: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,10 @@ class FactRecord:
     evidence_text: str
     created_at: int
     updated_at: int
+    importance: float = 0.5
+    last_seen_at: int = 0
+    superseded_by_fact_id: int | None = None
+    forget_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -215,6 +220,16 @@ class UserProfileRecord:
     fact_count: int = 0
     version: int = 0
     updated_at: int = 0
+
+
+@dataclass(frozen=True)
+class TargetUserContext:
+    user_id: str
+    resolution_status: str
+    match_reason: str
+    aliases: list[str] = field(default_factory=list)
+    facts: list[FactRecord] = field(default_factory=list)
+    profile: UserProfileRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -260,6 +275,9 @@ class ConversationSnapshot:
     group_lexicon: list[MemoryRecord] = field(default_factory=list)
     relationship: RelationshipState | None = None
     persona_lines: list[str] = field(default_factory=list)
+    target_users: list[TargetUserContext] = field(default_factory=list)
+    unknown_name_refs: list[str] = field(default_factory=list)
+    ambiguous_name_refs: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

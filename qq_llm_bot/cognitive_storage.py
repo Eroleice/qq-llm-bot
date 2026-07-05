@@ -26,6 +26,7 @@ from qq_llm_bot.models import (
     RelationshipState,
     StickerAssetRecord,
     StickerCandidate,
+    TargetUserContext,
     UserProfileRecord,
     UserProfileDraft,
 )
@@ -45,6 +46,44 @@ CONFLICT_SENSITIVE_KINDS = {
 }
 SENSITIVE_CONFIRMATION_KINDS = {"identity", "location"}
 TRUSTED_THIRD_PARTY_THRESHOLD = 70
+FACT_INACTIVE_STATUSES = {"rejected", "superseded", "forgotten"}
+PROTECTED_FACT_TYPES = {"identity", "boundary", "skill", "habit"}
+RELATIONAL_ALIAS_TERMS = {
+    "主人",
+    "主子",
+    "老板",
+    "老板娘",
+    "领导",
+    "管理员",
+    "管理",
+    "群主",
+    "版主",
+    "爸爸",
+    "爸",
+    "爹",
+    "父亲",
+    "妈妈",
+    "妈",
+    "母亲",
+    "哥哥",
+    "哥",
+    "姐姐",
+    "姐",
+    "弟弟",
+    "弟",
+    "妹妹",
+    "妹",
+    "儿子",
+    "女儿",
+    "老婆",
+    "老公",
+    "媳妇",
+    "丈夫",
+    "妻子",
+    "对象",
+    "男朋友",
+    "女朋友",
+}
 
 
 class BotStorage:
@@ -60,6 +99,10 @@ class BotStorage:
         third_party_trust_threshold: int = 70,
         third_party_confidence_threshold: float = 0.85,
         profile_fact_threshold: int = 5,
+        context_fact_limit: int = 8,
+        target_user_limit: int = 5,
+        low_importance_threshold: float = 0.35,
+        fact_context_ttl_days: int = 30,
     ) -> None:
         self.db_path = db_path
         self.initial_admins = {str(item) for item in initial_admins}
@@ -72,6 +115,10 @@ class BotStorage:
         self.third_party_trust_threshold = _clamp_score(third_party_trust_threshold)
         self.third_party_confidence_threshold = _clamp_float(third_party_confidence_threshold)
         self.profile_fact_threshold = max(1, int(profile_fact_threshold))
+        self.context_fact_limit = max(1, int(context_fact_limit))
+        self.target_user_limit = max(1, int(target_user_limit))
+        self.low_importance_threshold = _clamp_float(low_importance_threshold)
+        self.fact_context_ttl_seconds = max(1, int(fact_context_ttl_days)) * 24 * 60 * 60
         self._lock = RLock()
 
     @classmethod
@@ -116,6 +163,10 @@ class BotStorage:
             config.facts.third_party_trust_threshold,
             config.facts.third_party_confidence_threshold,
             config.facts.profile_fact_threshold,
+            config.facts.context_fact_limit,
+            config.facts.target_user_limit,
+            config.facts.low_importance_threshold,
+            config.facts.fact_context_ttl_days,
         )
 
     def setup(self) -> None:
@@ -265,7 +316,24 @@ class BotStorage:
                     evidence_message_id TEXT NOT NULL DEFAULT '',
                     evidence_text TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    importance REAL NOT NULL DEFAULT 0.5,
+                    last_seen_at INTEGER NOT NULL DEFAULT 0,
+                    superseded_by_fact_id INTEGER,
+                    forget_reason TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS member_aliases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    alias_type TEXT NOT NULL DEFAULT 'alias',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    source_fact_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS member_profiles (
@@ -313,7 +381,89 @@ class BotStorage:
                 );
                 """
             )
+            self._migrate_schema(conn)
+            self._backfill_member_aliases(conn)
+            self._reject_unreasonable_member_aliases(conn)
             self._seed_config(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "member_facts", "importance", "REAL NOT NULL DEFAULT 0.5")
+        self._ensure_column(conn, "member_facts", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "member_facts", "superseded_by_fact_id", "INTEGER")
+        self._ensure_column(conn, "member_facts", "forget_reason", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            UPDATE member_facts
+            SET last_seen_at = updated_at
+            WHERE last_seen_at = 0
+            """
+        )
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_member_facts_subject_status
+                ON member_facts(subject_user_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_member_facts_topic
+                ON member_facts(subject_user_id, fact_type, topic, status);
+            CREATE INDEX IF NOT EXISTS idx_member_aliases_lookup
+                ON member_aliases(alias, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_member_aliases_user
+                ON member_aliases(user_id, status, updated_at);
+            """
+        )
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {str(row["name"]) for row in rows}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _backfill_member_aliases(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                   confidence, status, claim_scope, source_user_id, source_group_id,
+                   evidence_message_id, evidence_text, created_at, updated_at,
+                   importance, last_seen_at, superseded_by_fact_id, forget_reason
+            FROM member_facts
+            WHERE status = 'accepted'
+              AND fact_type IN ('identity', 'alias')
+            ORDER BY updated_at ASC, id ASC
+            """
+        ).fetchall()
+        for row in rows:
+            self._sync_aliases_for_fact(conn, _fact_record(row))
+
+    def _reject_unreasonable_member_aliases(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, alias
+            FROM member_aliases
+            WHERE status = 'active'
+            """
+        ).fetchall()
+        ids = [
+            int(row["id"])
+            for row in rows
+            if not _is_reasonable_member_alias(str(row["alias"] or ""))
+        ]
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE member_aliases
+            SET status = 'rejected',
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            [int(time.time()), *ids],
+        )
 
     def record_message(self, context: MessageContext) -> None:
         now = context.timestamp or int(time.time())
@@ -925,22 +1075,32 @@ class BotStorage:
                     rejected.append(replace(normalized, status="rejected"))
                     continue
 
+                conflicting_facts = self._find_conflicting_facts(conn, normalized)
+                if conflicting_facts and normalized.claim_scope != "self_report":
+                    acceptance_status = "pending_confirmation"
+
                 duplicate = self._find_duplicate_fact(conn, normalized, acceptance_status)
                 if duplicate:
                     conn.execute(
                         """
                         UPDATE member_facts
                         SET confidence = MAX(confidence, ?),
-                            updated_at = ?
+                            importance = MAX(importance, ?),
+                            updated_at = ?,
+                            last_seen_at = ?
                         WHERE id = ?
                         """,
-                        (normalized.confidence, now, duplicate.id),
+                        (normalized.confidence, normalized.importance, now, now, duplicate.id),
                     )
                     updated = replace(
                         duplicate,
                         confidence=max(duplicate.confidence, normalized.confidence),
+                        importance=max(duplicate.importance, normalized.importance),
                         updated_at=now,
+                        last_seen_at=now,
                     )
+                    if updated.status == "accepted":
+                        self._sync_aliases_for_fact(conn, updated)
                     if updated.status == "accepted":
                         accepted.append(updated)
                     elif updated.status == "pending_confirmation":
@@ -956,6 +1116,9 @@ class BotStorage:
                     now,
                 )
                 if inserted.status == "accepted":
+                    if conflicting_facts and normalized.claim_scope == "self_report":
+                        self._supersede_facts(conn, conflicting_facts, inserted.id, now)
+                    self._sync_aliases_for_fact(conn, inserted)
                     accepted.append(inserted)
                 elif inserted.status == "pending_confirmation":
                     pending.append(inserted)
@@ -968,6 +1131,7 @@ class BotStorage:
         limit: int = 20,
         status: str = "accepted",
         group_id: str = "",
+        include_faded: bool = False,
     ) -> list[FactRecord]:
         subject = _dashboard_user_id(user_id)
         if not subject:
@@ -977,6 +1141,13 @@ class BotStorage:
         if group_id:
             where.append("source_group_id = ?")
             params.append(str(group_id))
+        if status == "accepted" and not include_faded:
+            cutoff = int(time.time()) - self.fact_context_ttl_seconds
+            protected = ", ".join("?" for _ in PROTECTED_FACT_TYPES)
+            where.append(
+                f"(importance >= ? OR fact_type IN ({protected}) OR last_seen_at >= ?)"
+            )
+            params.extend([self.low_importance_threshold, *sorted(PROTECTED_FACT_TYPES), cutoff])
         limit_value = int(limit)
         limit_sql = "LIMIT ?" if limit_value > 0 else ""
         if limit_value > 0:
@@ -986,15 +1157,21 @@ class BotStorage:
                 f"""
                 SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
                        confidence, status, claim_scope, source_user_id, source_group_id,
-                       evidence_message_id, evidence_text, created_at, updated_at
+                       evidence_message_id, evidence_text, created_at, updated_at,
+                       importance, last_seen_at, superseded_by_fact_id, forget_reason
                 FROM member_facts
                 WHERE {' AND '.join(where)}
-                ORDER BY updated_at DESC, id DESC
+                ORDER BY
+                    CASE WHEN fact_type IN ('identity', 'alias', 'boundary') THEN 0 ELSE 1 END,
+                    importance DESC, updated_at DESC, id DESC
                 {limit_sql}
                 """,
                 params,
             ).fetchall()
-        return [_fact_record(row) for row in rows]
+        records = [_fact_record(row) for row in rows]
+        if status == "accepted":
+            records = [record for record in records if not _is_unreasonable_alias_fact(record)]
+        return records
 
     def list_user_facts_text(self, user_id: str, limit: int = 20, status: str = "accepted") -> list[str]:
         return [format_fact_record(record) for record in self.list_user_facts(user_id, limit, status)]
@@ -1005,7 +1182,8 @@ class BotStorage:
                 """
                 SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
                        confidence, status, claim_scope, source_user_id, source_group_id,
-                       evidence_message_id, evidence_text, created_at, updated_at
+                       evidence_message_id, evidence_text, created_at, updated_at,
+                       importance, last_seen_at, superseded_by_fact_id, forget_reason
                 FROM member_facts
                 WHERE status = 'pending_confirmation'
                 ORDER BY updated_at DESC, id DESC
@@ -1021,7 +1199,8 @@ class BotStorage:
                 """
                 SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
                        confidence, status, claim_scope, source_user_id, source_group_id,
-                       evidence_message_id, evidence_text, created_at, updated_at
+                       evidence_message_id, evidence_text, created_at, updated_at,
+                       importance, last_seen_at, superseded_by_fact_id, forget_reason
                 FROM member_facts
                 WHERE id = ?
                 """,
@@ -1035,10 +1214,10 @@ class BotStorage:
             cursor = conn.execute(
                 """
                 UPDATE member_facts
-                SET status = 'accepted', updated_at = ?
+                SET status = 'accepted', updated_at = ?, last_seen_at = ?
                 WHERE id = ? AND status = 'pending_confirmation'
                 """,
-                (now, int(fact_id)),
+                (now, now, int(fact_id)),
             )
             if cursor.rowcount <= 0:
                 return None
@@ -1046,13 +1225,17 @@ class BotStorage:
                 """
                 SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
                        confidence, status, claim_scope, source_user_id, source_group_id,
-                       evidence_message_id, evidence_text, created_at, updated_at
+                       evidence_message_id, evidence_text, created_at, updated_at,
+                       importance, last_seen_at, superseded_by_fact_id, forget_reason
                 FROM member_facts
                 WHERE id = ?
                 """,
                 (int(fact_id),),
             ).fetchone()
-        return _fact_record(row) if row else None
+            record = _fact_record(row) if row else None
+            if record is not None:
+                self._sync_aliases_for_fact(conn, record)
+        return record
 
     def reject_fact(self, fact_id: int) -> bool:
         with self._connect() as conn:
@@ -1065,6 +1248,48 @@ class BotStorage:
                 (int(time.time()), int(fact_id)),
             )
         return cursor.rowcount > 0
+
+    def forget_fact(self, fact_id: int, reason: str = "manual") -> FactRecord | None:
+        now = int(time.time())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at,
+                       importance, last_seen_at, superseded_by_fact_id, forget_reason
+                FROM member_facts
+                WHERE id = ?
+                """,
+                (int(fact_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            record = _fact_record(row)
+            cursor = conn.execute(
+                """
+                UPDATE member_facts
+                SET status = 'forgotten',
+                    forget_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('accepted', 'pending_confirmation', 'superseded')
+                """,
+                (_clean_fact_field(reason, 120) or "manual", now, int(fact_id)),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            conn.execute(
+                """
+                UPDATE member_aliases
+                SET status = 'forgotten',
+                    updated_at = ?
+                WHERE source_fact_id = ?
+                  AND status = 'active'
+                """,
+                (now, int(fact_id)),
+            )
+        return replace(record, status="forgotten", updated_at=now, forget_reason=reason or "manual")
 
     def get_user_profile(self, user_id: str) -> UserProfileRecord | None:
         subject = _dashboard_user_id(user_id)
@@ -1161,6 +1386,14 @@ class BotStorage:
             version=version,
             updated_at=now,
         )
+
+    def clear_user_profile(self, user_id: str) -> bool:
+        subject = _dashboard_user_id(user_id)
+        if not subject:
+            return False
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM member_profiles WHERE user_id = ?", (subject,))
+        return cursor.rowcount > 0
 
     def format_user_profile(self, user_id: str) -> str:
         profile = self.get_user_profile(user_id)
@@ -1955,6 +2188,7 @@ class BotStorage:
 
     def build_snapshot(self, context: MessageContext) -> ConversationSnapshot:
         human_count, bot_count = self.get_recent_activity_counts(context.group_id)
+        target_users, unknown_refs, ambiguous_refs = self._resolve_target_user_contexts(context)
         return ConversationSnapshot(
             recent_messages=self.get_recent_messages(context.group_id, limit=12),
             recent_human_messages_60s=human_count,
@@ -1972,6 +2206,96 @@ class BotStorage:
             group_lexicon=self.list_group_lexicon_records(context.group_id, limit=10),
             relationship=self.get_relationship(context.group_id, context.user_id),
             persona_lines=self.get_persona_lines(),
+            target_users=target_users,
+            unknown_name_refs=unknown_refs,
+            ambiguous_name_refs=ambiguous_refs,
+        )
+
+    def _resolve_target_user_contexts(
+        self,
+        context: MessageContext,
+    ) -> tuple[list[TargetUserContext], list[str], dict[str, list[str]]]:
+        target_reasons: dict[str, str] = {}
+        for user_id in _extract_explicit_target_user_ids(context):
+            target_reasons.setdefault(user_id, "explicit_qq")
+
+        name_refs = _extract_identity_name_refs(context.plain_text)
+        unknown_refs: list[str] = []
+        ambiguous_refs: dict[str, list[str]] = {}
+        with self._connect() as conn:
+            for ref in name_refs:
+                matches = self._lookup_alias_users(conn, ref)
+                if not matches:
+                    unknown_refs.append(ref)
+                    continue
+                if len(matches) > 1:
+                    ambiguous_refs[ref] = matches[: self.target_user_limit]
+                    continue
+                target_reasons.setdefault(matches[0], f"alias:{ref}")
+
+            contexts: list[TargetUserContext] = []
+            for user_id, reason in list(target_reasons.items())[: self.target_user_limit]:
+                aliases = self._list_active_aliases(conn, user_id, limit=12)
+                facts = self.list_user_facts(
+                    user_id,
+                    limit=self.context_fact_limit,
+                    status="accepted",
+                )
+                contexts.append(
+                    TargetUserContext(
+                        user_id=user_id,
+                        resolution_status="resolved",
+                        match_reason=reason,
+                        aliases=aliases,
+                        facts=facts,
+                        profile=self.get_user_profile(user_id),
+                    )
+                )
+
+        return contexts, _dedupe_short_strings(unknown_refs), ambiguous_refs
+
+    def _lookup_alias_users(self, conn: sqlite3.Connection, name: str) -> list[str]:
+        alias = _clean_alias(name)
+        if not alias or not _is_reasonable_member_alias(alias):
+            return []
+        rows = conn.execute(
+            """
+            SELECT user_id, MAX(confidence) AS confidence, MAX(updated_at) AS updated_at
+            FROM member_aliases
+            WHERE alias = ?
+              AND status = 'active'
+            GROUP BY user_id
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (alias, self.target_user_limit + 1),
+        ).fetchall()
+        return [str(row["user_id"]) for row in rows if str(row["user_id"] or "").strip()]
+
+    def _list_active_aliases(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        limit: int = 12,
+    ) -> list[str]:
+        subject = _dashboard_user_id(user_id)
+        if not subject:
+            return []
+        rows = conn.execute(
+            """
+            SELECT alias
+            FROM member_aliases
+            WHERE user_id = ?
+              AND status = 'active'
+            ORDER BY confidence DESC, updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (subject, int(limit)),
+        ).fetchall()
+        return _dedupe_short_strings(
+            str(row["alias"] or "")
+            for row in rows
+            if _is_reasonable_member_alias(str(row["alias"] or ""))
         )
 
     def list_group_lexicon_records(
@@ -2365,6 +2689,7 @@ class BotStorage:
         claim_scope = _safe_claim_scope(item.claim_scope)
         if claim_scope == "self_report" and subject_user_id and source_user_id and subject_user_id != source_user_id:
             claim_scope = "third_party"
+        importance = _fact_importance(item)
         return replace(
             item,
             subject_user_id=subject_user_id,
@@ -2373,6 +2698,7 @@ class BotStorage:
             topic=_clean_fact_field(item.topic, 120),
             stance=_clean_fact_field(item.stance, 60),
             confidence=_clamp_float(item.confidence),
+            importance=importance,
             status=_safe_fact_status(item.status),
             claim_scope=claim_scope,
             source_user_id=source_user_id,
@@ -2391,6 +2717,8 @@ class BotStorage:
         if item.confidence < self.fact_confidence_threshold:
             return "rejected"
         if _looks_low_value_fact(item):
+            return "rejected"
+        if _is_unreasonable_alias_fact(item):
             return "rejected"
         if item.claim_scope == "third_party":
             source_trust = self._source_trust(conn, item.source_group_id, item.source_user_id)
@@ -2445,6 +2773,151 @@ class BotStorage:
         ).fetchone()
         return _fact_record(row) if row else None
 
+    def _find_conflicting_facts(
+        self,
+        conn: sqlite3.Connection,
+        item: FactCandidate,
+    ) -> list[FactRecord]:
+        if item.status in FACT_INACTIVE_STATUSES:
+            return []
+        if item.fact_type in {"identity", "alias"}:
+            denied_aliases = _extract_denied_aliases(item.claim_text, item.evidence_text)
+            if not denied_aliases:
+                return []
+            clauses = []
+            params: list[object] = [item.subject_user_id]
+            for alias in denied_aliases:
+                clauses.append("(claim_text LIKE ? OR evidence_text LIKE ? OR topic LIKE ?)")
+                like = f"%{alias}%"
+                params.extend([like, like, like])
+            rows = conn.execute(
+                f"""
+                SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                       confidence, status, claim_scope, source_user_id, source_group_id,
+                       evidence_message_id, evidence_text, created_at, updated_at,
+                       importance, last_seen_at, superseded_by_fact_id, forget_reason
+                FROM member_facts
+                WHERE subject_user_id = ?
+                  AND status = 'accepted'
+                  AND fact_type IN ('identity', 'alias')
+                  AND ({' OR '.join(clauses)})
+                ORDER BY confidence DESC, updated_at DESC
+                LIMIT 10
+                """,
+                params,
+            ).fetchall()
+            return [_fact_record(row) for row in rows]
+
+        if item.fact_type not in {"preference", "dislike", "opinion", "habit", "boundary", "event_stance"}:
+            return []
+        rows = conn.execute(
+            """
+            SELECT id, subject_user_id, fact_type, claim_text, topic, stance,
+                   confidence, status, claim_scope, source_user_id, source_group_id,
+                   evidence_message_id, evidence_text, created_at, updated_at,
+                   importance, last_seen_at, superseded_by_fact_id, forget_reason
+            FROM member_facts
+            WHERE subject_user_id = ?
+              AND fact_type = ?
+              AND topic = ?
+              AND status = 'accepted'
+              AND claim_text != ?
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT 5
+            """,
+            (item.subject_user_id, item.fact_type, item.topic, item.claim_text),
+        ).fetchall()
+        return [_fact_record(row) for row in rows]
+
+    def _supersede_facts(
+        self,
+        conn: sqlite3.Connection,
+        records: list[FactRecord],
+        replacement_fact_id: int,
+        now: int,
+    ) -> None:
+        ids = [record.id for record in records if record.status == "accepted"]
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE member_facts
+            SET status = 'superseded',
+                superseded_by_fact_id = ?,
+                forget_reason = 'superseded_by_new_self_report',
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            [replacement_fact_id, now, *ids],
+        )
+        conn.execute(
+            f"""
+            UPDATE member_aliases
+            SET status = 'superseded',
+                updated_at = ?
+            WHERE source_fact_id IN ({placeholders})
+              AND status = 'active'
+            """,
+            [now, *ids],
+        )
+
+    def _sync_aliases_for_fact(self, conn: sqlite3.Connection, fact: FactRecord) -> None:
+        if fact.status != "accepted" or fact.fact_type not in {"identity", "alias"}:
+            return
+        now = int(time.time())
+        denied_aliases = _extract_denied_aliases(fact.claim_text, fact.evidence_text)
+        for alias in denied_aliases:
+            conn.execute(
+                """
+                UPDATE member_aliases
+                SET status = 'superseded',
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND alias = ?
+                  AND status = 'active'
+                """,
+                (now, fact.subject_user_id, alias),
+            )
+
+        for alias, alias_type in _extract_aliases_from_fact(fact):
+            row = conn.execute(
+                """
+                SELECT id
+                FROM member_aliases
+                WHERE user_id = ?
+                  AND alias = ?
+                  AND alias_type = ?
+                  AND status = 'active'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (fact.subject_user_id, alias, alias_type),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    """
+                    UPDATE member_aliases
+                    SET confidence = MAX(confidence, ?),
+                        source_fact_id = ?,
+                        updated_at = ?,
+                        last_seen_at = ?
+                    WHERE id = ?
+                    """,
+                    (fact.confidence, fact.id, now, now, int(row["id"])),
+                )
+                continue
+            conn.execute(
+                """
+                INSERT INTO member_aliases (
+                    user_id, alias, alias_type, status, confidence,
+                    source_fact_id, created_at, updated_at, last_seen_at
+                )
+                VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                """,
+                (fact.subject_user_id, alias, alias_type, fact.confidence, fact.id, now, now, now),
+            )
+
     def _insert_fact(
         self,
         conn: sqlite3.Connection,
@@ -2456,9 +2929,10 @@ class BotStorage:
             INSERT INTO member_facts (
                 subject_user_id, fact_type, claim_text, topic, stance,
                 confidence, status, claim_scope, source_user_id, source_group_id,
-                evidence_message_id, evidence_text, created_at, updated_at
+                evidence_message_id, evidence_text, created_at, updated_at,
+                importance, last_seen_at, superseded_by_fact_id, forget_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.subject_user_id,
@@ -2475,6 +2949,10 @@ class BotStorage:
                 item.evidence_text,
                 now,
                 now,
+                item.importance,
+                now,
+                None,
+                "",
             ),
         )
         return FactRecord(
@@ -2493,6 +2971,8 @@ class BotStorage:
             evidence_text=item.evidence_text,
             created_at=now,
             updated_at=now,
+            importance=item.importance,
+            last_seen_at=now,
         )
 
     def _normalize_memory_candidate(self, item: MemoryCandidate) -> MemoryCandidate:
@@ -2782,6 +3262,10 @@ def _fact_to_dict(record: FactRecord) -> dict[str, object]:
         "evidence_text": record.evidence_text,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        "importance": record.importance,
+        "last_seen_at": record.last_seen_at,
+        "superseded_by_fact_id": record.superseded_by_fact_id,
+        "forget_reason": record.forget_reason,
     }
 
 
@@ -2935,6 +3419,7 @@ def _memory_record(row: sqlite3.Row) -> MemoryRecord:
 
 
 def _fact_record(row: sqlite3.Row) -> FactRecord:
+    superseded_by = _row_value(row, "superseded_by_fact_id", "")
     return FactRecord(
         id=int(row["id"]),
         subject_user_id=str(row["subject_user_id"]),
@@ -2951,6 +3436,10 @@ def _fact_record(row: sqlite3.Row) -> FactRecord:
         evidence_text=str(row["evidence_text"] or ""),
         created_at=int(row["created_at"]),
         updated_at=int(row["updated_at"]),
+        importance=_row_float(row, "importance", 0.5),
+        last_seen_at=_row_int(row, "last_seen_at", int(row["updated_at"])),
+        superseded_by_fact_id=int(superseded_by) if superseded_by.strip() else None,
+        forget_reason=_row_value(row, "forget_reason", ""),
     )
 
 
@@ -2983,7 +3472,11 @@ def _safe_verification_status(value: str) -> str:
 
 
 def _safe_fact_status(value: str) -> str:
-    return value if value in {"candidate", "accepted", "pending_confirmation", "rejected"} else "candidate"
+    return (
+        value
+        if value in {"candidate", "accepted", "pending_confirmation", "rejected", "superseded", "forgotten"}
+        else "candidate"
+    )
 
 
 def _clean_fact_field(value: str, limit: int) -> str:
@@ -3029,6 +3522,201 @@ def _row_value(row: sqlite3.Row, key: str, default: str) -> str:
     except (IndexError, KeyError):
         return default
     return str(value or default)
+
+
+def _row_int(row: sqlite3.Row, key: str, default: int) -> int:
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _row_float(row: sqlite3.Row, key: str, default: float) -> float:
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_explicit_target_user_ids(context: MessageContext) -> list[str]:
+    candidates: list[str] = []
+    for mention in context.mentions:
+        if mention.is_bot:
+            continue
+        user_id = _dashboard_user_id(mention.user_id)
+        if user_id.isdigit():
+            candidates.append(user_id)
+
+    text = context.plain_text
+    for match in re.finditer(r"(?i)(?:@?\s*QQ\s*[:：]\s*|qq=)(\d{5,20})", text):
+        candidates.append(match.group(1))
+    if _looks_like_identity_query(text):
+        for match in re.finditer(r"(?<!\d)(\d{5,20})(?!\d)", text):
+            candidates.append(match.group(1))
+    return _dedupe_short_strings(candidates)
+
+
+def _extract_identity_name_refs(text: str) -> list[str]:
+    if not _looks_like_identity_query(text):
+        return []
+    direct_qq_pattern = re.compile(r"(?i)QQ\s*[:：]\s*\d{5,20}|\d{5,20}")
+    refs: list[str] = []
+    patterns = (
+        re.compile(r"谁是\s*([^?？,，。!！\s@]{1,30})"),
+        re.compile(r"([^?？,，。!！\s@]{1,30})\s*是谁"),
+        re.compile(r"([^?？,，。!！\s@]{1,30})\s*(?:叫啥|叫什么|叫什麼)"),
+        re.compile(r"(?:怎么|如何|要怎么|该怎么)\s*称呼\s*([^?？,，。!！\s@]{1,30})"),
+        re.compile(r"(?:名字|昵称|外号|称呼)\s*(?:是|叫|为)\s*([^?？,，。!！\s@]{1,30})"),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            raw = match.group(1)
+            if direct_qq_pattern.fullmatch(raw.strip()):
+                continue
+            cleaned = _clean_alias(raw)
+            if cleaned:
+                refs.append(cleaned)
+    return _dedupe_short_strings(refs)
+
+
+def _looks_like_identity_query(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(谁是|是谁|叫啥|叫什么|叫什麼|怎么称呼|如何称呼|要怎么称呼|该怎么称呼|名字|昵称|外号|称呼)",
+            text,
+        )
+    )
+
+
+def _extract_aliases_from_fact(fact: FactRecord) -> list[tuple[str, str]]:
+    if fact.fact_type not in {"identity", "alias"}:
+        return []
+    candidates = _extract_alias_candidates_from_fact(fact)
+    return _dedupe_alias_pairs(
+        (alias, alias_type)
+        for alias, alias_type in candidates
+        if _is_reasonable_member_alias(alias)
+    )
+
+
+def _extract_alias_candidates_from_fact(fact: FactCandidate | FactRecord) -> list[tuple[str, str]]:
+    if fact.fact_type not in {"identity", "alias"}:
+        return []
+    texts = (fact.claim_text, fact.evidence_text, fact.topic)
+    denied = set(_extract_denied_aliases(fact.claim_text, fact.evidence_text))
+    aliases: list[tuple[str, str]] = []
+    patterns = (
+        ("alias", re.compile(r"(?:称呼|昵称|外号|名字)\s*(?:是|叫|为|：|:)?\s*[“\"']?([^，,。；;、\s”\"']{1,30})")),
+        ("alias", re.compile(r"(?<!不)(?<!别)(?<!要)(?<!再)(?:叫做|称作|称为|叫)\s*(?:我|他|她|ta|TA)?\s*[“\"']?([^，,。；;、\s”\"']{1,30})")),
+        ("identity", re.compile(r"(?:自称|身份是|是)\s*[“\"']?([^，,。；;、\s”\"']{1,30})")),
+        ("alias", re.compile(r"(?:改叫|以后叫)\s*[“\"']?([^，,。；;、\s”\"']{1,30})")),
+    )
+    for alias_type, pattern in patterns:
+        for text in texts:
+            for match in pattern.finditer(text):
+                alias = _clean_alias(match.group(1))
+                if not alias or alias in denied:
+                    continue
+                aliases.append((alias, alias_type))
+    return _dedupe_alias_pairs(aliases)
+
+
+def _is_unreasonable_alias_fact(fact: FactCandidate | FactRecord) -> bool:
+    if fact.fact_type not in {"identity", "alias"}:
+        return False
+    aliases = _extract_alias_candidates_from_fact(fact)
+    return bool(aliases) and all(not _is_reasonable_member_alias(alias) for alias, _ in aliases)
+
+
+def _is_reasonable_member_alias(value: str) -> bool:
+    alias = _clean_alias(value)
+    if not alias:
+        return False
+    compact = re.sub(r"\s+", "", alias)
+    if compact in RELATIONAL_ALIAS_TERMS:
+        return False
+    relation_core = (
+        "主人|主子|老板|老板娘|领导|管理员|管理|群主|版主|"
+        "爸爸|爸|爹|父亲|妈妈|妈|母亲|哥哥|哥|姐姐|姐|"
+        "弟弟|弟|妹妹|妹|儿子|女儿|老婆|老公|媳妇|丈夫|妻子|"
+        "对象|男朋友|女朋友"
+    )
+    if re.fullmatch(rf"(?:小|老|大|阿)?(?:{relation_core})(?:大人)?", compact):
+        return False
+    if re.fullmatch(r"(?:第?[一二三四五六七八九十\d]+)?(?:管理员|管理|群主|版主)", compact):
+        return False
+    return True
+
+
+def _extract_denied_aliases(*texts: str) -> list[str]:
+    combined = "\n".join(str(text or "") for text in texts)
+    aliases: list[str] = []
+    patterns = (
+        re.compile(r"(?:不是|不叫|别叫|不要叫|别再叫|不要再叫)\s*(?:我|他|她|ta|TA)?\s*[“\"']?([^，,。；;、\s”\"']{1,30})"),
+        re.compile(r"[“\"']?([^，,。；;、\s”\"']{1,30})[”\"']?\s*(?:不是我|不是他|不是她|不是ta|不对)"),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(combined):
+            alias = _clean_alias(match.group(1))
+            if alias:
+                aliases.append(alias)
+    return _dedupe_short_strings(aliases)
+
+
+def _clean_alias(value: str) -> str:
+    alias = " ".join(str(value or "").strip().split())
+    alias = alias.strip("「」『』“”\"'`.,，。:：;；!?！？()（）[]【】")
+    if not 1 <= len(alias) <= 30:
+        return ""
+    if re.fullmatch(r"(?i)qq[:：]?\d+", alias):
+        return ""
+    if alias in {"谁", "你", "我", "他", "她", "它", "ta", "TA", "这个", "那个", "哪位"}:
+        return ""
+    return alias
+
+
+def _dedupe_alias_pairs(values: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for alias, alias_type in values:
+        key = (alias, alias_type)
+        if alias and key not in seen:
+            result.append(key)
+            seen.add(key)
+    return result
+
+
+def _dedupe_short_strings(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = " ".join(str(value or "").strip().split())
+        if not item or item in seen:
+            continue
+        result.append(item)
+        seen.add(item)
+    return result
+
+
+def _fact_importance(item: FactCandidate) -> float:
+    base = _clamp_float(getattr(item, "importance", 0.5))
+    if item.fact_type in {"identity", "boundary"}:
+        base = max(base, 0.9)
+    elif item.fact_type in {"skill", "habit"}:
+        base = max(base, 0.75)
+    elif item.fact_type in {"preference", "dislike"}:
+        base = max(base, 0.55)
+    if str(item.evidence_text or "").startswith("image_index="):
+        base = min(base, 0.3)
+    return base
 
 
 def _compact_string_list(values: Iterable[str], limit: int = 10) -> list[str]:

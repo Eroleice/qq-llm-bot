@@ -35,6 +35,7 @@ from qq_llm_bot.config import (
 from qq_llm_bot.models import (
     ConversationSnapshot,
     FactCandidate,
+    FactRecord,
     MemoryCandidate,
     MemoryRecord,
     MessageAttachment,
@@ -45,6 +46,7 @@ from qq_llm_bot.models import (
     ParticipationDecision,
     StickerAssetRecord,
     StickerCandidate,
+    TargetUserContext,
     UserProfileDraft,
 )
 from qq_llm_bot.onebot_messages import (
@@ -223,6 +225,106 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
                 ("text", " can explain", ""),
             ],
         )
+
+    async def test_active_mode_observes_unknown_identity_reference(self) -> None:
+        agent = ParticipationPolicyAgent(test_config(Path("unused.sqlite3")), FakeLLM())
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-unknown-name",
+            plain_text="谁是牛宝宝",
+            raw_message="谁是牛宝宝",
+        )
+        perception = PerceptionResult(
+            is_question=True,
+            is_self_disclosure=False,
+            mentions_bot=False,
+            topics=["称呼"],
+            emotion_hint="neutral",
+            confidence=0.9,
+        )
+
+        decision = await agent.decide(
+            context,
+            perception,
+            "active",
+            ConversationSnapshot(unknown_name_refs=["牛宝宝"]),
+        )
+
+        self.assertEqual(decision.action, "observe")
+        self.assertIn("unresolved", decision.reason)
+
+    async def test_direct_unknown_identity_reference_asks_for_confirmation(self) -> None:
+        agent = ResponseAgent(test_config(Path("unused.sqlite3")), FakeLLM(["这句不应该被用到"]))
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-unknown-direct",
+            plain_text="可可，谁是牛宝宝",
+            raw_message="可可，谁是牛宝宝",
+            is_direct=True,
+        )
+        decision = ParticipationDecision("reply", "direct", "passive", 1.0)
+
+        draft = await agent.generate(
+            context,
+            PerceptionResult(True, False, True),
+            decision,
+            ConversationSnapshot(unknown_name_refs=["牛宝宝"]),
+        )
+
+        self.assertIn("牛宝宝", draft.text or "")
+        self.assertIn("QQ", draft.text or "")
+
+    async def test_identity_reply_falls_back_to_target_fact_when_llm_is_uncertain(self) -> None:
+        fact = FactRecord(
+            id=1,
+            subject_user_id="1657222326",
+            fact_type="identity",
+            claim_text="QQ:1657222326 的称呼是牛宝宝。",
+            topic="称呼",
+            stance="neutral",
+            confidence=0.95,
+            status="accepted",
+            claim_scope="self_report",
+            source_user_id="1657222326",
+            source_group_id="100",
+            evidence_message_id="m1",
+            evidence_text="我叫牛宝宝",
+            created_at=1,
+            updated_at=1,
+        )
+        llm = FakeLLM(["我不太确定。"])
+        agent = ResponseAgent(test_config(Path("unused.sqlite3")), llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-known-name",
+            plain_text="谁是牛宝宝",
+            raw_message="谁是牛宝宝",
+            is_direct=True,
+        )
+
+        draft = await agent.generate(
+            context,
+            PerceptionResult(True, False, True),
+            ParticipationDecision("reply", "direct", "passive", 1.0),
+            ConversationSnapshot(
+                target_users=[
+                    TargetUserContext(
+                        user_id="1657222326",
+                        resolution_status="resolved",
+                        match_reason="alias:牛宝宝",
+                        aliases=["牛宝宝"],
+                        facts=[fact],
+                    )
+                ]
+            ),
+        )
+
+        self.assertEqual(draft.text, "牛宝宝是 QQ:1657222326。")
+        self.assertIn("被询问/提及成员资料", llm.text_calls[0][1])
+        self.assertIn("不要主动转移话题", llm.text_calls[0][1])
 
     async def test_mentioned_member_fallback_uses_mentioned_qq(self) -> None:
         context = MessageContext(
@@ -1715,6 +1817,304 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(accepted_facts[0].claim_scope, "self_report")
             self.assertEqual(accepted_facts[0].status, "accepted")
             self.assertEqual(storage.list_memories("user", "42", status="active"), [])
+
+    def test_member_aliases_allow_multiple_names_and_resolve_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+
+            facts = [
+                FactCandidate(
+                    subject_user_id="123",
+                    fact_type="identity",
+                    claim_text="QQ:123 的称呼是牛宝宝。",
+                    topic="称呼",
+                    stance="neutral",
+                    confidence=0.95,
+                    evidence_message_id="m-alias-1",
+                    evidence_text="我叫牛宝宝",
+                    source_user_id="123",
+                    source_group_id="100",
+                    claim_scope="self_report",
+                    importance=0.9,
+                ),
+                FactCandidate(
+                    subject_user_id="123",
+                    fact_type="identity",
+                    claim_text="QQ:123 的昵称是牛牛。",
+                    topic="昵称",
+                    stance="neutral",
+                    confidence=0.94,
+                    evidence_message_id="m-alias-2",
+                    evidence_text="昵称是牛牛",
+                    source_user_id="123",
+                    source_group_id="100",
+                    claim_scope="self_report",
+                    importance=0.9,
+                ),
+            ]
+
+            storage.record_fact_candidates(facts)
+            by_first = storage.build_snapshot(
+                MessageContext("100", "42", "q1", "谁是牛宝宝", "谁是牛宝宝")
+            )
+            by_second = storage.build_snapshot(
+                MessageContext("100", "42", "q2", "牛牛是谁", "牛牛是谁")
+            )
+
+            self.assertEqual(by_first.target_users[0].user_id, "123")
+            self.assertEqual(by_second.target_users[0].user_id, "123")
+            self.assertIn("牛宝宝", by_first.target_users[0].aliases)
+            self.assertIn("牛牛", by_first.target_users[0].aliases)
+
+    def test_relationship_titles_are_rejected_as_member_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            candidates = [
+                FactCandidate(
+                    subject_user_id="123",
+                    fact_type="identity",
+                    claim_text="QQ:123 的称呼是主人。",
+                    topic="称呼",
+                    stance="neutral",
+                    confidence=0.98,
+                    evidence_message_id="m-title-1",
+                    evidence_text="我叫主人",
+                    source_user_id="123",
+                    source_group_id="100",
+                    claim_scope="self_report",
+                    importance=0.9,
+                ),
+                FactCandidate(
+                    subject_user_id="456",
+                    fact_type="identity",
+                    claim_text="QQ:456 的昵称是老板。",
+                    topic="昵称",
+                    stance="neutral",
+                    confidence=0.98,
+                    evidence_message_id="m-title-2",
+                    evidence_text="@QQ:456 叫老板",
+                    source_user_id="42",
+                    source_group_id="100",
+                    claim_scope="third_party",
+                    importance=0.9,
+                ),
+                FactCandidate(
+                    subject_user_id="789",
+                    fact_type="identity",
+                    claim_text="QQ:789 的称呼是管理员。",
+                    topic="称呼",
+                    stance="neutral",
+                    confidence=0.98,
+                    evidence_message_id="m-title-3",
+                    evidence_text="@QQ:789 叫管理员",
+                    source_user_id="42",
+                    source_group_id="100",
+                    claim_scope="third_party",
+                    importance=0.9,
+                ),
+                FactCandidate(
+                    subject_user_id="999",
+                    fact_type="identity",
+                    claim_text="QQ:999 的称呼是爸爸。",
+                    topic="称呼",
+                    stance="neutral",
+                    confidence=0.98,
+                    evidence_message_id="m-title-4",
+                    evidence_text="我叫爸爸",
+                    source_user_id="999",
+                    source_group_id="100",
+                    claim_scope="self_report",
+                    importance=0.9,
+                ),
+            ]
+
+            write = storage.record_fact_candidates(candidates)
+            snapshot = storage.build_snapshot(
+                MessageContext("100", "42", "q-title", "谁是主人", "谁是主人")
+            )
+
+            self.assertEqual(len(write.rejected), len(candidates))
+            self.assertEqual(write.accepted, [])
+            self.assertEqual(write.pending, [])
+            self.assertEqual(storage.list_user_facts("123", include_faded=True), [])
+            self.assertEqual(snapshot.target_users, [])
+            self.assertEqual(snapshot.unknown_name_refs, ["主人"])
+
+    def test_mixed_relationship_title_claim_keeps_reasonable_alias_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+
+            write = storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="123",
+                        fact_type="identity",
+                        claim_text="QQ:123 的昵称是牛宝宝。",
+                        topic="称呼",
+                        stance="neutral",
+                        confidence=0.98,
+                        evidence_message_id="m-title-mixed",
+                        evidence_text="别叫我主人，叫我牛宝宝",
+                        source_user_id="123",
+                        source_group_id="100",
+                        claim_scope="self_report",
+                        importance=0.9,
+                    )
+                ]
+            )
+            by_good_name = storage.build_snapshot(
+                MessageContext("100", "42", "q-good", "谁是牛宝宝", "谁是牛宝宝")
+            )
+            by_bad_title = storage.build_snapshot(
+                MessageContext("100", "42", "q-bad", "谁是主人", "谁是主人")
+            )
+
+            self.assertEqual(len(write.accepted), 1)
+            self.assertEqual(by_good_name.target_users[0].user_id, "123")
+            self.assertIn("牛宝宝", by_good_name.target_users[0].aliases)
+            self.assertNotIn("主人", by_good_name.target_users[0].aliases)
+            self.assertEqual(by_bad_title.target_users, [])
+            self.assertEqual(by_bad_title.unknown_name_refs, ["主人"])
+
+    def test_mention_target_injects_member_facts_for_non_speaker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="1657222326",
+                        fact_type="identity",
+                        claim_text="QQ:1657222326 的称呼是牛宝宝。",
+                        topic="称呼",
+                        stance="neutral",
+                        confidence=0.95,
+                        evidence_message_id="m-target",
+                        evidence_text="我叫牛宝宝",
+                        source_user_id="1657222326",
+                        source_group_id="100",
+                        claim_scope="self_report",
+                        importance=0.9,
+                    )
+                ]
+            )
+
+            snapshot = storage.build_snapshot(
+                MessageContext(
+                    group_id="100",
+                    user_id="42",
+                    message_id="q-target",
+                    plain_text="你要怎么称呼 @QQ:1657222326？",
+                    raw_message="",
+                    mentions=[MessageMention(user_id="1657222326")],
+                )
+            )
+
+            self.assertEqual(snapshot.user_facts, [])
+            self.assertEqual(snapshot.target_users[0].user_id, "1657222326")
+            self.assertIn("牛宝宝", snapshot.target_users[0].aliases)
+            self.assertIn("牛宝宝", snapshot.target_users[0].facts[0].claim_text)
+
+    def test_alias_correction_supersedes_only_denied_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            first = storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="123",
+                        fact_type="identity",
+                        claim_text="QQ:123 的称呼是牛宝宝。",
+                        topic="称呼",
+                        stance="neutral",
+                        confidence=0.95,
+                        evidence_message_id="m-old",
+                        evidence_text="我叫牛宝宝",
+                        source_user_id="123",
+                        source_group_id="100",
+                        claim_scope="self_report",
+                        importance=0.9,
+                    )
+                ]
+            ).accepted[0]
+
+            storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="123",
+                        fact_type="identity",
+                        claim_text="用户表示不是牛宝宝，是牛牛。",
+                        topic="称呼",
+                        stance="neutral",
+                        confidence=0.95,
+                        evidence_message_id="m-new",
+                        evidence_text="我不是牛宝宝，是牛牛",
+                        source_user_id="123",
+                        source_group_id="100",
+                        claim_scope="self_report",
+                        importance=0.9,
+                    )
+                ]
+            )
+
+            old_record = storage.get_fact_record(first.id)
+            old_lookup = storage.build_snapshot(
+                MessageContext("100", "42", "q-old", "谁是牛宝宝", "谁是牛宝宝")
+            )
+            new_lookup = storage.build_snapshot(
+                MessageContext("100", "42", "q-new", "谁是牛牛", "谁是牛牛")
+            )
+
+            self.assertEqual(old_record.status if old_record else None, "superseded")
+            self.assertEqual(old_lookup.target_users, [])
+            self.assertEqual(old_lookup.unknown_name_refs, ["牛宝宝"])
+            self.assertEqual(new_lookup.target_users[0].user_id, "123")
+            self.assertIn("牛牛", new_lookup.target_users[0].aliases)
+
+    def test_forgotten_and_stale_low_importance_facts_do_not_enter_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            low = storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="42",
+                        fact_type="opinion",
+                        claim_text="用户42觉得一次截图里的按钮很亮。",
+                        topic="截图按钮",
+                        stance="neutral",
+                        confidence=0.8,
+                        evidence_message_id="m-low-importance",
+                        evidence_text="image_index=0 description=button",
+                        source_user_id="42",
+                        source_group_id="100",
+                        claim_scope="self_report",
+                        importance=0.2,
+                    )
+                ]
+            ).accepted[0]
+
+            with storage._connect() as conn:
+                conn.execute(
+                    "UPDATE member_facts SET last_seen_at = 1, updated_at = 1 WHERE id = ?",
+                    (low.id,),
+                )
+
+            self.assertEqual(storage.list_user_facts("42"), [])
+            self.assertEqual(storage.list_user_facts("42", include_faded=True)[0].id, low.id)
+            storage.forget_fact(low.id)
+
+            self.assertEqual(storage.list_user_facts("42"), [])
+            self.assertEqual(storage.get_fact_record(low.id).status, "forgotten")
 
     def test_low_value_fact_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

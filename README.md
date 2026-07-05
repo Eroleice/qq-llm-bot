@@ -72,6 +72,7 @@ http://127.0.0.1:8080/dashboard
 #bot facts pending
 #bot facts approve <fact_id>
 #bot facts reject <fact_id>
+#bot facts forget <fact_id>
 #bot profile <qq_id>
 #bot stickers list [数量]
 #bot stickers enable <sticker_id>
@@ -151,6 +152,7 @@ http://127.0.0.1:8080/dashboard
 #bot memory reject <memory_id>
 #bot facts approve <fact_id>
 #bot facts reject <fact_id>
+#bot facts forget <fact_id>
 #bot persona self approve <memory_id>
 #bot persona self reject <memory_id>
 ```
@@ -180,7 +182,14 @@ fact_confidence_threshold = 0.75
 third_party_trust_threshold = 70
 third_party_confidence_threshold = 0.85
 profile_fact_threshold = 5
+context_fact_limit = 8
+target_user_limit = 5
+low_importance_threshold = 0.35
+fact_context_ttl_days = 30
 ```
+
+`facts forget` 会把指定 FACT 标记为 forgotten，并触发成员画像重算；低重要度且长期未复现的 FACT 默认不会进入聊天上下文或画像聚合，但不会自动删库。
+关系型称谓（如“主人”“老板”“管理员”“爸爸”）不会被接受为成员称呼/昵称索引，避免把人际关系称谓误学成身份别名。
 
 ## 接入 OpenAI-compatible LLM
 

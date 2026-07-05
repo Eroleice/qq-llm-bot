@@ -148,7 +148,10 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     memory_write = storage.record_memory_candidates(result.memories)
     storage.update_image_descriptions(context.group_id, context.message_id, result.image_descriptions)
     await _record_sticker_candidates(context, result.sticker_candidates)
-    await _maybe_update_profiles([fact.subject_user_id for fact in fact_write.accepted])
+    await _maybe_update_profiles(
+        [fact.subject_user_id for fact in fact_write.accepted],
+        force=bool(fact_write.accepted),
+    )
     storage.apply_relationship_delta(context.group_id, context.user_id, result.relationship_delta)
     await _maybe_reflect_group(context.group_id)
     conflict_reply = storage.build_conflict_confirmation(memory_write.conflicts, context, mode)
@@ -282,7 +285,7 @@ async def _handle_facts(rest: list[str]) -> None:
         record = storage.approve_fact(fact_id)
         if record is None:
             await admin_cmd.finish("没有找到可批准的 FACT。")
-        await _maybe_update_profiles([record.subject_user_id])
+        await _maybe_update_profiles([record.subject_user_id], force=True)
         await admin_cmd.finish("已批准。")
     if len(rest) >= 2 and action == "reject":
         fact_id = _parse_memory_id(rest[1])
@@ -290,6 +293,15 @@ async def _handle_facts(rest: list[str]) -> None:
             await admin_cmd.finish("fact_id 必须是数字，例如：#bot facts reject 12")
         ok = storage.reject_fact(fact_id)
         await admin_cmd.finish("已拒绝。" if ok else "没有找到可拒绝的 FACT。")
+    if len(rest) >= 2 and action == "forget":
+        fact_id = _parse_memory_id(rest[1])
+        if fact_id is None:
+            await admin_cmd.finish("fact_id 必须是数字，例如：#bot facts forget 12")
+        record = storage.forget_fact(fact_id)
+        if record is None:
+            await admin_cmd.finish("没有找到可遗忘的 FACT。")
+        await _maybe_update_profiles([record.subject_user_id], force=True)
+        await admin_cmd.finish("已遗忘。")
     await admin_cmd.finish(_facts_help_text())
 
 
@@ -421,20 +433,23 @@ async def _maybe_reflect_group(group_id: str) -> None:
         storage.record_memory_candidates([reflection])
 
 
-async def _maybe_update_profiles(user_ids: list[str]) -> None:
+async def _maybe_update_profiles(user_ids: list[str], force: bool = False) -> None:
     seen: set[str] = set()
     for raw_user_id in user_ids:
         user_id = str(raw_user_id).strip()
         if not user_id or user_id in seen:
             continue
         seen.add(user_id)
-        if not storage.should_update_user_profile(user_id, config.facts.profile_fact_threshold):
+        if not force and not storage.should_update_user_profile(user_id, config.facts.profile_fact_threshold):
             continue
         facts = storage.list_user_facts(user_id, limit=0)
+        if force and not facts:
+            storage.clear_user_profile(user_id)
+            continue
         draft = await pipeline.profile(user_id, facts, storage.get_user_profile(user_id))
         if draft is None:
             continue
-        storage.maybe_update_user_profile(user_id, draft, facts)
+        storage.maybe_update_user_profile(user_id, draft, facts, force=force)
 
 
 async def _record_sticker_candidates(
@@ -655,7 +670,7 @@ def _help_text() -> str:
         "#bot admin list|add <qq_id>|remove <qq_id>\n"
         "#bot ignore list|add <qq_id>|remove <qq_id>\n"
         "#bot memory lexicon [term]|pending|conflicts|approve <id>|reject <id>\n"
-        "#bot facts user <qq_id>|pending|approve <id>|reject <id>\n"
+        "#bot facts user <qq_id>|pending|approve <id>|reject <id>|forget <id>\n"
         "#bot profile <qq_id>\n"
         "#bot stickers list [数量]|enable <id>|disable <id>|delete <id>\n"
         "#bot persona show|self [pending|conflicts|approve <id>|reject <id>|forget <id>]\n"
@@ -684,6 +699,7 @@ def _facts_help_text() -> str:
         "#bot facts pending\n"
         "#bot facts approve <fact_id>\n"
         "#bot facts reject <fact_id>\n"
+        "#bot facts forget <fact_id>\n"
         "#bot profile <qq_id>"
     )
 
