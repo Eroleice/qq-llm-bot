@@ -1158,6 +1158,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
                   ${item.description ? `<div class="muted">${escapeHtml(item.description)}</div>` : ""}
                   <div class="muted">
                     hits=${Number(item.hit_count || 0)}
+                    sent=${Number(item.send_count || 0)}
                     conf=${Number(item.confidence || 0).toFixed(2)}
                     · ${formatTime(item.updated_at)}
                   </div>

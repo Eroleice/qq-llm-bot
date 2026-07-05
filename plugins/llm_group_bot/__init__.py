@@ -75,6 +75,7 @@ if config.dashboard.enabled:
 @driver.on_startup
 async def _startup() -> None:
     storage.setup()
+    _maybe_cleanup_unused_stickers()
 
 
 admin_cmd = on_command("bot", priority=5, block=True)
@@ -434,6 +435,7 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     storage.record_message(context)
     if storage.is_user_ignored(context.user_id):
         return
+    _maybe_cleanup_unused_stickers()
 
     mode = storage.get_group_mode(group_id, config.bot.default_group_mode)
     if _should_defer_realtime_pipeline(context, mode):
@@ -481,7 +483,8 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     storage.record_decision(context, result.decision, decision_reply)
     storage.record_bot_reply(context.group_id, str(bot.self_id), decision_reply)
     if sent_sticker:
-        storage.record_sticker_sent(sent_sticker.id)
+        storage.record_sticker_sent(sent_sticker.id, usage_date=_draw_usage_date())
+        _maybe_cleanup_unused_stickers()
     await group_message.finish()
 
 
@@ -1061,6 +1064,28 @@ def _draw_join(lines: list[str]) -> str:
 def _draw_usage_date(now: int | None = None) -> str:
     timestamp = int(time.time() if now is None else now)
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+
+def _maybe_cleanup_unused_stickers() -> None:
+    if not config.stickers.enabled:
+        return
+    now = int(time.time())
+    interval_seconds = config.stickers.cleanup_interval_hours * 60 * 60
+    if not storage.claim_sticker_cleanup(interval_seconds, now=now):
+        return
+    unused_seconds = config.stickers.unused_ttl_hours * 60 * 60
+    deleted_assets = storage.delete_unused_sticker_assets(unused_seconds, now=now)
+    deleted_files = 0
+    for asset in deleted_assets:
+        if sticker_store.delete_saved_file(asset.local_path):
+            deleted_files += 1
+    if deleted_assets:
+        logger.info(
+            "Sticker cleanup deleted {} assets and {} files after {} unused hours",
+            len(deleted_assets),
+            deleted_files,
+            config.stickers.unused_ttl_hours,
+        )
 
 
 async def _maybe_reflect_group(group_id: str) -> None:

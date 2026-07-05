@@ -91,6 +91,8 @@ class StickerAssetRecord:
     updated_at: int
     last_seen_at: int
     hit_count: int = 0
+    send_count: int = 0
+    last_sent_at: int = 0
 
 
 @dataclass(frozen=True)

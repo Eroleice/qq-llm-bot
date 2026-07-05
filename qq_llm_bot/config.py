@@ -150,6 +150,8 @@ class StickerConfig:
     download_timeout_seconds: float = 20.0
     max_download_bytes: int = 8 * 1024 * 1024
     send_cooldown_seconds: int = 120
+    unused_ttl_hours: int = 72
+    cleanup_interval_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -527,6 +529,14 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             send_cooldown_seconds=_positive_int(
                 stickers_raw.get("send_cooldown_seconds", 120),
                 "stickers.send_cooldown_seconds",
+            ),
+            unused_ttl_hours=_positive_int(
+                stickers_raw.get("unused_ttl_hours", 72),
+                "stickers.unused_ttl_hours",
+            ),
+            cleanup_interval_hours=_positive_int(
+                stickers_raw.get("cleanup_interval_hours", 24),
+                "stickers.cleanup_interval_hours",
             ),
         ),
         storage=StorageConfig(

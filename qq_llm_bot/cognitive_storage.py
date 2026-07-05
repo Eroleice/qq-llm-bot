@@ -258,7 +258,19 @@ class BotStorage:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     last_seen_at INTEGER NOT NULL,
-                    hit_count INTEGER NOT NULL DEFAULT 0
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    send_count INTEGER NOT NULL DEFAULT 0,
+                    last_sent_at INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS sticker_usage_daily (
+                    sticker_id INTEGER NOT NULL,
+                    group_id TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    send_count INTEGER NOT NULL DEFAULT 0,
+                    first_sent_at INTEGER NOT NULL,
+                    last_sent_at INTEGER NOT NULL,
+                    PRIMARY KEY (sticker_id, usage_date)
                 );
 
                 CREATE TABLE IF NOT EXISTS group_whitelist (
@@ -406,6 +418,12 @@ class BotStorage:
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS bot_maintenance_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                );
                 """
             )
             self._migrate_schema(conn)
@@ -418,6 +436,8 @@ class BotStorage:
         self._ensure_column(conn, "member_facts", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(conn, "member_facts", "superseded_by_fact_id", "INTEGER")
         self._ensure_column(conn, "member_facts", "forget_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "sticker_assets", "send_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "sticker_assets", "last_sent_at", "INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             UPDATE member_facts
@@ -441,6 +461,10 @@ class BotStorage:
                 ON llm_usage(created_at);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_purpose_created_at
                 ON llm_usage(purpose, created_at);
+            CREATE INDEX IF NOT EXISTS idx_sticker_assets_last_sent
+                ON sticker_assets(last_sent_at, created_at);
+            CREATE INDEX IF NOT EXISTS idx_sticker_usage_daily_group_date
+                ON sticker_usage_daily(group_id, usage_date);
             """
         )
 
@@ -845,7 +869,7 @@ class BotStorage:
                 SELECT id, group_id, source_user_id, source_message_id, url, file,
                        local_path, sha256, description, ocr_text, mood, usage,
                        tags, confidence, enabled, created_at, updated_at,
-                       last_seen_at, hit_count
+                       last_seen_at, hit_count, send_count, last_sent_at
                 FROM sticker_assets
                 WHERE id = ?
                 """,
@@ -873,7 +897,7 @@ class BotStorage:
                 SELECT id, group_id, source_user_id, source_message_id, url, file,
                        local_path, sha256, description, ocr_text, mood, usage,
                        tags, confidence, enabled, created_at, updated_at,
-                       last_seen_at, hit_count
+                       last_seen_at, hit_count, send_count, last_sent_at
                 FROM sticker_assets
                 WHERE id = ?
                 """,
@@ -898,7 +922,7 @@ class BotStorage:
                 SELECT id, group_id, source_user_id, source_message_id, url, file,
                        local_path, sha256, description, ocr_text, mood, usage,
                        tags, confidence, enabled, created_at, updated_at,
-                       last_seen_at, hit_count
+                       last_seen_at, hit_count, send_count, last_sent_at
                 FROM sticker_assets
                 WHERE {' AND '.join(where)}
                 ORDER BY confidence DESC, hit_count DESC, updated_at DESC, id DESC
@@ -919,7 +943,7 @@ class BotStorage:
                 SELECT id, group_id, source_user_id, source_message_id, url, file,
                        local_path, sha256, description, ocr_text, mood, usage,
                        tags, confidence, enabled, created_at, updated_at,
-                       last_seen_at, hit_count
+                       last_seen_at, hit_count, send_count, last_sent_at
                 FROM sticker_assets
                 WHERE id = ?
                 """,
@@ -945,19 +969,166 @@ class BotStorage:
             return None
         with self._connect() as conn:
             conn.execute("DELETE FROM sticker_assets WHERE id = ?", (int(sticker_id),))
+            conn.execute("DELETE FROM sticker_usage_daily WHERE sticker_id = ?", (int(sticker_id),))
         return asset
 
-    def record_sticker_sent(self, sticker_id: int) -> None:
+    def record_sticker_sent(
+        self,
+        sticker_id: int,
+        usage_date: str = "",
+        sent_at: int | None = None,
+    ) -> None:
+        now = int(sent_at or time.time())
+        usage_day = str(usage_date).strip() or _local_usage_date(now)
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sticker_assets
                 SET last_seen_at = ?,
-                    hit_count = hit_count + 1
+                    hit_count = hit_count + 1,
+                    send_count = send_count + 1,
+                    last_sent_at = ?
                 WHERE id = ?
                 """,
-                (int(time.time()), int(sticker_id)),
+                (now, now, int(sticker_id)),
             )
+            row = conn.execute(
+                """
+                SELECT group_id
+                FROM sticker_assets
+                WHERE id = ?
+                """,
+                (int(sticker_id),),
+            ).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                """
+                INSERT INTO sticker_usage_daily (
+                    sticker_id, group_id, usage_date, send_count, first_sent_at, last_sent_at
+                )
+                VALUES (?, ?, ?, 1, ?, ?)
+                ON CONFLICT(sticker_id, usage_date) DO UPDATE SET
+                    group_id = excluded.group_id,
+                    send_count = sticker_usage_daily.send_count + 1,
+                    last_sent_at = excluded.last_sent_at
+                """,
+                (int(sticker_id), str(row["group_id"]), usage_day, now, now),
+            )
+
+    def count_sticker_usage(self, sticker_id: int, usage_date: str = "") -> int:
+        where = ["sticker_id = ?"]
+        params: list[object] = [int(sticker_id)]
+        if usage_date:
+            where.append("usage_date = ?")
+            params.append(str(usage_date))
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(send_count), 0) AS count
+                FROM sticker_usage_daily
+                WHERE {' AND '.join(where)}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def list_sticker_usage_daily(
+        self,
+        group_id: str = "",
+        usage_date: str = "",
+        limit: int = 200,
+    ) -> list[dict[str, object]]:
+        where: list[str] = []
+        params: list[object] = []
+        if group_id:
+            where.append("group_id = ?")
+            params.append(str(group_id))
+        if usage_date:
+            where.append("usage_date = ?")
+            params.append(str(usage_date))
+        params.append(int(limit))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT sticker_id, group_id, usage_date, send_count, first_sent_at, last_sent_at
+                FROM sticker_usage_daily
+                {where_sql}
+                ORDER BY usage_date DESC, send_count DESC, last_sent_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                "sticker_id": int(row["sticker_id"]),
+                "group_id": str(row["group_id"]),
+                "usage_date": str(row["usage_date"]),
+                "send_count": int(row["send_count"] or 0),
+                "first_sent_at": int(row["first_sent_at"] or 0),
+                "last_sent_at": int(row["last_sent_at"] or 0),
+            }
+            for row in rows
+        ]
+
+    def claim_sticker_cleanup(self, interval_seconds: int, now: int | None = None) -> bool:
+        timestamp = int(now or time.time())
+        interval = max(1, int(interval_seconds))
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT value
+                FROM bot_maintenance_state
+                WHERE key = 'sticker_cleanup.last_run_at'
+                """
+            ).fetchone()
+            last_run_at = _safe_int(str(row["value"] or "0"), 0) if row is not None else 0
+            if row is not None and timestamp - last_run_at < interval:
+                return False
+            conn.execute(
+                """
+                INSERT INTO bot_maintenance_state (key, value, updated_at)
+                VALUES ('sticker_cleanup.last_run_at', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (str(timestamp), timestamp),
+            )
+        return True
+
+    def delete_unused_sticker_assets(
+        self,
+        unused_seconds: int,
+        now: int | None = None,
+    ) -> list[StickerAssetRecord]:
+        timestamp = int(now or time.time())
+        cutoff = timestamp - max(1, int(unused_seconds))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, group_id, source_user_id, source_message_id, url, file,
+                       local_path, sha256, description, ocr_text, mood, usage,
+                       tags, confidence, enabled, created_at, updated_at,
+                       last_seen_at, hit_count, send_count, last_sent_at
+                FROM sticker_assets
+                WHERE local_path != ''
+                  AND (
+                    (last_sent_at > 0 AND last_sent_at <= ?)
+                    OR (last_sent_at = 0 AND created_at <= ?)
+                  )
+                ORDER BY COALESCE(NULLIF(last_sent_at, 0), created_at) ASC, id ASC
+                """,
+                (cutoff, cutoff),
+            ).fetchall()
+            assets = [_sticker_asset_record(row) for row in rows]
+            if assets:
+                ids = [asset.id for asset in assets]
+                placeholders = ", ".join("?" for _ in ids)
+                conn.execute(f"DELETE FROM sticker_assets WHERE id IN ({placeholders})", ids)
+                conn.execute(f"DELETE FROM sticker_usage_daily WHERE sticker_id IN ({placeholders})", ids)
+        return assets
 
     def _find_sticker_asset(
         self,
@@ -2447,7 +2618,7 @@ class BotStorage:
                 SELECT id, group_id, source_user_id, source_message_id, url, file,
                        local_path, sha256, description, ocr_text, mood, usage,
                        tags, confidence, enabled, created_at, updated_at,
-                       last_seen_at, hit_count
+                       last_seen_at, hit_count, send_count, last_sent_at
                 FROM sticker_assets
                 WHERE {' AND '.join(where)}
                 ORDER BY group_id, confidence DESC, hit_count DESC, updated_at DESC, id DESC
@@ -3548,6 +3719,8 @@ def _sticker_asset_to_dict(asset: StickerAssetRecord) -> dict[str, object]:
         "updated_at": asset.updated_at,
         "last_seen_at": asset.last_seen_at,
         "hit_count": asset.hit_count,
+        "send_count": asset.send_count,
+        "last_sent_at": asset.last_sent_at,
         "delete_command": f"#bot stickers delete {asset.id}",
     }
 
@@ -3803,6 +3976,8 @@ def _sticker_asset_record(row: sqlite3.Row) -> StickerAssetRecord:
         updated_at=int(row["updated_at"]),
         last_seen_at=int(row["last_seen_at"]),
         hit_count=int(row["hit_count"]),
+        send_count=_row_int(row, "send_count", 0),
+        last_sent_at=_row_int(row, "last_sent_at", 0),
     )
 
 
@@ -3940,6 +4115,17 @@ def _row_int(row: sqlite3.Row, key: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_int(value: str, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _local_usage_date(timestamp: int) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(int(timestamp)))
 
 
 def _row_float(row: sqlite3.Row, key: str, default: float) -> float:

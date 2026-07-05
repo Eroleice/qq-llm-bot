@@ -2438,6 +2438,137 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertFalse(sticker_file.exists())
             self.assertEqual(storage.list_sticker_assets("100", enabled_only=False), [])
 
+    def test_sticker_usage_is_counted_by_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-sticker",
+                plain_text="",
+                raw_message="[CQ:image]",
+            )
+            candidate = StickerCandidate(
+                url="https://example.test/meme.png",
+                file="meme.png",
+                description="reaction sticker",
+                mood="funny",
+                usage="use for a quick reaction",
+                tags=("funny",),
+                confidence=0.86,
+            )
+            asset = storage.upsert_sticker_asset(
+                context,
+                candidate,
+                local_path=str(Path(tmp) / "meme.png"),
+                sha256="abc",
+            )
+
+            self.assertIsNotNone(asset)
+            storage.record_sticker_sent(asset.id, usage_date="2026-07-05", sent_at=100)
+            storage.record_sticker_sent(asset.id, usage_date="2026-07-05", sent_at=200)
+            storage.record_sticker_sent(asset.id, usage_date="2026-07-06", sent_at=300)
+            refreshed = storage.get_sticker_asset(asset.id)
+            daily = storage.list_sticker_usage_daily("100", "2026-07-05")
+
+            self.assertIsNotNone(refreshed)
+            self.assertEqual(refreshed.send_count, 3)
+            self.assertEqual(refreshed.last_sent_at, 300)
+            self.assertEqual(storage.count_sticker_usage(asset.id, "2026-07-05"), 2)
+            self.assertEqual(storage.count_sticker_usage(asset.id, "2026-07-06"), 1)
+            self.assertEqual(storage.count_sticker_usage(asset.id), 3)
+            self.assertEqual(daily[0]["send_count"], 2)
+
+    def test_unused_sticker_cleanup_removes_assets_after_72_hours(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            store = StickerLocalStore(config)
+            sticker_dir = config.resolve_path(config.stickers.storage_dir) / "100"
+            sticker_dir.mkdir(parents=True)
+            old_file = sticker_dir / "old.png"
+            stale_file = sticker_dir / "stale.png"
+            recent_file = sticker_dir / "recent.png"
+            for path in (old_file, stale_file, recent_file):
+                path.write_bytes(b"fake image")
+
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-sticker",
+                plain_text="",
+                raw_message="[CQ:image]",
+            )
+
+            def save_asset(name: str, path: Path) -> StickerAssetRecord:
+                asset = storage.upsert_sticker_asset(
+                    replace(context, message_id=f"m-{name}"),
+                    StickerCandidate(
+                        url=f"https://example.test/{name}.png",
+                        file=f"{name}.png",
+                        description=f"{name} sticker",
+                        mood="funny",
+                        usage=f"use {name}",
+                        tags=(name,),
+                        confidence=0.86,
+                    ),
+                    local_path=str(path),
+                    sha256=f"hash-{name}",
+                )
+                self.assertIsNotNone(asset)
+                return asset
+
+            old_asset = save_asset("old", old_file)
+            stale_asset = save_asset("stale", stale_file)
+            recent_asset = save_asset("recent", recent_file)
+            now = 1_800_000_000
+            ttl_seconds = 72 * 60 * 60
+            old_at = now - ttl_seconds - 10
+            recent_at = now - ttl_seconds + 10
+            storage.record_sticker_sent(stale_asset.id, usage_date="2026-07-01", sent_at=old_at)
+            storage.record_sticker_sent(recent_asset.id, usage_date="2026-07-02", sent_at=recent_at)
+            with storage._connect() as conn:
+                conn.execute(
+                    "UPDATE sticker_assets SET created_at = ?, updated_at = ?, last_seen_at = ? WHERE id = ?",
+                    (old_at, old_at, old_at, old_asset.id),
+                )
+                conn.execute(
+                    "UPDATE sticker_assets SET created_at = ?, updated_at = ?, last_seen_at = ? WHERE id = ?",
+                    (old_at, old_at, old_at, stale_asset.id),
+                )
+                conn.execute(
+                    "UPDATE sticker_assets SET created_at = ?, updated_at = ?, last_seen_at = ? WHERE id = ?",
+                    (old_at, old_at, old_at, recent_asset.id),
+                )
+
+            deleted = storage.delete_unused_sticker_assets(ttl_seconds, now=now)
+            deleted_ids = {asset.id for asset in deleted}
+            deleted_files = {asset.id for asset in deleted if store.delete_saved_file(asset.local_path)}
+
+            self.assertEqual(deleted_ids, {old_asset.id, stale_asset.id})
+            self.assertEqual(deleted_files, deleted_ids)
+            self.assertIsNone(storage.get_sticker_asset(old_asset.id))
+            self.assertIsNone(storage.get_sticker_asset(stale_asset.id))
+            self.assertIsNotNone(storage.get_sticker_asset(recent_asset.id))
+            self.assertEqual(storage.count_sticker_usage(stale_asset.id), 0)
+            self.assertFalse(old_file.exists())
+            self.assertFalse(stale_file.exists())
+            self.assertTrue(recent_file.exists())
+
+    def test_sticker_cleanup_claim_runs_once_per_interval(self) -> None:
+        storage = InMemoryBotStorage()
+        try:
+            storage.setup()
+
+            self.assertTrue(storage.claim_sticker_cleanup(24 * 60 * 60, now=1000))
+            self.assertFalse(storage.claim_sticker_cleanup(24 * 60 * 60, now=1000 + 60))
+            self.assertTrue(storage.claim_sticker_cleanup(24 * 60 * 60, now=1000 + 24 * 60 * 60))
+        finally:
+            storage.connection.close()
+
     def test_bot_sourced_lexicon_group_fact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")

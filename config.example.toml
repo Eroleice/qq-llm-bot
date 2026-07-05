@@ -117,6 +117,8 @@ max_context_stickers = 24
 download_timeout_seconds = 20.0
 max_download_bytes = 8388608
 send_cooldown_seconds = 120
+unused_ttl_hours = 72
+cleanup_interval_hours = 24
 
 [storage]
 sqlite_path = "data/bot.sqlite3"
