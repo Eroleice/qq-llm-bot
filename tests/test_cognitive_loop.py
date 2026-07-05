@@ -1256,6 +1256,37 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("机器人拟发送文本：可以先按预算拆一下，别一次压太满。", user_prompt)
         self.assertIn("政治立场", user_prompt)
 
+    async def test_final_qa_uses_focused_recent_context_when_available(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM(
+            ['{"verdict":"allow","reason":"贴合发言人主线","categories":[],"confidence":0.91}']
+        )
+        agent = FinalQAAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-focused-final-qa",
+            plain_text="可可那我是不是还是先别抽？",
+            raw_message="可可那我是不是还是先别抽？",
+            is_direct=True,
+        )
+        decision = ParticipationDecision("reply", "direct request", "passive", 1.0, "answer", 1.0)
+        snapshot = ConversationSnapshot(
+            recent_messages=["bob: 我准备直接抽", "alice: 我预算不多"],
+            speaker_recent_messages=["alice: 我预算不多", "alice: 那我是不是先别抽"],
+            other_recent_messages=["bob: 我准备直接抽", "carol: 我觉得等复刻也行"],
+        )
+
+        result = await agent.review(context, decision, snapshot, "按你前面说预算不多，先别急着抽更稳。")
+        _, user_prompt = llm.text_calls[0]
+
+        self.assertTrue(result.allowed)
+        self.assertIn("当前发言人近期主线", user_prompt)
+        self.assertIn("其他发言近期话题参考", user_prompt)
+        self.assertIn("优先根据", user_prompt)
+        self.assertLess(user_prompt.index("当前发言人近期主线"), user_prompt.index("其他发言近期话题参考"))
+        self.assertLess(user_prompt.index("alice: 我预算不多"), user_prompt.index("bob: 我准备直接抽"))
+
     async def test_final_qa_blocks_unsolicited_truth_doubt_for_shared_screenshot(self) -> None:
         config = test_config(Path("unused.sqlite3"))
         llm = FakeLLM()
@@ -1516,6 +1547,75 @@ class MemoryStorageTests(unittest.TestCase):
 
         self.assertLess(record_line, ignore_line)
         self.assertLess(ignore_line, pipeline_line)
+
+    def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_message(
+                MessageContext(
+                    group_id="100",
+                    user_id="7",
+                    message_id="m-bob-1",
+                    plain_text="我准备直接抽",
+                    raw_message="我准备直接抽",
+                    sender_name="bob",
+                    timestamp=10,
+                )
+            )
+            storage.record_message(
+                MessageContext(
+                    group_id="100",
+                    user_id="42",
+                    message_id="m-alice-1",
+                    plain_text="我预算不多",
+                    raw_message="我预算不多",
+                    sender_name="alice",
+                    timestamp=20,
+                )
+            )
+            storage.record_message(
+                MessageContext(
+                    group_id="100",
+                    user_id="8",
+                    message_id="m-carol-1",
+                    plain_text="等复刻也行",
+                    raw_message="等复刻也行",
+                    sender_name="carol",
+                    timestamp=30,
+                )
+            )
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-alice-2",
+                plain_text="那我是不是先别抽",
+                raw_message="那我是不是先别抽",
+                sender_name="alice",
+                timestamp=40,
+            )
+            storage.record_message(context)
+
+            snapshot = storage.build_snapshot(context)
+
+            self.assertEqual(
+                snapshot.speaker_recent_messages,
+                ["alice: 我预算不多", "alice: 那我是不是先别抽"],
+            )
+            self.assertEqual(
+                snapshot.other_recent_messages,
+                ["bob: 我准备直接抽", "carol: 等复刻也行"],
+            )
+            self.assertEqual(
+                snapshot.recent_messages,
+                [
+                    "bob: 我准备直接抽",
+                    "alice: 我预算不多",
+                    "carol: 等复刻也行",
+                    "alice: 那我是不是先别抽",
+                ],
+            )
 
     def test_sticker_asset_is_saved_and_can_be_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

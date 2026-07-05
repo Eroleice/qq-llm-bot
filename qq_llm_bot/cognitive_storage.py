@@ -1661,11 +1661,55 @@ class BotStorage:
             ).fetchall()
         lines = []
         for row in reversed(rows):
-            name = str(row["sender_name"] or row["user_id"])
-            text = str(row["plain_text"] or "").strip()
-            if text:
-                lines.append(f"{name}: {text}")
+            line = _format_message_context_line(row)
+            if line:
+                lines.append(line)
         return lines
+
+    def get_focused_recent_messages(
+        self,
+        group_id: str,
+        user_id: str,
+        speaker_limit: int = 5,
+        other_limit: int = 10,
+    ) -> tuple[list[str], list[str]]:
+        group_id = str(group_id)
+        user_id = str(user_id)
+        with self._connect() as conn:
+            speaker_rows = conn.execute(
+                """
+                SELECT sender_name, user_id, plain_text
+                FROM messages
+                WHERE group_id = ?
+                  AND user_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (group_id, user_id, int(speaker_limit)),
+            ).fetchall()
+            other_rows = conn.execute(
+                """
+                SELECT sender_name, user_id, plain_text
+                FROM messages
+                WHERE group_id = ?
+                  AND user_id != ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (group_id, user_id, int(other_limit)),
+            ).fetchall()
+
+        speaker_lines = [
+            line
+            for row in reversed(speaker_rows)
+            if (line := _format_message_context_line(row))
+        ]
+        other_lines = [
+            line
+            for row in reversed(other_rows)
+            if (line := _format_message_context_line(row))
+        ]
+        return speaker_lines, other_lines
 
     def get_recent_activity_counts(
         self,
@@ -2230,8 +2274,14 @@ class BotStorage:
     def build_snapshot(self, context: MessageContext) -> ConversationSnapshot:
         human_count, bot_count = self.get_recent_activity_counts(context.group_id)
         target_users, unknown_refs, ambiguous_refs = self._resolve_target_user_contexts(context)
+        speaker_messages, other_messages = self.get_focused_recent_messages(
+            context.group_id,
+            context.user_id,
+        )
         return ConversationSnapshot(
             recent_messages=self.get_recent_messages(context.group_id, limit=12),
+            speaker_recent_messages=speaker_messages,
+            other_recent_messages=other_messages,
             recent_human_messages_60s=human_count,
             recent_bot_messages_120s=bot_count,
             recent_image_descriptions=self.get_recent_image_descriptions(context.group_id, limit=8),
@@ -3350,6 +3400,14 @@ def _relationship_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
     )
     data["updated_at"] = int(row["updated_at"])
     return data
+
+
+def _format_message_context_line(row: sqlite3.Row) -> str:
+    name = str(row["sender_name"] or row["user_id"])
+    text = str(row["plain_text"] or "").strip()
+    if not text:
+        return ""
+    return f"{name}: {text}"
 
 
 def _relationship_rank_label(user_id: str, profile: dict[str, object] | None) -> str:

@@ -278,6 +278,8 @@ class ConversationSnapshot:
     target_users: list[TargetUserContext] = field(default_factory=list)
     unknown_name_refs: list[str] = field(default_factory=list)
     ambiguous_name_refs: dict[str, list[str]] = field(default_factory=dict)
+    speaker_recent_messages: list[str] = field(default_factory=list)
+    other_recent_messages: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

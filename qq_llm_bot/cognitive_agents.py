@@ -301,7 +301,7 @@ class PerceptionAgent:
                 '{"is_question":bool,"is_self_disclosure":bool,'
                 '"topics":["短话题"],"emotion_hint":"positive|neutral|negative",'
                 '"confidence":0.0}\n'
-                f"最近上下文：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"最近上下文：\n{_format_recent_context(snapshot)}\n"
                 f"消息：{context.plain_text}"
             ),
         )
@@ -578,7 +578,7 @@ class FactExtractorAgent:
                 "[合并转发聊天记录结束] is quoted chat history. First-person words inside it "
                 "refer to the sender label on that forwarded line, not the member who forwarded it.\n"
                 f"Current mentions:\n{_format_mentions(context)}\n"
-                f"最近上下文：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"最近上下文：\n{_format_recent_context(snapshot)}\n"
                 f"当前消息：{context.plain_text}"
             ),
         )
@@ -1364,7 +1364,7 @@ class ParticipationPolicyAgent:
                 '{"action":"observe|proactive_reply","score":0.0,'
                 '"value_type":"answer|synthesis|missing_angle|useful_context|clarifying_question|humor|agreement|empathy|rephrase|none",'
                 '"value_score":0.0,"reason":"短原因"}\n'
-                f"最近消息：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"最近消息：\n{_format_recent_context(snapshot)}\n"
                 f"最近60秒人类消息数：{snapshot.recent_human_messages_60s}\n"
                 f"最近120秒机器人消息数：{snapshot.recent_bot_messages_120s}\n"
                 f"聊天密度：{traffic_level}\n"
@@ -1678,7 +1678,7 @@ class SelfNarrativeAgent:
                 f"规划：purpose={plan.purpose}, allowed={list(plan.allowed_kinds)}, reason={plan.reason}\n"
                 f"人格：\n{_join_lines(snapshot.persona_lines)}\n"
                 f"已有 self memory：\n{_format_memories(snapshot.self_memories)}\n"
-                f"群聊上下文：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"群聊上下文：\n{_format_recent_context(snapshot)}\n"
                 f"用户消息：{context.plain_text}"
             ),
         )
@@ -1842,7 +1842,7 @@ class ResponseAgent:
             f"已有 self memory：\n{_format_memories(snapshot.self_memories)}\n"
             f"本轮已批准自我记忆：\n{_format_memory_candidates(approved_self_memories)}\n"
             f"自我背景门禁：{background_rule}\n"
-            f"最近群聊：\n{_join_lines(snapshot.recent_messages)}\n"
+            f"最近群聊：\n{_format_recent_context(snapshot)}\n"
             f"最近图片：\n{_join_lines(snapshot.recent_image_descriptions)}\n"
             f"发言人全局画像：\n{_format_user_profile_record(snapshot.user_profile)}\n"
             f"发言人 FACT：\n{_format_fact_records(snapshot.user_facts[:10])}\n"
@@ -1986,7 +1986,7 @@ class FinalQAAgent:
                 '{"verdict":"allow|block","reason":"短原因",'
                 '"categories":["context_mismatch|political_stance|inappropriate|privacy|'
                 'unsafe_self_claim|system_leak|low_value|other"],"confidence":0.0}\n'
-                f"最近群聊：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"最近群聊：\n{_format_recent_context(snapshot)}\n"
                 f"最近图片：\n{_join_lines(snapshot.recent_image_descriptions)}\n"
                 f"当前触发消息：{context.plain_text}\n"
                 f"参与决策：{decision.action}，原因：{decision.reason}\n"
@@ -2050,7 +2050,7 @@ class StickerSelectorAgent:
                 "asset_id 为 0 表示不发。"
                 "输出 JSON："
                 '{"asset_id":0,"confidence":0.0,"reason":"短原因"}\n'
-                f"最近群聊：\n{_join_lines(snapshot.recent_messages)}\n"
+                f"最近群聊：\n{_format_recent_context(snapshot)}\n"
                 f"对方消息：{context.plain_text}\n"
                 f"机器人文字回复：{reply}\n"
                 f"可用表情：\n{_format_sticker_assets(snapshot.sticker_assets)}"
@@ -3353,6 +3353,26 @@ def _format_relationship(snapshot: ConversationSnapshot) -> str:
 
 def _join_lines(lines: list[str]) -> str:
     return "\n".join(lines) if lines else "(none)"
+
+
+def _format_recent_context(snapshot: ConversationSnapshot) -> str:
+    if not snapshot.speaker_recent_messages and not snapshot.other_recent_messages:
+        return _join_lines(snapshot.recent_messages)
+
+    sections = [
+        "优先根据“当前发言人近期主线”理解当前消息；其他发言只作为话题背景参考。"
+    ]
+    if snapshot.speaker_recent_messages:
+        sections.append(
+            "当前发言人近期主线：\n"
+            f"{_join_lines(snapshot.speaker_recent_messages)}"
+        )
+    if snapshot.other_recent_messages:
+        sections.append(
+            "其他发言近期话题参考：\n"
+            f"{_join_lines(snapshot.other_recent_messages)}"
+        )
+    return "\n\n".join(sections)
 
 
 def _as_bool(value: Any, fallback: bool) -> bool:
