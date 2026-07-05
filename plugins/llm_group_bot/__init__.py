@@ -174,7 +174,7 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     else:
         storage.record_memory_candidates(result.reply_self_memories)
 
-    sent_sticker = await _send_group_reply(final_reply, selected_sticker)
+    sent_sticker = await _send_group_reply(final_reply, selected_sticker, context.message_id)
     decision_reply = _reply_record_text(final_reply, sent_sticker)
     storage.record_decision(context, result.decision, decision_reply)
     storage.record_bot_reply(context.group_id, str(bot.self_id), decision_reply)
@@ -484,39 +484,109 @@ async def _record_sticker_candidates(
 async def _send_group_reply(
     reply: str,
     sticker: StickerAssetRecord | None,
+    reply_to_message_id: str | None,
 ) -> StickerAssetRecord | None:
-    message = _reply_message(reply, sticker)
-    sticker_included = _message_contains_image(message)
-    try:
-        await group_message.send(message)
-    except ActionFailed as exc:
-        if sticker is None or not sticker_included:
-            raise
-        logger.warning(
-            "Sticker send failed for asset #{} ({}): {}",
-            sticker.id,
-            sticker.local_path or sticker.url,
-            exc,
+    first_error: ActionFailed | None = None
+    for message, attempted_sticker, used_reply in _reply_send_attempts(
+        reply,
+        sticker,
+        reply_to_message_id,
+    ):
+        sticker_included = _message_contains_image(message)
+        try:
+            await group_message.send(message)
+        except ActionFailed as exc:
+            if first_error is None:
+                first_error = exc
+            _log_reply_send_failure(
+                exc,
+                attempted_sticker if sticker_included else None,
+                used_reply,
+                reply_to_message_id,
+            )
+            continue
+        return attempted_sticker if sticker_included else None
+    if first_error is not None:
+        raise first_error
+    return None
+
+
+def _reply_send_attempts(
+    reply: str,
+    sticker: StickerAssetRecord | None,
+    reply_to_message_id: str | None,
+) -> list[tuple[Message | str, StickerAssetRecord | None, bool]]:
+    reply_to = str(reply_to_message_id or "").strip() or None
+    requested: list[tuple[str | None, StickerAssetRecord | None]] = []
+    if reply_to:
+        requested.append((reply_to, sticker))
+        if sticker is not None:
+            requested.append((reply_to, None))
+            requested.append((None, sticker))
+        requested.append((None, None))
+    else:
+        requested.append((None, sticker))
+        if sticker is not None:
+            requested.append((None, None))
+
+    attempts: list[tuple[Message | str, StickerAssetRecord | None, bool]] = []
+    seen: set[tuple[bool, int | None]] = set()
+    for attempt_reply_to, attempt_sticker in requested:
+        key = (bool(attempt_reply_to), attempt_sticker.id if attempt_sticker is not None else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        attempts.append(
+            (
+                _reply_message(reply, attempt_sticker, attempt_reply_to),
+                attempt_sticker,
+                bool(attempt_reply_to),
+            )
         )
-        await group_message.send(_reply_message(reply, None))
-        return None
-    return sticker if sticker_included else None
+    return attempts
 
 
-def _reply_message(reply: str, sticker: StickerAssetRecord | None) -> Message | str:
+def _reply_message(
+    reply: str,
+    sticker: StickerAssetRecord | None,
+    reply_to_message_id: str | None = None,
+) -> Message | str:
     text_message = _reply_text_message(reply)
     file_ref = _sticker_file_ref(sticker) if sticker is not None else ""
-    if not file_ref:
+    reply_to = str(reply_to_message_id or "").strip()
+    if not file_ref and not reply_to:
         return text_message
     message = Message()
+    if reply_to:
+        message += MessageSegment.reply(reply_to)
     if reply:
         if isinstance(text_message, Message):
             message += text_message
         else:
             message += MessageSegment.text(reply)
         message += MessageSegment.text("\n")
-    message += MessageSegment.image(file=file_ref)
+    if file_ref:
+        message += MessageSegment.image(file=file_ref)
     return message
+
+
+def _log_reply_send_failure(
+    exc: ActionFailed,
+    sticker: StickerAssetRecord | None,
+    used_reply: bool,
+    reply_to_message_id: str | None,
+) -> None:
+    if sticker is not None:
+        logger.warning(
+            "Group reply send failed for asset #{} ({}) reply_to={}: {}",
+            sticker.id,
+            sticker.local_path or sticker.url,
+            reply_to_message_id if used_reply else "",
+            exc,
+        )
+        return
+    if used_reply:
+        logger.warning("Group reply send failed reply_to={}: {}", reply_to_message_id, exc)
 
 
 def _reply_text_message(reply: str) -> Message | str:
