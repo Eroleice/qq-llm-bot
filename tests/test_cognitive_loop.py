@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import tempfile
 import unittest
 from dataclasses import replace
@@ -23,6 +24,7 @@ from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import (
     AppConfig,
     BotConfig,
+    ImageGenerationConfig,
     LexiconConfig,
     LLMConfig,
     NapCatConfig,
@@ -49,6 +51,8 @@ from qq_llm_bot.models import (
     TargetUserContext,
     UserProfileDraft,
 )
+from qq_llm_bot.image_generation import GeneratedImageStore
+from qq_llm_bot.llm import GeneratedImage, extract_generated_image, normalize_responses_url
 from qq_llm_bot.onebot_messages import (
     FORWARDED_RECORD_END,
     FORWARDED_RECORD_START,
@@ -66,11 +70,14 @@ class FakeLLM:
         self,
         replies: list[str] | None = None,
         vision_replies: list[str] | None = None,
+        image_replies: list[GeneratedImage | None] | None = None,
     ) -> None:
         self.replies = replies or []
         self.vision_replies = vision_replies or []
+        self.image_replies = image_replies or []
         self.text_calls: list[tuple[str, str]] = []
         self.vision_calls: list[list[str]] = []
+        self.image_calls: list[str] = []
 
     async def complete_text(self, system_prompt: str, user_prompt: str) -> str | None:
         self.text_calls.append((system_prompt, user_prompt))
@@ -88,6 +95,16 @@ class FakeLLM:
         self.vision_calls.append(image_urls)
         if self.vision_replies:
             return self.vision_replies.pop(0)
+        return None
+
+    async def generate_image(
+        self,
+        prompt: str,
+        image_config: ImageGenerationConfig,
+    ) -> GeneratedImage | None:
+        self.image_calls.append(prompt)
+        if self.image_replies:
+            return self.image_replies.pop(0)
         return None
 
 
@@ -161,6 +178,95 @@ def _first_attribute_call_line(node: ast.AST, attribute_name: str) -> int:
 class WebSearchTests(unittest.TestCase):
     def test_default_slang_query_uses_readable_chinese_terms(self) -> None:
         self.assertEqual(default_slang_query("内卷"), "内卷 网络用语 梗 意思")
+
+
+class ImageGenerationTests(unittest.TestCase):
+    def test_responses_url_is_derived_from_openai_compatible_base_url(self) -> None:
+        self.assertEqual(
+            normalize_responses_url("https://example.test/v1"),
+            "https://example.test/v1/responses",
+        )
+        self.assertEqual(
+            normalize_responses_url("https://example.test"),
+            "https://example.test/v1/responses",
+        )
+
+    def test_extract_generated_image_reads_responses_image_generation_call(self) -> None:
+        encoded = base64.b64encode(b"fake-png").decode("ascii")
+
+        image = extract_generated_image(
+            {"output": [{"type": "image_generation_call", "result": encoded}]}
+        )
+
+        self.assertIsNotNone(image)
+        self.assertEqual(image.data, b"fake-png")  # type: ignore[union-attr]
+        self.assertEqual(image.mime_type, "image/png")  # type: ignore[union-attr]
+
+    def test_generated_image_store_saves_single_image_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base_config = test_config(Path(tmp) / "bot.sqlite3")
+            config = replace(
+                base_config,
+                image_generation=ImageGenerationConfig(
+                    enabled=True,
+                    storage_dir="generated",
+                ),
+            )
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-draw",
+                plain_text="#draw cat",
+                raw_message="#draw cat",
+            )
+
+            saved = GeneratedImageStore(config).save(
+                context,
+                GeneratedImage(data=b"fake-png", mime_type="image/png"),
+            )
+
+            self.assertIsNotNone(saved)
+            self.assertTrue(Path(saved.local_path).exists())  # type: ignore[union-attr]
+            self.assertEqual(saved.file_ref, saved.local_path)  # type: ignore[union-attr]
+
+    def test_draw_command_exempts_admins_from_trust_and_daily_limit(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        self.assertIn("is_admin = storage.is_admin(user_id)", source)
+        self.assertIn(
+            "if not is_admin and relation.trust < config.image_generation.min_trust:",
+            source,
+        )
+        self.assertIn(
+            "if not is_admin and used_count >= config.image_generation.daily_limit:",
+            source,
+        )
+
+    def test_draw_command_retries_image_send_with_base64_fallback(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        self.assertIn("base64_ref = _generated_image_base64_ref(saved.local_path)", source)
+        self.assertIn('return "base64://" + base64.b64encode(data).decode("ascii")', source)
+
+    def test_draw_command_uses_persona_appearance_without_fixed_outfit_or_scene(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        plugin_source = (root / "plugins" / "llm_group_bot" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        config_source = (root / "qq_llm_bot" / "config.py").read_text(encoding="utf-8")
+        storage_source = (root / "qq_llm_bot" / "cognitive_storage.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("appearance_prompt: str = \"\"", config_source)
+        self.assertIn('"appearance_prompt": config.persona.appearance_prompt', storage_source)
+        self.assertIn("appearance_prompt 只约束人物样貌，不固定服装、场景", plugin_source)
 
 
 class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -1617,6 +1723,41 @@ class MemoryStorageTests(unittest.TestCase):
             storage.add_ignored_user("QQ:123")
             self.assertTrue(storage.is_user_ignored("123"))
             self.assertCountEqual(storage.list_ignored_users(), ["123", "7"])
+
+    def test_image_generation_usage_is_counted_by_user_and_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+
+            storage.record_image_generation_usage(
+                "100",
+                "42",
+                "2026-07-05",
+                "cat",
+                "data/generated_images/100/cat.png",
+                created_at=1,
+            )
+            storage.record_image_generation_usage(
+                "100",
+                "42",
+                "2026-07-05",
+                "dog",
+                "data/generated_images/100/dog.png",
+                created_at=2,
+            )
+            storage.record_image_generation_usage(
+                "100",
+                "42",
+                "2026-07-06",
+                "bird",
+                "data/generated_images/100/bird.png",
+                created_at=3,
+            )
+
+            self.assertEqual(storage.count_image_generation_usage("42", "2026-07-05"), 2)
+            self.assertEqual(storage.count_image_generation_usage("42", "2026-07-06"), 1)
+            self.assertEqual(storage.count_image_generation_usage("7", "2026-07-05"), 0)
 
     def test_group_handler_records_ignored_user_messages_before_skip(self) -> None:
         plugin_path = (

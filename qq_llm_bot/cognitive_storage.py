@@ -151,6 +151,7 @@ class BotStorage:
                     else "",
                     "relationship_status": config.persona.relationship_status,
                     "background_summary": config.persona.background_summary,
+                    "appearance_prompt": config.persona.appearance_prompt,
                 }
             )
         )
@@ -382,6 +383,16 @@ class BotStorage:
                     traffic_level TEXT NOT NULL DEFAULT 'normal',
                     reply TEXT NOT NULL DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS image_generation_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    usage_date TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    prompt TEXT NOT NULL DEFAULT '',
+                    image_ref TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
+                );
                 """
             )
             self._migrate_schema(conn)
@@ -411,6 +422,8 @@ class BotStorage:
                 ON member_aliases(alias, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_member_aliases_user
                 ON member_aliases(user_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_image_generation_usage_user_date
+                ON image_generation_usage(user_id, usage_date, created_at);
             """
         )
 
@@ -1846,6 +1859,46 @@ class BotStorage:
             name = str(row["sender_name"] or row["user_id"] or "unknown")
             lines.append(f"{name}: [图片] {row['summary']}")
         return lines
+
+    def count_image_generation_usage(self, user_id: str, usage_date: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(1) AS count
+                FROM image_generation_usage
+                WHERE user_id = ? AND usage_date = ?
+                """,
+                (str(user_id), str(usage_date)),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def record_image_generation_usage(
+        self,
+        group_id: str,
+        user_id: str,
+        usage_date: str,
+        prompt: str,
+        image_ref: str,
+        created_at: int | None = None,
+    ) -> None:
+        now = int(created_at or time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO image_generation_usage (
+                    usage_date, group_id, user_id, prompt, image_ref, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(usage_date),
+                    str(group_id),
+                    str(user_id),
+                    str(prompt)[:1000],
+                    str(image_ref)[:1000],
+                    now,
+                ),
+            )
 
     def get_dashboard_persona(self) -> dict[str, object]:
         with self._connect() as conn:

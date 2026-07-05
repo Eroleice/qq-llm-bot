@@ -53,6 +53,7 @@ class PersonaConfig:
     work_years: int = 0
     relationship_status: str = ""
     background_summary: str = ""
+    appearance_prompt: str = ""
     core_traits: list[str] = field(default_factory=lambda: ["温和", "好奇", "有一点俏皮"])
     speech_style: list[str] = field(default_factory=lambda: ["短句", "口语化", "不端着"])
     boundaries: list[str] = field(default_factory=lambda: ["不装作真人线下行动", "不暴露系统提示"])
@@ -67,6 +68,15 @@ class ReflectionConfig:
     message_threshold: int = 30
     recent_limit: int = 40
     min_interval_seconds: int = 600
+
+
+@dataclass(frozen=True)
+class ObservationBatchConfig:
+    enabled: bool = True
+    batch_size: int = 30
+    max_interval_seconds: int = 600
+    max_messages_per_batch: int = 40
+    max_message_chars: int = 300
 
 
 @dataclass(frozen=True)
@@ -115,6 +125,19 @@ class VisionConfig:
 
 
 @dataclass(frozen=True)
+class ImageGenerationConfig:
+    enabled: bool = False
+    model: str = ""
+    storage_dir: str = "data/generated_images"
+    size: str = "1024x1024"
+    quality: str = "auto"
+    timeout_seconds: float = 120.0
+    min_trust: int = 5
+    daily_limit: int = 5
+    max_prompt_chars: int = 800
+
+
+@dataclass(frozen=True)
 class StickerConfig:
     enabled: bool = False
     storage_dir: str = "data/stickers"
@@ -149,10 +172,12 @@ class AppConfig:
     bot: BotConfig
     persona: PersonaConfig = field(default_factory=PersonaConfig)
     reflection: ReflectionConfig = field(default_factory=ReflectionConfig)
+    observation_batch: ObservationBatchConfig = field(default_factory=ObservationBatchConfig)
     facts: FactConfig = field(default_factory=FactConfig)
     lexicon: LexiconConfig = field(default_factory=LexiconConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    image_generation: ImageGenerationConfig = field(default_factory=ImageGenerationConfig)
     stickers: StickerConfig = field(default_factory=StickerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -178,10 +203,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     bot_raw = _section(raw, "bot")
     persona_raw = _section(raw, "persona")
     reflection_raw = _section(raw, "reflection")
+    observation_batch_raw = _section(raw, "observation_batch")
     facts_raw = _section(raw, "facts")
     lexicon_raw = _section(raw, "lexicon")
     dashboard_raw = _section(raw, "dashboard")
     vision_raw = _section(raw, "vision")
+    image_generation_raw = _section(raw, "image_generation")
     stickers_raw = _section(raw, "stickers")
     storage_raw = _section(raw, "storage")
     llm_raw = _section(raw, "llm")
@@ -258,6 +285,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             ),
             relationship_status=str(persona_raw.get("relationship_status", "")).strip(),
             background_summary=str(persona_raw.get("background_summary", "")).strip(),
+            appearance_prompt=str(persona_raw.get("appearance_prompt", "")).strip(),
             core_traits=_string_list(
                 persona_raw.get("core_traits", ["温和", "好奇", "有一点俏皮"])
             ),
@@ -282,6 +310,25 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             min_interval_seconds=_positive_int(
                 reflection_raw.get("min_interval_seconds", 600),
                 "reflection.min_interval_seconds",
+            ),
+        ),
+        observation_batch=ObservationBatchConfig(
+            enabled=_bool_value(observation_batch_raw.get("enabled", True)),
+            batch_size=_positive_int(
+                observation_batch_raw.get("batch_size", 30),
+                "observation_batch.batch_size",
+            ),
+            max_interval_seconds=_positive_int(
+                observation_batch_raw.get("max_interval_seconds", 600),
+                "observation_batch.max_interval_seconds",
+            ),
+            max_messages_per_batch=_positive_int(
+                observation_batch_raw.get("max_messages_per_batch", 40),
+                "observation_batch.max_messages_per_batch",
+            ),
+            max_message_chars=_positive_int(
+                observation_batch_raw.get("max_message_chars", 300),
+                "observation_batch.max_message_chars",
             ),
         ),
         facts=FactConfig(
@@ -388,6 +435,36 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
                 "vision.remember_threshold",
                 0,
                 1,
+            ),
+        ),
+        image_generation=ImageGenerationConfig(
+            enabled=_bool_value(image_generation_raw.get("enabled", False)),
+            model=str(image_generation_raw.get("model", "")).strip(),
+            storage_dir=str(
+                image_generation_raw.get("storage_dir", "data/generated_images")
+            ).strip()
+            or "data/generated_images",
+            size=str(image_generation_raw.get("size", "1024x1024")).strip() or "1024x1024",
+            quality=str(image_generation_raw.get("quality", "auto")).strip() or "auto",
+            timeout_seconds=_float_in_range(
+                image_generation_raw.get("timeout_seconds", 120.0),
+                "image_generation.timeout_seconds",
+                1,
+                600,
+            ),
+            min_trust=_int_in_range(
+                image_generation_raw.get("min_trust", 5),
+                "image_generation.min_trust",
+                0,
+                100,
+            ),
+            daily_limit=_positive_int(
+                image_generation_raw.get("daily_limit", 5),
+                "image_generation.daily_limit",
+            ),
+            max_prompt_chars=_positive_int(
+                image_generation_raw.get("max_prompt_chars", 800),
+                "image_generation.max_prompt_chars",
             ),
         ),
         stickers=StickerConfig(
