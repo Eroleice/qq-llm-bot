@@ -389,6 +389,40 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(tool["output_format"], "jpeg")
         self.assertEqual(tool["output_compression"], 65)
 
+    def test_processing_ack_uses_napcat_emoji_like_action(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        self.assertIn('_PROCESSING_ACK_EMOJI_ID = "124"', source)
+        self.assertIn('"set_msg_emoji_like"', source)
+        self.assertIn("await bot.call_api(", source)
+
+    def test_draw_command_acknowledges_before_slow_processing(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        ack_position = source.index('await _acknowledge_processing(bot, event.message_id, "draw")')
+        prompt_position = source.index("image_prompt = await _compose_draw_prompt")
+
+        self.assertLess(ack_position, prompt_position)
+
+    def test_realtime_pipeline_acknowledges_before_llm_work(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        ack_position = source.index(
+            'await _acknowledge_processing(bot, context.message_id, "realtime pipeline")'
+        )
+        pipeline_position = source.index("result = await pipeline.run")
+
+        self.assertLess(ack_position, pipeline_position)
+
     def test_draw_command_exempts_admins_from_trust_and_daily_limit(self) -> None:
         plugin_path = (
             Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"

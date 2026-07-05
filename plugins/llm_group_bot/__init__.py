@@ -86,11 +86,36 @@ user_reject_cmd = on_command("reject", priority=5, block=True)
 draw_cmd = on_command("draw", priority=5, block=True)
 
 _command_reply_message_id: ContextVar[str] = ContextVar("command_reply_message_id", default="")
+_PROCESSING_ACK_EMOJI_ID = "124"  # QQ [OK]
 _DRAW_FAILURE_REPLY = "哎呀，图片不见了，我的我的~"
 
 
 def _remember_command_reply(event: GroupMessageEvent) -> None:
     _command_reply_message_id.set(str(getattr(event, "message_id", "") or ""))
+
+
+async def _acknowledge_processing(bot: Bot, message_id: object, reason: str) -> None:
+    target_message_id = _onebot_message_id(message_id)
+    if target_message_id is None:
+        return
+    try:
+        await bot.call_api(
+            "set_msg_emoji_like",
+            message_id=target_message_id,
+            emoji_id=_PROCESSING_ACK_EMOJI_ID,
+        )
+    except Exception as exc:  # pragma: no cover - depends on NapCat extension availability
+        logger.warning("Processing acknowledgement failed for {}: {}", reason, exc)
+
+
+def _onebot_message_id(message_id: object) -> int | str | None:
+    text = str(message_id or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
 
 
 async def _finish_command(matcher: Any, message: Message | str) -> None:
@@ -117,7 +142,11 @@ def _with_command_reply(message: Message | str) -> Message | str:
 
 
 @admin_cmd.handle()
-async def _handle_admin_command(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
+async def _handle_admin_command(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Message = CommandArg(),
+) -> None:
     _remember_command_reply(event)
     user_id = str(event.user_id)
     group_id = str(event.group_id)
@@ -179,7 +208,7 @@ async def _handle_admin_command(event: GroupMessageEvent, args: Message = Comman
         await _handle_persona(rest)
 
     if topic == "llm":
-        await _handle_llm(rest)
+        await _handle_llm(bot, event, rest)
 
     if topic == "why":
         await _finish_command(admin_cmd, storage.get_last_decision(group_id))
@@ -285,6 +314,8 @@ async def _handle_draw_command(
             draw_cmd,
             f"今天的生图次数已经用完了（{used_count}/{config.image_generation.daily_limit}）。",
         )
+
+    await _acknowledge_processing(bot, event.message_id, "draw")
 
     context = await _build_context(bot, event)
     storage.record_message(context)
@@ -408,6 +439,8 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if _should_defer_realtime_pipeline(context, mode):
         await _defer_observation(context, mode)
         return
+
+    await _acknowledge_processing(bot, context.message_id, "realtime pipeline")
 
     await _flush_observation_batch(group_id)
     snapshot = storage.build_snapshot(context)
@@ -782,7 +815,7 @@ async def _handle_persona_self(rest: list[str]) -> None:
     await _finish_command(admin_cmd, _persona_help_text())
 
 
-async def _handle_llm(rest: list[str]) -> None:
+async def _handle_llm(bot: Bot, event: GroupMessageEvent, rest: list[str]) -> None:
     action = rest[0].lower() if rest else "status"
     if action == "status":
         provider = config.llm.provider
@@ -817,6 +850,7 @@ async def _handle_llm(rest: list[str]) -> None:
 
     if action == "test":
         prompt = " ".join(rest[1:]).strip() or "用一句话自然地打个招呼。"
+        await _acknowledge_processing(bot, event.message_id, "llm test")
         reply = await llm.complete_text(
             "你是 QQ 群里的拟人角色，说话自然、简短。",
             prompt,
