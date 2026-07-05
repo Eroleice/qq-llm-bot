@@ -91,6 +91,49 @@ def register_dashboard_routes(
         _ensure_authorized(request, config)
         return {"items": storage.list_dashboard_pending(limit=_clamp_limit(limit, 10, 300))}
 
+    @app.post(f"{api_prefix}/pending/bulk")
+    async def dashboard_bulk_pending(request: Request) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        payload = await _request_json(request)
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"approve", "reject"}:
+            raise HTTPException(status_code=400, detail="action must be approve or reject")
+        raw_items = payload.get("items", [])
+        if not isinstance(raw_items, list) or not raw_items:
+            raise HTTPException(status_code=400, detail="items are required")
+
+        changed_user_ids: list[str] = []
+        results: list[dict[str, object]] = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                results.append({"ok": False, "detail": "invalid item"})
+                continue
+            item_type = str(raw_item.get("item_type") or raw_item.get("type") or "memory").strip()
+            try:
+                item_id = int(raw_item.get("id", 0))
+            except (TypeError, ValueError):
+                results.append({"ok": False, "item_type": item_type, "detail": "invalid id"})
+                continue
+
+            if item_type == "fact":
+                if action == "approve":
+                    record = storage.approve_fact(item_id)
+                    ok = record is not None
+                    if record is not None and record.subject_user_id:
+                        changed_user_ids.append(record.subject_user_id)
+                else:
+                    ok = storage.reject_fact(item_id)
+            elif item_type == "memory":
+                ok = storage.approve_memory(item_id) if action == "approve" else storage.reject_memory(item_id)
+            else:
+                ok = False
+            results.append({"ok": ok, "item_type": item_type, "id": item_id})
+
+        if changed_user_ids and on_fact_changed is not None:
+            await on_fact_changed(changed_user_ids)
+        success_count = sum(1 for item in results if item.get("ok"))
+        return {"ok": success_count > 0, "count": success_count, "results": results}
+
     @app.post(f"{api_prefix}/facts/{{fact_id}}/approve")
     async def dashboard_approve_fact(request: Request, fact_id: int) -> dict[str, object]:
         _ensure_authorized(request, config)
@@ -206,6 +249,16 @@ def _ensure_authorized(request: Request, config: AppConfig) -> None:
 
 def _dashboard_token(config: AppConfig) -> str:
     return config.dashboard.access_token or os.getenv(config.dashboard.access_token_env, "")
+
+
+async def _request_json(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid json body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="json body must be an object")
+    return payload
 
 
 async def _notify_fact_changed(
@@ -357,6 +410,13 @@ _DASHBOARD_HTML = r"""<!doctype html>
       color: var(--text);
       min-width: 150px;
     }
+    input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      min-width: 0;
+      padding: 0;
+      accent-color: var(--accent);
+    }
     button {
       height: 34px;
       border: 1px solid var(--line);
@@ -447,6 +507,17 @@ _DASHBOARD_HTML = r"""<!doctype html>
       gap: 8px;
       margin-top: 10px;
       align-items: center;
+    }
+    .pending-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .selection-count {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
     }
     .sticker-grid {
       display: grid;
@@ -560,6 +631,11 @@ _DASHBOARD_HTML = r"""<!doctype html>
         <div class="toolbar">
           <label>数量<input id="pendingLimit" type="number" value="100" min="10" max="300" /></label>
           <button class="primary" id="loadPendingBtn">刷新</button>
+          <button id="selectAllPendingBtn">全选</button>
+          <button id="clearPendingSelectionBtn">清空选择</button>
+          <button class="primary" id="bulkApprovePendingBtn">批量批准</button>
+          <button class="danger" id="bulkRejectPendingBtn">批量驳回</button>
+          <span id="pendingSelectionText" class="muted selection-count">已选 0 条</span>
         </div>
         <div id="pendingList"></div>
       </div>
@@ -600,6 +676,10 @@ _DASHBOARD_HTML = r"""<!doctype html>
     document.getElementById("loadMessagesBtn").addEventListener("click", loadMessages);
     document.getElementById("loadStickersBtn").addEventListener("click", loadStickers);
     document.getElementById("loadPendingBtn").addEventListener("click", loadPending);
+    document.getElementById("selectAllPendingBtn").addEventListener("click", selectAllPending);
+    document.getElementById("clearPendingSelectionBtn").addEventListener("click", clearPendingSelection);
+    document.getElementById("bulkApprovePendingBtn").addEventListener("click", () => bulkManagePending("approve"));
+    document.getElementById("bulkRejectPendingBtn").addEventListener("click", () => bulkManagePending("reject"));
 
     async function api(path, params = {}, options = {}) {
       const url = new URL(API_PREFIX + path, location.origin);
@@ -912,6 +992,48 @@ _DASHBOARD_HTML = r"""<!doctype html>
       if (itemType === "fact") return manageFact(itemId, action);
       return manageMemory(itemId, action);
     }
+    function pendingCheckboxes() {
+      return Array.from(document.querySelectorAll(".pending-check"));
+    }
+    function selectedPendingItems() {
+      return pendingCheckboxes()
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => ({
+          id: Number(checkbox.dataset.itemId),
+          item_type: checkbox.dataset.itemType || "memory",
+        }))
+        .filter((item) => Number.isFinite(item.id) && item.id > 0);
+    }
+    function updatePendingSelection() {
+      const count = selectedPendingItems().length;
+      document.getElementById("pendingSelectionText").textContent = `已选 ${count} 条`;
+    }
+    function selectAllPending() {
+      pendingCheckboxes().forEach((checkbox) => {
+        checkbox.checked = true;
+      });
+      updatePendingSelection();
+    }
+    function clearPendingSelection() {
+      pendingCheckboxes().forEach((checkbox) => {
+        checkbox.checked = false;
+      });
+      updatePendingSelection();
+    }
+    async function bulkManagePending(action) {
+      const items = selectedPendingItems();
+      if (!items.length) {
+        setStatus("请先选择 pending 项");
+        return;
+      }
+      const label = action === "approve" ? "批准" : "驳回";
+      if (!confirm(`确认${label}选中的 ${items.length} 条 pending？`)) return;
+      await runAction(
+        "/pending/bulk",
+        { method: "POST", body: { action, items } },
+        `已${label} ${items.length} 条 pending`
+      );
+    }
     async function setStickerEnabled(stickerId, enabled) {
       await runAction(
         `/stickers/${encodeURIComponent(stickerId)}/${enabled ? "enable" : "disable"}`,
@@ -980,12 +1102,26 @@ _DASHBOARD_HTML = r"""<!doctype html>
           limit: document.getElementById("pendingLimit").value,
         });
         const items = data.items || [];
-        if (!items.length) return renderEmpty("pendingList", "暂无待确认 FACT 或冲突记忆。");
-        document.getElementById("pendingList").innerHTML = items.map((item) => `
+        if (!items.length) {
+          renderEmpty("pendingList", "暂无待确认 FACT 或冲突记忆。");
+          updatePendingSelection();
+          return;
+        }
+        document.getElementById("pendingList").innerHTML = items.map((item) => {
+          const itemType = item.item_type || "memory";
+          return `
           <div class="item">
-            <div>
+            <div class="pending-title">
+              <input
+                class="pending-check"
+                type="checkbox"
+                data-item-id="${Number(item.id)}"
+                data-item-type="${escapeHtml(itemType)}"
+                onchange="updatePendingSelection()"
+                aria-label="选择 pending #${escapeHtml(item.id)}"
+              />
               <span class="pill">#${item.id}</span>
-              <span class="pill">${escapeHtml(item.item_type || "memory")}</span>
+              <span class="pill">${escapeHtml(itemType)}</span>
               <span class="pill">${
                 item.item_type === "fact"
                   ? `user:${escapeHtml(item.subject_user_id)}`
@@ -1001,15 +1137,17 @@ _DASHBOARD_HTML = r"""<!doctype html>
               · ${formatTime(item.updated_at)}
             </div>
             <div class="commands">
-              <button class="primary" onclick="managePending('${escapeHtml(item.item_type || "memory")}', ${Number(item.id)}, 'approve')">批准</button>
-              <button class="danger" onclick="managePending('${escapeHtml(item.item_type || "memory")}', ${Number(item.id)}, 'reject')">拒绝</button>
+              <button class="primary" onclick="managePending('${escapeHtml(itemType)}', ${Number(item.id)}, 'approve')">批准</button>
+              <button class="danger" onclick="managePending('${escapeHtml(itemType)}', ${Number(item.id)}, 'reject')">拒绝</button>
               <code>${escapeHtml(item.approve_command)}</code>
               <button onclick="copyText('${escapeHtml(item.approve_command)}')">复制批准</button>
               <code>${escapeHtml(item.reject_command)}</code>
               <button onclick="copyText('${escapeHtml(item.reject_command)}')">复制拒绝</button>
             </div>
           </div>
-        `).join("");
+        `;
+        }).join("");
+        updatePendingSelection();
         setStatus(`Pending ${items.length} 条`);
       } catch (error) {
         showError(error);

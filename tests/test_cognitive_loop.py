@@ -3257,6 +3257,115 @@ class MemoryStorageTests(unittest.TestCase):
                     [],
                 )
 
+    def test_dashboard_api_can_bulk_manage_pending_items(self) -> None:
+        FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            changed_users: list[str] = []
+
+            async def on_fact_changed(user_ids: list[str]) -> None:
+                changed_users.extend(user_ids)
+
+            app = FastAPI()
+            register_dashboard_routes(
+                FakeDashboardDriver(app),
+                storage,
+                config,
+                on_fact_changed=on_fact_changed,
+            )
+            fact_write = storage.record_fact_candidates(
+                [
+                    FactCandidate(
+                        subject_user_id="77",
+                        fact_type="preference",
+                        claim_text="user 77 likes seaside",
+                        topic="seaside",
+                        stance="positive",
+                        confidence=0.86,
+                        evidence_message_id="m1",
+                        evidence_text="77 likes seaside",
+                        source_user_id="42",
+                        source_group_id="100",
+                        claim_scope="third_party",
+                    ),
+                    FactCandidate(
+                        subject_user_id="88",
+                        fact_type="preference",
+                        claim_text="user 88 likes shrimp",
+                        topic="shrimp",
+                        stance="positive",
+                        confidence=0.86,
+                        evidence_message_id="m2",
+                        evidence_text="88 likes shrimp",
+                        source_user_id="42",
+                        source_group_id="100",
+                        claim_scope="third_party",
+                    ),
+                ]
+            )
+            storage.record_memory_candidates(
+                [
+                    MemoryCandidate(
+                        owner_type="user",
+                        owner_id="name:alice",
+                        kind="preference",
+                        content="likes fish",
+                        confidence=0.86,
+                        importance=0.5,
+                        evidence_message_id="m3",
+                        source_user_id="42",
+                        source_group_id="100",
+                        subject_user_id="name:alice",
+                        claim_scope="third_party",
+                    )
+                ]
+            )
+            memory_id = storage.list_memories(
+                "user",
+                "name:alice",
+                status="pending_confirmation",
+            )[0].id
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/dashboard/pending/bulk",
+                    json={
+                        "action": "approve",
+                        "items": [
+                            {"item_type": "fact", "id": fact_write.pending[0].id},
+                            {"item_type": "memory", "id": memory_id},
+                        ],
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["count"], 2)
+                self.assertEqual(
+                    storage.get_fact_record(fact_write.pending[0].id).status,  # type: ignore[union-attr]
+                    "accepted",
+                )
+                self.assertEqual(
+                    storage.list_memories("user", "name:alice", status="active")[0].id,
+                    memory_id,
+                )
+
+                response = client.post(
+                    "/api/dashboard/pending/bulk",
+                    json={
+                        "action": "reject",
+                        "items": [{"item_type": "fact", "id": fact_write.pending[1].id}],
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["count"], 1)
+                self.assertEqual(
+                    storage.get_fact_record(fact_write.pending[1].id).status,  # type: ignore[union-attr]
+                    "rejected",
+                )
+
+            self.assertEqual(changed_users, ["77"])
+
     def test_dashboard_api_deletes_sticker_asset_and_file(self) -> None:
         FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
         with tempfile.TemporaryDirectory() as tmp:
