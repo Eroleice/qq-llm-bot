@@ -36,6 +36,8 @@ LLMUsageRecorder = Callable[[LLMUsageRecord], None]
 
 
 class LLMClient(Protocol):
+    last_image_generation_error: str
+
     async def complete_text(
         self,
         system_prompt: str,
@@ -63,6 +65,8 @@ class LLMClient(Protocol):
 
 
 class DisabledLLMClient:
+    last_image_generation_error = "llm.provider=disabled"
+
     async def complete_text(
         self,
         system_prompt: str,
@@ -102,6 +106,8 @@ class OpenAICompatibleLLMClient:
             normalize_chat_completions_url(config.base_url) if config.base_url else ""
         )
         self.responses_url = normalize_responses_url(config.base_url) if config.base_url else ""
+        self.last_image_generation_error = ""
+        self._last_image_generation_failure_kind = ""
 
     async def complete_text(
         self,
@@ -178,8 +184,11 @@ class OpenAICompatibleLLMClient:
         prompt: str,
         image_config: ImageGenerationConfig,
     ) -> GeneratedImage | None:
+        self.last_image_generation_error = ""
+        self._last_image_generation_failure_kind = ""
         missing = self._missing_config_items()
         if missing:
+            self.last_image_generation_error = "missing: " + ", ".join(missing)
             logger.warning(
                 "LLM image generation is not configured; missing: {}",
                 ", ".join(missing),
@@ -187,20 +196,39 @@ class OpenAICompatibleLLMClient:
             return None
         clean_prompt = prompt.strip()
         if not clean_prompt:
+            self.last_image_generation_error = "empty prompt"
             return None
 
-        tool: dict[str, str] = {"type": "image_generation"}
+        tool: dict[str, object] = {"type": "image_generation"}
         if image_config.size:
             tool["size"] = image_config.size
         if image_config.quality:
             tool["quality"] = image_config.quality
+        if image_config.output_format:
+            tool["output_format"] = image_config.output_format
+        if image_config.output_compression:
+            tool["output_compression"] = image_config.output_compression
         payload = {
             "model": image_config.model or self.config.model,
             "input": clean_prompt,
             "tools": [tool],
             "tool_choice": {"type": "image_generation"},
         }
-        return await self._post_image_generation_response(payload, image_config.timeout_seconds)
+        for attempt in range(1, 3):
+            generated = await self._post_image_generation_response(
+                payload,
+                image_config.timeout_seconds,
+            )
+            if generated is not None:
+                return generated
+            if attempt == 1 and self._last_image_generation_failure_kind == "no_image":
+                logger.warning(
+                    "Retrying image generation once after response without image result: {}",
+                    self.last_image_generation_error,
+                )
+                continue
+            break
+        return None
 
     async def _post_chat_completion(
         self,
@@ -260,6 +288,11 @@ class OpenAICompatibleLLMClient:
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500]
             request_id = _response_request_id(exc.response)
+            self._last_image_generation_failure_kind = "http_error"
+            self.last_image_generation_error = (
+                f"http_status={exc.response.status_code} request_id={request_id or '(none)'} "
+                f"body={body}"
+            )
             logger.warning(
                 "LLM image generation HTTP error: status={} request_id={} body={}",
                 exc.response.status_code,
@@ -268,20 +301,34 @@ class OpenAICompatibleLLMClient:
             )
             return None
         except httpx.HTTPError as exc:
+            self._last_image_generation_failure_kind = "request_error"
+            self.last_image_generation_error = f"request_error={type(exc).__name__}: {exc}"
             logger.warning("LLM image generation request failed: {}", exc)
             return None
 
         try:
             data = response.json()
         except (KeyError, TypeError, ValueError) as exc:
+            self._last_image_generation_failure_kind = "parse_error"
+            self.last_image_generation_error = f"json_parse_error={type(exc).__name__}: {exc}"
             logger.warning("LLM image generation response parse failed: {}", exc)
             return None
         try:
             generated = extract_generated_image(data)
         except (KeyError, TypeError, ValueError) as exc:
+            self._last_image_generation_failure_kind = "parse_error"
+            self.last_image_generation_error = (
+                f"image_parse_error={type(exc).__name__}: {exc}; "
+                f"{_image_generation_failure_summary(data, response)}"
+            )
             logger.warning("LLM image generation response parse failed: {}", exc)
             return None
         if generated is None:
+            self._last_image_generation_failure_kind = "no_image"
+            self.last_image_generation_error = _image_generation_failure_summary(
+                data,
+                response,
+            )
             logger.warning(
                 "LLM image generation response had no image result: request_id={} "
                 "status={} error={} incomplete_details={} output_types={} body={}",
@@ -451,6 +498,39 @@ def _response_output_types(data: dict) -> list[str]:
         if isinstance(item, dict):
             types.append(str(item.get("type", "")) or "(missing)")
     return types
+
+
+def _image_generation_failure_summary(data: dict, response: httpx.Response) -> str:
+    return (
+        f"request_id={_response_request_id(response) or '(none)'} "
+        f"status={data.get('status') or '(missing)'} "
+        f"error={_compact_json(data.get('error'))} "
+        f"incomplete={_compact_json(data.get('incomplete_details'))} "
+        f"output={_response_output_summary(data)}"
+    )
+
+
+def _response_output_summary(data: dict) -> str:
+    parts = []
+    for item in data.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        keys = ",".join(str(key) for key in item.keys())
+        result = item.get("result")
+        result_state = "present" if result else "empty"
+        parts.append(
+            f"{item.get('type') or '(missing)'}"
+            f"/status={item.get('status') or '(none)'}"
+            f"/result={result_state}"
+            f"/keys={keys}"
+        )
+    return "[" + "; ".join(parts)[:700] + "]"
+
+
+def _compact_json(value: object) -> str:
+    if value in (None, "", [], {}):
+        return "(none)"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))[:300]
 
 
 def _json_preview(data: dict, limit: int = 800) -> str:

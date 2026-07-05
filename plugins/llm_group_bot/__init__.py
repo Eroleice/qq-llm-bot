@@ -301,15 +301,17 @@ async def _handle_draw_command(
 
     generated = await llm.generate_image(image_prompt, config.image_generation)
     if generated is None:
+        detail = str(getattr(llm, "last_image_generation_error", "") or "")
         logger.warning(
-            "Draw image generation returned no image: group={} user={} message={}",
+            "Draw image generation returned no image: group={} user={} message={} detail={}",
             group_id,
             user_id,
             context.message_id,
+            detail,
         )
         await _finish_command(
             draw_cmd,
-            _draw_failure_reply("Responses image_generation 没有返回图片", is_admin),
+            _draw_failure_reply("Responses image_generation 没有返回图片", is_admin, detail),
         )
     saved = generated_image_store.save(context, generated)
     if saved is None:
@@ -806,7 +808,11 @@ async def _handle_llm(rest: list[str]) -> None:
             f"image_generation_enabled={config.image_generation.enabled}\n"
             f"image_generation_model={image_model}\n"
             f"image_generation_size={config.image_generation.size}\n"
-            f"image_generation_quality={config.image_generation.quality}"
+            f"image_generation_quality={config.image_generation.quality}\n"
+            f"image_generation_format={config.image_generation.output_format}\n"
+            f"image_generation_compression={config.image_generation.output_compression}\n"
+            f"image_generation_timeout={config.image_generation.timeout_seconds}\n"
+            f"image_generation_max_send_dimension={config.image_generation.max_send_dimension}"
         )
 
     if action == "test":

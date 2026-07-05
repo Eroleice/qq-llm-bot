@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import base64
+import io
 import json
 import sqlite3
 import tempfile
@@ -37,6 +39,7 @@ from qq_llm_bot.config import (
     StorageConfig,
     StickerConfig,
     VisionConfig,
+    load_config,
 )
 from qq_llm_bot.models import (
     ConversationSnapshot,
@@ -59,6 +62,7 @@ from qq_llm_bot.image_generation import GeneratedImageStore
 from qq_llm_bot.llm import (
     GeneratedImage,
     LLMUsageRecord,
+    OpenAICompatibleLLMClient,
     extract_generated_image,
     normalize_responses_url,
 )
@@ -88,6 +92,7 @@ class FakeLLM:
         self.text_call_purposes: list[str] = []
         self.vision_calls: list[list[str]] = []
         self.image_calls: list[str] = []
+        self.last_image_generation_error = ""
 
     async def complete_text(
         self,
@@ -282,6 +287,108 @@ class ImageGenerationTests(unittest.TestCase):
             self.assertTrue(Path(saved.local_path).exists())  # type: ignore[union-attr]
             self.assertEqual(saved.file_ref, saved.local_path)  # type: ignore[union-attr]
 
+    def test_generated_image_store_compresses_large_images_for_chat(self) -> None:
+        try:
+            from PIL import Image
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest("Pillow is not installed in this environment") from exc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = io.BytesIO()
+            Image.new("RGB", (1400, 1000), "white").save(source, format="PNG")
+            base_config = test_config(Path(tmp) / "bot.sqlite3")
+            config = replace(
+                base_config,
+                image_generation=ImageGenerationConfig(
+                    enabled=True,
+                    storage_dir="generated",
+                    output_format="jpeg",
+                    output_compression=65,
+                    max_send_dimension=512,
+                ),
+            )
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-draw",
+                plain_text="#draw cat",
+                raw_message="#draw cat",
+            )
+
+            saved = GeneratedImageStore(config).save(
+                context,
+                GeneratedImage(data=source.getvalue(), mime_type="image/png"),
+            )
+
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved.mime_type, "image/jpeg")  # type: ignore[union-attr]
+            with Image.open(saved.local_path) as image:  # type: ignore[arg-type, union-attr]
+                self.assertLessEqual(max(image.size), 512)
+                self.assertEqual(image.format, "JPEG")
+
+    def test_image_generation_config_uses_small_chat_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "[napcat]",
+                        'ws_url = "ws://example.test"',
+                        "",
+                        "[image_generation]",
+                        'size = "1024x1024"',
+                        'quality = "auto"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.image_generation.size, "832x832")
+            self.assertEqual(config.image_generation.output_format, "jpeg")
+            self.assertEqual(config.image_generation.output_compression, 65)
+            self.assertEqual(config.image_generation.timeout_seconds, 240.0)
+            self.assertEqual(config.image_generation.max_send_dimension, 832)
+
+    def test_image_generation_retries_once_when_response_has_no_image(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="openai-compatible",
+                model="gpt-image-test",
+                base_url="https://example.test/v1",
+                api_key="test-key",
+            )
+        )
+        calls = 0
+        captured_payload: dict = {}
+
+        async def fake_post_image_generation_response(
+            payload: dict,
+            timeout_seconds: float,
+        ) -> GeneratedImage | None:
+            nonlocal calls
+            calls += 1
+            captured_payload.update(payload)
+            if calls == 1:
+                client._last_image_generation_failure_kind = "no_image"  # type: ignore[attr-defined]
+                client.last_image_generation_error = "output=[message/result=empty]"
+                return None
+            return GeneratedImage(data=b"fake-png", mime_type="image/png")
+
+        client._post_image_generation_response = fake_post_image_generation_response  # type: ignore[method-assign]
+
+        image = asyncio.run(client.generate_image("cat", ImageGenerationConfig()))
+
+        self.assertIsNotNone(image)
+        self.assertEqual(image.data, b"fake-png")  # type: ignore[union-attr]
+        self.assertEqual(calls, 2)
+        tool = captured_payload["tools"][0]
+        self.assertEqual(tool["size"], "512x512")
+        self.assertEqual(tool["quality"], "low")
+        self.assertEqual(tool["output_format"], "jpeg")
+        self.assertEqual(tool["output_compression"], 65)
+
     def test_draw_command_exempts_admins_from_trust_and_daily_limit(self) -> None:
         plugin_path = (
             Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
@@ -306,6 +413,18 @@ class ImageGenerationTests(unittest.TestCase):
 
         self.assertIn("base64_ref = _generated_image_base64_ref(saved.local_path)", source)
         self.assertIn('return "base64://" + base64.b64encode(data).decode("ascii")', source)
+
+    def test_draw_command_reports_image_generation_failure_detail_to_admins(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        self.assertIn('getattr(llm, "last_image_generation_error"', source)
+        self.assertIn(
+            '_draw_failure_reply("Responses image_generation 没有返回图片", is_admin, detail)',
+            source,
+        )
 
     def test_draw_command_uses_persona_appearance_without_fixed_outfit_or_scene(self) -> None:
         root = Path(__file__).resolve().parents[1]

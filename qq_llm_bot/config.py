@@ -129,9 +129,12 @@ class ImageGenerationConfig:
     enabled: bool = False
     model: str = ""
     storage_dir: str = "data/generated_images"
-    size: str = "1024x1024"
-    quality: str = "auto"
-    timeout_seconds: float = 120.0
+    size: str = "512x512"
+    quality: str = "low"
+    output_format: str = "jpeg"
+    output_compression: int = 65
+    timeout_seconds: float = 240.0
+    max_send_dimension: int = 832
     min_trust: int = 5
     daily_limit: int = 5
     max_prompt_chars: int = 800
@@ -444,13 +447,37 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
                 image_generation_raw.get("storage_dir", "data/generated_images")
             ).strip()
             or "data/generated_images",
-            size=str(image_generation_raw.get("size", "1024x1024")).strip() or "1024x1024",
-            quality=str(image_generation_raw.get("quality", "auto")).strip() or "auto",
+            size=_image_generation_size(
+                image_generation_raw.get("size", "512x512"),
+                max_dimension=832,
+            ),
+            quality=_safe_choice(
+                str(image_generation_raw.get("quality", "low")).strip().lower(),
+                {"low", "medium", "high", "auto"},
+                "low",
+            ),
+            output_format=_safe_choice(
+                str(image_generation_raw.get("output_format", "jpeg")).strip().lower(),
+                {"jpeg", "png", "webp"},
+                "jpeg",
+            ),
+            output_compression=_int_in_range(
+                image_generation_raw.get("output_compression", 65),
+                "image_generation.output_compression",
+                1,
+                100,
+            ),
             timeout_seconds=_float_in_range(
-                image_generation_raw.get("timeout_seconds", 120.0),
+                image_generation_raw.get("timeout_seconds", 240.0),
                 "image_generation.timeout_seconds",
                 1,
-                600,
+                900,
+            ),
+            max_send_dimension=_int_in_range(
+                image_generation_raw.get("max_send_dimension", 832),
+                "image_generation.max_send_dimension",
+                256,
+                2048,
             ),
             min_trust=_int_in_range(
                 image_generation_raw.get("min_trust", 5),
@@ -576,6 +603,26 @@ def _route_prefix(value: Any) -> str:
     if not prefix.startswith("/"):
         prefix = "/" + prefix
     return prefix.rstrip("/") or "/"
+
+
+def _image_generation_size(value: Any, max_dimension: int) -> str:
+    fallback = "512x512"
+    raw = str(value).strip().lower()
+    if "x" not in raw:
+        return fallback
+    width_raw, height_raw = raw.split("x", 1)
+    try:
+        width = int(width_raw)
+        height = int(height_raw)
+    except ValueError:
+        return fallback
+    if width <= 0 or height <= 0:
+        return fallback
+    width = min(width, max_dimension)
+    height = min(height, max_dimension)
+    width = max(16, (width // 16) * 16)
+    height = max(16, (height // 16) * 16)
+    return f"{width}x{height}"
 
 
 def _safe_choice(value: str, allowed: set[str], fallback: str) -> str:
