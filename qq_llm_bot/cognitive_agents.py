@@ -8,7 +8,7 @@ from typing import Any, Iterable, Protocol
 
 from loguru import logger
 
-from qq_llm_bot.config import AppConfig, ParticipationMode
+from qq_llm_bot.config import AppConfig, ParticipationMode, VisionConfig
 from qq_llm_bot.llm import LLMClient
 from qq_llm_bot.models import (
     ConversationSnapshot,
@@ -956,6 +956,7 @@ class VisionAgent:
         fresh_results: dict[str, VisionImageResult] = {}
         if missing_urls:
             sticker_prompt = self._sticker_prompt()
+            direct_image_hint = _vision_direct_image_hint(context, missing_urls)
             data = await _complete_vision_json(
                 self.llm,
                 self.config,
@@ -984,6 +985,8 @@ class VisionAgent:
                 ),
                 missing_urls,
                 purpose="vision",
+                model_tier="flagship" if direct_image_hint else "",
+                direct_image_hint=direct_image_hint,
             )
             if data:
                 fresh_results = self._parse_fresh_results(missing_urls, data)
@@ -2104,6 +2107,9 @@ class FinalQAAgent:
                 f"机器人拟发送文本：{cleaned_reply}"
             ),
             purpose="final_qa",
+            model_tier="flagship"
+            if _final_qa_requires_flagship(context, decision, snapshot, cleaned_reply)
+            else "",
         )
         if data:
             verdict = str(data.get("verdict", "block")).strip().lower()
@@ -2722,15 +2728,62 @@ async def _complete_json(
     system_prompt: str,
     user_prompt: str,
     purpose: str = "structured_json",
+    model_tier: str = "",
+    allow_flagship_retry: bool = True,
 ) -> dict[str, Any] | None:
-    text = await llm.complete_text(system_prompt, user_prompt, purpose=purpose)
+    text = await llm.complete_text(
+        system_prompt,
+        user_prompt,
+        purpose=purpose,
+        model_tier=model_tier,
+    )
     if not text:
+        if _can_retry_text_with_flagship(llm, purpose, model_tier, allow_flagship_retry):
+            logger.info("Retrying structured LLM JSON with flagship model: purpose={} reason=empty", purpose)
+            return await _complete_json(
+                llm,
+                system_prompt,
+                user_prompt,
+                purpose=purpose,
+                model_tier="flagship",
+                allow_flagship_retry=False,
+            )
         return None
     try:
-        return _parse_json_object(text)
+        data = _parse_json_object(text)
     except ValueError as exc:
         logger.warning("Structured LLM JSON parse failed: {}", exc)
+        if _can_retry_text_with_flagship(llm, purpose, model_tier, allow_flagship_retry):
+            logger.info(
+                "Retrying structured LLM JSON with flagship model: purpose={} reason=parse_error",
+                purpose,
+            )
+            return await _complete_json(
+                llm,
+                system_prompt,
+                user_prompt,
+                purpose=purpose,
+                model_tier="flagship",
+                allow_flagship_retry=False,
+            )
         return None
+    retry_reason = _structured_json_flagship_retry_reason(purpose, data)
+    if retry_reason and _can_retry_text_with_flagship(llm, purpose, model_tier, allow_flagship_retry):
+        logger.info(
+            "Retrying structured LLM JSON with flagship model: purpose={} reason={}",
+            purpose,
+            retry_reason,
+        )
+        retry_data = await _complete_json(
+            llm,
+            system_prompt,
+            user_prompt,
+            purpose=purpose,
+            model_tier="flagship",
+            allow_flagship_retry=False,
+        )
+        return retry_data or data
+    return data
 
 
 async def _complete_vision_json(
@@ -2740,6 +2793,9 @@ async def _complete_vision_json(
     user_prompt: str,
     image_urls: list[str],
     purpose: str = "vision",
+    model_tier: str = "",
+    direct_image_hint: bool = False,
+    allow_flagship_retry: bool = True,
 ) -> dict[str, Any] | None:
     text = await llm.complete_vision(
         system_prompt,
@@ -2747,14 +2803,246 @@ async def _complete_vision_json(
         image_urls,
         config.vision,
         purpose=purpose,
+        model_tier=model_tier,
     )
     if not text:
+        if _can_retry_vision_with_flagship(
+            llm,
+            config.vision,
+            model_tier,
+            allow_flagship_retry,
+        ):
+            logger.info("Retrying LLM vision JSON with flagship model: reason=empty")
+            return await _complete_vision_json(
+                llm,
+                config,
+                system_prompt,
+                user_prompt,
+                image_urls,
+                purpose=purpose,
+                model_tier="flagship",
+                direct_image_hint=direct_image_hint,
+                allow_flagship_retry=False,
+            )
         return None
     try:
-        return _parse_json_object(text)
+        data = _parse_json_object(text)
     except ValueError as exc:
         logger.warning("Structured vision JSON parse failed: {}", exc)
+        if _can_retry_vision_with_flagship(
+            llm,
+            config.vision,
+            model_tier,
+            allow_flagship_retry,
+        ):
+            logger.info("Retrying LLM vision JSON with flagship model: reason=parse_error")
+            return await _complete_vision_json(
+                llm,
+                config,
+                system_prompt,
+                user_prompt,
+                image_urls,
+                purpose=purpose,
+                model_tier="flagship",
+                direct_image_hint=direct_image_hint,
+                allow_flagship_retry=False,
+            )
         return None
+    retry_reason = _vision_json_flagship_retry_reason(
+        data,
+        expected_images=len(image_urls),
+        direct_image_hint=direct_image_hint,
+    )
+    if retry_reason and _can_retry_vision_with_flagship(
+        llm,
+        config.vision,
+        model_tier,
+        allow_flagship_retry,
+    ):
+        logger.info("Retrying LLM vision JSON with flagship model: reason={}", retry_reason)
+        retry_data = await _complete_vision_json(
+            llm,
+            config,
+            system_prompt,
+            user_prompt,
+            image_urls,
+            purpose=purpose,
+            model_tier="flagship",
+            direct_image_hint=direct_image_hint,
+            allow_flagship_retry=False,
+        )
+        return retry_data or data
+    return data
+
+
+STRUCTURED_JSON_REQUIRED_KEYS = {
+    "batch_observation": {"memories", "facts", "reflection"},
+    "draw_prompt": {"prompt"},
+    "fact_extract": {"facts"},
+    "final_qa": {"verdict", "reason", "categories", "confidence"},
+    "followup_gate": {"action", "confidence", "value_type", "reason"},
+    "lexicon_detect": {"terms"},
+    "lexicon_summarize": {"should_remember", "definition", "confidence"},
+    "memory_curator": {"memories"},
+    "participation_policy": {"action", "score", "value_type", "value_score", "reason"},
+    "perception": {"is_question", "is_self_disclosure", "topics", "emotion_hint", "confidence"},
+    "profile_aggregate": {"summary", "traits", "supporting_fact_ids"},
+    "reflection": {"summary", "topics", "importance"},
+    "relationship": {"closeness", "trust", "familiarity", "tension", "summary_patch", "reason"},
+    "self_narrative_check": {"status", "reason", "safe_rewrite"},
+    "self_narrative_draft": {"kind", "content", "fictionality", "confidence", "importance"},
+    "self_narrative_plan": {
+        "needs_self_narrative",
+        "purpose",
+        "allowed_kinds",
+        "should_invent",
+        "requires_background",
+        "fallback_caution",
+        "reason",
+    },
+    "sticker_select": {"asset_id", "confidence", "reason"},
+}
+
+
+def _can_retry_text_with_flagship(
+    llm: LLMClient,
+    purpose: str,
+    model_tier: str,
+    allow_flagship_retry: bool,
+) -> bool:
+    if not allow_flagship_retry or model_tier == "flagship":
+        return False
+    retry_checker = getattr(llm, "should_retry_with_flagship", None)
+    if not callable(retry_checker):
+        return False
+    try:
+        return bool(retry_checker(purpose))
+    except Exception as exc:  # pragma: no cover - retry checks must not break fallback
+        logger.warning("LLM flagship retry check failed: {}", exc)
+        return False
+
+
+def _can_retry_vision_with_flagship(
+    llm: LLMClient,
+    vision_config: VisionConfig,
+    model_tier: str,
+    allow_flagship_retry: bool,
+) -> bool:
+    if not allow_flagship_retry or model_tier == "flagship":
+        return False
+    retry_checker = getattr(llm, "should_retry_vision_with_flagship", None)
+    if not callable(retry_checker):
+        return False
+    try:
+        return bool(retry_checker(vision_config))
+    except Exception as exc:  # pragma: no cover - retry checks must not break fallback
+        logger.warning("LLM vision flagship retry check failed: {}", exc)
+        return False
+
+
+def _structured_json_flagship_retry_reason(purpose: str, data: dict[str, Any]) -> str:
+    normalized = (purpose or "").strip().lower()
+    required = STRUCTURED_JSON_REQUIRED_KEYS.get(normalized, set())
+    missing = sorted(key for key in required if key not in data)
+    if missing:
+        return "missing_keys:" + ",".join(missing[:4])
+    if normalized == "final_qa":
+        confidence = _clamp_float(data.get("confidence", 0.0))
+        if 0.0 < confidence < 0.72:
+            return f"low_final_qa_confidence:{confidence:.2f}"
+    if normalized == "participation_policy":
+        action = str(data.get("action", "")).strip().lower()
+        score = _clamp_float(data.get("score", 0.0))
+        value_score = _clamp_float(data.get("value_score", 0.0))
+        if action == "proactive_reply":
+            return f"proactive_review:{score:.2f}/{value_score:.2f}"
+    if normalized in {"followup_gate", "lexicon_summarize", "sticker_select"}:
+        confidence = _clamp_float(data.get("confidence", 0.0))
+        if 0.0 < confidence < 0.68:
+            return f"low_confidence:{confidence:.2f}"
+    return ""
+
+
+def _vision_json_flagship_retry_reason(
+    data: dict[str, Any],
+    *,
+    expected_images: int,
+    direct_image_hint: bool,
+) -> str:
+    images = data.get("images")
+    if not isinstance(images, list):
+        return "missing_images"
+    if expected_images > 1 and len(images) < expected_images:
+        return f"incomplete_multi_image:{len(images)}/{expected_images}"
+    for item in images:
+        if not isinstance(item, dict):
+            return "invalid_image_item"
+        description = str(item.get("description", "")).strip()
+        ocr_text = str(item.get("ocr_text", "")).strip()
+        confidence = _clamp_float(item.get("confidence", 0.0))
+        if direct_image_hint and not description and not ocr_text:
+            return "direct_image_empty_description"
+        if 0.0 < confidence < 0.68:
+            return f"low_vision_confidence:{confidence:.2f}"
+    return ""
+
+
+def _vision_direct_image_hint(context: MessageContext, image_urls: list[str]) -> bool:
+    if not image_urls:
+        return False
+    text = context.plain_text.strip()
+    if context.is_direct and text:
+        return True
+    lowered = text.lower()
+    image_cues = (
+        "ocr",
+        "image",
+        "图",
+        "图片",
+        "截图",
+        "照片",
+        "这张",
+        "这些图",
+        "看一下",
+        "帮我看",
+        "识别",
+        "读图",
+        "文字",
+        "什么意思",
+        "是什么",
+    )
+    return any(cue in lowered for cue in image_cues)
+
+
+def _final_qa_requires_flagship(
+    context: MessageContext,
+    decision: ParticipationDecision,
+    snapshot: ConversationSnapshot,
+    reply: str,
+) -> bool:
+    if decision.action == "proactive_reply":
+        return True
+    risk_text = "\n".join(
+        (
+            context.plain_text,
+            reply,
+            _format_recent_context(snapshot),
+            _join_lines(snapshot.recent_image_descriptions),
+        )
+    )
+    risk_patterns = (
+        POLITICAL_TOPIC_PATTERN,
+        POLITICAL_STANCE_PATTERN,
+        SYSTEM_LEAK_PATTERN,
+        PRIVACY_LEAK_PATTERN,
+        INAPPROPRIATE_REPLY_PATTERN,
+        SHARED_CONTENT_CUE_PATTERN,
+        TRUTH_VERIFICATION_REQUEST_PATTERN,
+        HIGH_RISK_SHARED_CONTENT_PATTERN,
+        LIVE_EVENT_TOPIC_PATTERN,
+        LIVE_EVENT_TIME_PATTERN,
+    )
+    return any(pattern.search(risk_text) for pattern in risk_patterns)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

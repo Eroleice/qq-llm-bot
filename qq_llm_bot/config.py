@@ -160,6 +160,14 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class LLMRoutingConfig:
+    enabled: bool = False
+    base_model: str = ""
+    flagship_model: str = ""
+    vision_base_model: str = ""
+
+
+@dataclass(frozen=True)
 class LLMConfig:
     provider: str = "disabled"
     model: str = ""
@@ -169,6 +177,7 @@ class LLMConfig:
     temperature: float = 0.8
     max_tokens: int = 256
     timeout_seconds: float = 30.0
+    routing: LLMRoutingConfig = field(default_factory=LLMRoutingConfig)
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     stickers_raw = _section(raw, "stickers")
     storage_raw = _section(raw, "storage")
     llm_raw = _section(raw, "llm")
+    llm_routing_raw = _section(llm_raw, "routing")
 
     mode = str(bot_raw.get("default_group_mode", "passive")).strip().lower()
     if mode not in {"silent", "passive", "active"}:
@@ -557,6 +567,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
                 "llm.timeout_seconds",
                 1,
                 300,
+            ),
+            routing=LLMRoutingConfig(
+                enabled=_bool_value(llm_routing_raw.get("enabled", False)),
+                base_model=str(llm_routing_raw.get("base_model", "")).strip(),
+                flagship_model=str(llm_routing_raw.get("flagship_model", "")).strip(),
+                vision_base_model=str(llm_routing_raw.get("vision_base_model", "")).strip(),
             ),
         ),
         config_path=config_path,

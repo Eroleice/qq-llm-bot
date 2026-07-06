@@ -307,6 +307,9 @@ async def _handle_draw_command(
     if not is_llm_configured(config.llm):
         await _finish_command(draw_cmd, "生图模型未配置，请检查 provider/base_url/model/key。")
 
+    if not config.image_generation.model.strip():
+        await _finish_command(draw_cmd, "image_generation.model is required for #draw.")
+
     prompt = args.extract_plain_text().strip()
     if not prompt:
         await _finish_command(draw_cmd, "用法：#draw <图片描述>")
@@ -1084,13 +1087,17 @@ async def _handle_llm(bot: Bot, event: GroupMessageEvent, rest: list[str]) -> No
         responses_url = (
             normalize_responses_url(config.llm.base_url) if config.llm.base_url else "(empty)"
         )
-        image_model = config.image_generation.model or config.llm.model or "(empty)"
+        image_model = config.image_generation.model or "(empty; required)"
         await _finish_command(
             admin_cmd,
             "LLM 状态：\n"
             f"provider={provider}\n"
             f"configured={configured}\n"
             f"model={config.llm.model or '(empty)'}\n"
+            f"routing_enabled={config.llm.routing.enabled}\n"
+            f"routing_base_model={config.llm.routing.base_model or '(empty)'}\n"
+            f"routing_flagship_model={config.llm.routing.flagship_model or '(empty)'}\n"
+            f"routing_vision_base_model={config.llm.routing.vision_base_model or '(empty)'}\n"
             f"chat_url={chat_url}\n"
             f"responses_url={responses_url}\n"
             f"api_key_env={config.llm.api_key_env}\n"
@@ -1225,8 +1232,27 @@ async def _compose_draw_prompt(
         "但不要把 appearance_prompt 明确排除的场景或穿着固化进去；"
         "如果用户请求很简单，也不要过度添加不相关记忆。"
     )
-    text = await llm.complete_text(system_prompt, user_prompt, purpose="draw_prompt")
-    return _extract_draw_prompt(text)
+    model_tier = "flagship" if _draw_prompt_requires_flagship(context, snapshot, draw_request) else ""
+    text = await llm.complete_text(
+        system_prompt,
+        user_prompt,
+        purpose="draw_prompt",
+        model_tier=model_tier,
+    )
+    prompt = _extract_draw_prompt(text)
+    if (
+        prompt is None
+        and model_tier != "flagship"
+        and _can_retry_draw_prompt_with_flagship()
+    ):
+        text = await llm.complete_text(
+            system_prompt,
+            user_prompt,
+            purpose="draw_prompt",
+            model_tier="flagship",
+        )
+        prompt = _extract_draw_prompt(text)
+    return prompt
 
 
 def _extract_draw_prompt(text: str | None) -> str | None:
@@ -1249,6 +1275,48 @@ def _extract_draw_prompt(text: str | None) -> str | None:
     if not prompt:
         return None
     return prompt[: max(1, config.image_generation.max_prompt_chars)]
+
+
+def _can_retry_draw_prompt_with_flagship() -> bool:
+    retry_checker = getattr(llm, "should_retry_with_flagship", None)
+    if not callable(retry_checker):
+        return False
+    try:
+        return bool(retry_checker("draw_prompt"))
+    except Exception as exc:  # pragma: no cover - retry checks must not break draw
+        logger.warning("Draw prompt flagship retry check failed: {}", exc)
+        return False
+
+
+def _draw_prompt_requires_flagship(
+    context: MessageContext,
+    snapshot: ConversationSnapshot,
+    draw_request: str,
+) -> bool:
+    text = "\n".join(
+        (
+            draw_request,
+            context.plain_text,
+            _draw_join(snapshot.recent_image_descriptions),
+        )
+    ).lower()
+    if any(name and name.lower() in text for name in config.bot.nicknames):
+        return True
+    if snapshot.persona_lines and any(token in text for token in ("bot", "机器人", "可可", "人设")):
+        return True
+    high_risk_cues = (
+        "隐私",
+        "身份证",
+        "手机号",
+        "住址",
+        "账号",
+        "真实",
+        "本人",
+        "合照",
+        "照着",
+        "参考截图",
+    )
+    return any(cue in text for cue in high_risk_cues)
 
 
 def _draw_recent_context(snapshot: ConversationSnapshot) -> str:

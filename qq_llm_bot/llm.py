@@ -13,6 +13,32 @@ from loguru import logger
 from qq_llm_bot.config import ImageGenerationConfig, LLMConfig, VisionConfig
 
 
+BASE_TEXT_PURPOSES = {
+    "batch_observation",
+    "fact_extract",
+    "followup_gate",
+    "lexicon_detect",
+    "lexicon_summarize",
+    "perception",
+    "profile_aggregate",
+    "reflection",
+    "relationship",
+    "sticker_select",
+    "vision",
+}
+BASE_TEXT_PURPOSES_WITH_ESCALATION = {
+    "draw_prompt",
+    "final_qa",
+    "participation_policy",
+}
+FLAGSHIP_TEXT_PURPOSES = {
+    "response",
+    "self_claim_rewrite",
+    "self_narrative_check",
+    "self_narrative_draft",
+}
+
+
 @dataclass(frozen=True)
 class GeneratedImage:
     data: bytes | None = None
@@ -43,6 +69,7 @@ class LLMClient(Protocol):
         system_prompt: str,
         user_prompt: str,
         purpose: str = "",
+        model_tier: str = "",
     ) -> str | None:
         ...
 
@@ -53,6 +80,7 @@ class LLMClient(Protocol):
         image_urls: list[str],
         vision_config: VisionConfig,
         purpose: str = "vision",
+        model_tier: str = "",
     ) -> str | None:
         ...
 
@@ -72,6 +100,7 @@ class DisabledLLMClient:
         system_prompt: str,
         user_prompt: str,
         purpose: str = "",
+        model_tier: str = "",
     ) -> str | None:
         return None
 
@@ -82,6 +111,7 @@ class DisabledLLMClient:
         image_urls: list[str],
         vision_config: VisionConfig,
         purpose: str = "vision",
+        model_tier: str = "",
     ) -> str | None:
         return None
 
@@ -106,6 +136,10 @@ class OpenAICompatibleLLMClient:
             normalize_chat_completions_url(config.base_url) if config.base_url else ""
         )
         self.responses_url = normalize_responses_url(config.base_url) if config.base_url else ""
+        self.last_chat_error = ""
+        self._last_chat_failure_kind = ""
+        self._last_chat_failure_status = 0
+        self._last_chat_failure_body = ""
         self.last_image_generation_error = ""
         self._last_image_generation_failure_kind = ""
 
@@ -114,14 +148,16 @@ class OpenAICompatibleLLMClient:
         system_prompt: str,
         user_prompt: str,
         purpose: str = "",
+        model_tier: str = "",
     ) -> str | None:
         missing = self._missing_config_items()
         if missing:
             logger.warning("LLM is not configured; missing: {}", ", ".join(missing))
             return None
 
+        model = self._text_model_for_purpose(purpose or "text", model_tier)
         payload = {
-            "model": self.config.model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -143,6 +179,7 @@ class OpenAICompatibleLLMClient:
         image_urls: list[str],
         vision_config: VisionConfig,
         purpose: str = "vision",
+        model_tier: str = "",
     ) -> str | None:
         missing = self._missing_config_items()
         if missing:
@@ -163,8 +200,9 @@ class OpenAICompatibleLLMClient:
             }
             for url in clean_urls[: vision_config.max_images_per_message]
         )
+        model = self._vision_model_for_tier(vision_config, model_tier)
         payload = {
-            "model": vision_config.model or self.config.model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content},
@@ -172,12 +210,32 @@ class OpenAICompatibleLLMClient:
             "temperature": 0.2,
             "max_tokens": max(self.config.max_tokens, 512),
         }
-        return await self._post_chat_completion(
+        text = await self._post_chat_completion(
             payload,
             vision_config.timeout_seconds,
             purpose or "vision",
             len(system_prompt) + len(user_prompt),
         )
+        if (
+            text is None
+            and model_tier != "flagship"
+            and self._should_retry_vision_failure_with_flagship(model, vision_config)
+        ):
+            payload["model"] = self._vision_model_for_tier(vision_config, "flagship")
+            logger.info(
+                "Retrying LLM vision with flagship model after base-model failure: "
+                "purpose={} base_model={} flagship_model={}",
+                purpose or "vision",
+                model,
+                payload["model"],
+            )
+            return await self._post_chat_completion(
+                payload,
+                vision_config.timeout_seconds,
+                purpose or "vision",
+                len(system_prompt) + len(user_prompt),
+            )
+        return text
 
     async def generate_image(
         self,
@@ -208,8 +266,14 @@ class OpenAICompatibleLLMClient:
             tool["output_format"] = image_config.output_format
         if image_config.output_compression:
             tool["output_compression"] = image_config.output_compression
+        image_model = image_config.model.strip()
+        if not image_model:
+            self.last_image_generation_error = "missing: image_generation.model"
+            logger.warning("LLM image generation requires explicit image_generation.model")
+            return None
+
         payload = {
-            "model": image_config.model or self.config.model,
+            "model": image_model,
             "input": clean_prompt,
             "tools": [tool],
             "tool_choice": {"type": "image_generation"},
@@ -237,6 +301,10 @@ class OpenAICompatibleLLMClient:
         purpose: str,
         prompt_chars: int,
     ) -> str | None:
+        self.last_chat_error = ""
+        self._last_chat_failure_kind = ""
+        self._last_chat_failure_status = 0
+        self._last_chat_failure_body = ""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -248,9 +316,15 @@ class OpenAICompatibleLLMClient:
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500]
+            self._last_chat_failure_kind = "http_error"
+            self._last_chat_failure_status = exc.response.status_code
+            self._last_chat_failure_body = body
+            self.last_chat_error = f"http_status={exc.response.status_code} body={body}"
             logger.warning("LLM HTTP error: status={} body={}", exc.response.status_code, body)
             return None
         except httpx.HTTPError as exc:
+            self._last_chat_failure_kind = "request_error"
+            self.last_chat_error = f"request_error={type(exc).__name__}: {exc}"
             logger.warning("LLM request failed: {}", exc)
             return None
 
@@ -268,6 +342,8 @@ class OpenAICompatibleLLMClient:
             self._record_chat_usage(record)
             return text
         except (KeyError, TypeError, ValueError) as exc:
+            self._last_chat_failure_kind = "parse_error"
+            self.last_chat_error = f"parse_error={type(exc).__name__}: {exc}"
             logger.warning("LLM response parse failed: {}", exc)
             return None
 
@@ -350,6 +426,67 @@ class OpenAICompatibleLLMClient:
         if not self.api_key:
             missing.append(f"{self.config.api_key_env}/llm.api_key")
         return missing
+
+    def should_retry_with_flagship(self, purpose: str) -> bool:
+        if not self._routing_enabled():
+            return False
+        base_model = self._text_model_for_purpose(purpose, "")
+        flagship_model = self._text_model_for_purpose(purpose, "flagship")
+        return bool(base_model and flagship_model and base_model != flagship_model)
+
+    def should_retry_vision_with_flagship(self, vision_config: VisionConfig) -> bool:
+        if not self._routing_enabled():
+            return False
+        base_model = self._vision_model_for_tier(vision_config, "")
+        flagship_model = self._vision_model_for_tier(vision_config, "flagship")
+        return bool(base_model and flagship_model and base_model != flagship_model)
+
+    def _routing_enabled(self) -> bool:
+        return bool(self.config.routing.enabled)
+
+    def _text_model_for_purpose(self, purpose: str, model_tier: str = "") -> str:
+        if not self._routing_enabled():
+            return self.config.model
+        if model_tier == "flagship":
+            return self.config.routing.flagship_model or self.config.model
+        if model_tier == "base":
+            return self.config.routing.base_model or self.config.model
+
+        normalized = (purpose or "text").strip().lower()
+        if normalized in FLAGSHIP_TEXT_PURPOSES:
+            return self.config.routing.flagship_model or self.config.model
+        if normalized in BASE_TEXT_PURPOSES or normalized in BASE_TEXT_PURPOSES_WITH_ESCALATION:
+            return self.config.routing.base_model or self.config.model
+        return self.config.model
+
+    def _vision_model_for_tier(
+        self,
+        vision_config: VisionConfig,
+        model_tier: str = "",
+    ) -> str:
+        if not self._routing_enabled():
+            return vision_config.model or self.config.model
+        if model_tier == "flagship":
+            return vision_config.model or self.config.routing.flagship_model or self.config.model
+        return (
+            self.config.routing.vision_base_model
+            or self.config.routing.base_model
+            or vision_config.model
+            or self.config.model
+        )
+
+    def _should_retry_vision_failure_with_flagship(
+        self,
+        attempted_model: str,
+        vision_config: VisionConfig,
+    ) -> bool:
+        if not self.should_retry_vision_with_flagship(vision_config):
+            return False
+        if attempted_model == self._vision_model_for_tier(vision_config, "flagship"):
+            return False
+        if self._last_chat_failure_kind != "http_error":
+            return False
+        return self._last_chat_failure_status in {400, 404, 415, 422}
 
     def _record_chat_usage(self, record: LLMUsageRecord) -> None:
         if self.usage_recorder is None:

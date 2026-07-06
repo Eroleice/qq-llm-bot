@@ -25,6 +25,8 @@ from qq_llm_bot.cognitive_agents import (
     ResponseAgent,
     StickerSelectorAgent,
     VisionAgent,
+    _complete_json,
+    _complete_vision_json,
 )
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import (
@@ -33,6 +35,7 @@ from qq_llm_bot.config import (
     ImageGenerationConfig,
     LexiconConfig,
     LLMConfig,
+    LLMRoutingConfig,
     NapCatConfig,
     PersonaConfig,
     ReflectionConfig,
@@ -93,7 +96,9 @@ class FakeLLM:
         self.image_replies = image_replies or []
         self.text_calls: list[tuple[str, str]] = []
         self.text_call_purposes: list[str] = []
+        self.text_call_tiers: list[str] = []
         self.vision_calls: list[list[str]] = []
+        self.vision_call_tiers: list[str] = []
         self.image_calls: list[str] = []
         self.last_image_generation_error = ""
 
@@ -102,9 +107,11 @@ class FakeLLM:
         system_prompt: str,
         user_prompt: str,
         purpose: str = "",
+        model_tier: str = "",
     ) -> str | None:
         self.text_calls.append((system_prompt, user_prompt))
         self.text_call_purposes.append(purpose)
+        self.text_call_tiers.append(model_tier)
         if self.replies:
             return self.replies.pop(0)
         return None
@@ -116,8 +123,10 @@ class FakeLLM:
         image_urls: list[str],
         vision_config: VisionConfig,
         purpose: str = "vision",
+        model_tier: str = "",
     ) -> str | None:
         self.vision_calls.append(image_urls)
+        self.vision_call_tiers.append(model_tier)
         if self.vision_replies:
             return self.vision_replies.pop(0)
         return None
@@ -131,6 +140,14 @@ class FakeLLM:
         if self.image_replies:
             return self.image_replies.pop(0)
         return None
+
+
+class RetryCapableFakeLLM(FakeLLM):
+    def should_retry_with_flagship(self, purpose: str) -> bool:
+        return True
+
+    def should_retry_vision_with_flagship(self, vision_config: VisionConfig) -> bool:
+        return True
 
 
 class FakeSearch:
@@ -395,11 +412,14 @@ class ImageGenerationTests(unittest.TestCase):
 
         client._post_image_generation_response = fake_post_image_generation_response  # type: ignore[method-assign]
 
-        image = asyncio.run(client.generate_image("cat", ImageGenerationConfig()))
+        image = asyncio.run(
+            client.generate_image("cat", ImageGenerationConfig(model="gpt-image-test"))
+        )
 
         self.assertIsNotNone(image)
         self.assertEqual(image.data, b"fake-png")  # type: ignore[union-attr]
         self.assertEqual(calls, 2)
+        self.assertEqual(captured_payload["model"], "gpt-image-test")
         tool = captured_payload["tools"][0]
         self.assertEqual(tool["size"], "512x512")
         self.assertEqual(tool["quality"], "low")
@@ -488,6 +508,160 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertIn("appearance_prompt: str = \"\"", config_source)
         self.assertIn('"appearance_prompt": config.persona.appearance_prompt', storage_source)
         self.assertIn("appearance_prompt 只约束人物样貌，不固定服装、场景", plugin_source)
+
+
+class LLMRoutingTests(unittest.TestCase):
+    def test_llm_routing_config_is_loaded_from_nested_table(self) -> None:
+        with _project_temp_directory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "[napcat]",
+                        'ws_url = "ws://example.test"',
+                        "",
+                        "[llm]",
+                        'provider = "openai-compatible"',
+                        'model = "gpt-5.5"',
+                        'base_url = "https://example.test/v1"',
+                        "",
+                        "[llm.routing]",
+                        "enabled = true",
+                        'base_model = "gpt-5.4-mini"',
+                        'flagship_model = "gpt-5.5"',
+                        'vision_base_model = "gpt-5.4-mini"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertTrue(config.llm.routing.enabled)
+            self.assertEqual(config.llm.routing.base_model, "gpt-5.4-mini")
+            self.assertEqual(config.llm.routing.flagship_model, "gpt-5.5")
+            self.assertEqual(config.llm.routing.vision_base_model, "gpt-5.4-mini")
+
+    def test_openai_client_routes_text_purposes_to_expected_models(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="openai-compatible",
+                model="gpt-5.5",
+                base_url="https://example.test/v1",
+                api_key="test-key",
+                routing=LLMRoutingConfig(
+                    enabled=True,
+                    base_model="gpt-5.4-mini",
+                    flagship_model="gpt-5.5",
+                    vision_base_model="gpt-5.4-mini",
+                ),
+            )
+        )
+        captured: list[tuple[str, str]] = []
+
+        async def fake_post_chat_completion(
+            payload: dict,
+            timeout_seconds: float,
+            purpose: str,
+            prompt_chars: int,
+        ) -> str | None:
+            captured.append((purpose, str(payload["model"])))
+            return "ok"
+
+        client._post_chat_completion = fake_post_chat_completion  # type: ignore[method-assign]
+
+        asyncio.run(client.complete_text("s", "u", purpose="perception"))
+        asyncio.run(client.complete_text("s", "u", purpose="response"))
+        asyncio.run(client.complete_text("s", "u", purpose="final_qa"))
+        asyncio.run(client.complete_text("s", "u", purpose="final_qa", model_tier="flagship"))
+
+        self.assertEqual(
+            captured,
+            [
+                ("perception", "gpt-5.4-mini"),
+                ("response", "gpt-5.5"),
+                ("final_qa", "gpt-5.4-mini"),
+                ("final_qa", "gpt-5.5"),
+            ],
+        )
+
+    def test_openai_client_routes_vision_to_base_and_flagship_models(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="openai-compatible",
+                model="gpt-5.5",
+                base_url="https://example.test/v1",
+                api_key="test-key",
+                routing=LLMRoutingConfig(
+                    enabled=True,
+                    base_model="gpt-5.4-mini",
+                    flagship_model="gpt-5.5",
+                    vision_base_model="gpt-5.4-mini",
+                ),
+            )
+        )
+        captured: list[str] = []
+
+        async def fake_post_chat_completion(
+            payload: dict,
+            timeout_seconds: float,
+            purpose: str,
+            prompt_chars: int,
+        ) -> str | None:
+            captured.append(str(payload["model"]))
+            return "{}"
+
+        client._post_chat_completion = fake_post_chat_completion  # type: ignore[method-assign]
+
+        asyncio.run(
+            client.complete_vision(
+                "s",
+                "u",
+                ["https://example.test/a.png"],
+                VisionConfig(model="gpt-5.5"),
+            )
+        )
+        asyncio.run(
+            client.complete_vision(
+                "s",
+                "u",
+                ["https://example.test/a.png"],
+                VisionConfig(model="gpt-5.5"),
+                model_tier="flagship",
+            )
+        )
+
+        self.assertEqual(captured, ["gpt-5.4-mini", "gpt-5.5"])
+
+    def test_structured_json_retries_once_with_flagship_on_parse_failure(self) -> None:
+        llm = RetryCapableFakeLLM(["not json", '{"facts":[]}'])
+
+        data = asyncio.run(_complete_json(llm, "s", "u", purpose="fact_extract"))
+
+        self.assertEqual(data, {"facts": []})
+        self.assertEqual(llm.text_call_tiers, ["", "flagship"])
+
+    def test_vision_json_retries_once_with_flagship_on_empty_direct_result(self) -> None:
+        llm = RetryCapableFakeLLM(
+            vision_replies=[
+                '{"images":[{"description":"","ocr_text":"","confidence":0.5}]}',
+                '{"images":[{"description":"chart","ocr_text":"","confidence":0.9}]}',
+            ]
+        )
+
+        data = asyncio.run(
+            _complete_vision_json(
+                llm,
+                test_config(Path("unused.sqlite3")),
+                "s",
+                "u",
+                ["https://example.test/a.png"],
+                direct_image_hint=True,
+            )
+        )
+
+        self.assertEqual(data["images"][0]["description"], "chart")  # type: ignore[index]
+        self.assertEqual(llm.vision_call_tiers, ["", "flagship"])
 
 
 class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -2101,7 +2275,7 @@ class MemoryStorageTests(unittest.TestCase):
             storage.record_llm_usage(
                 LLMUsageRecord(
                     purpose="perception",
-                    model="test-model",
+                    model="gpt-5.4-mini",
                     prompt_chars=100,
                     completion_chars=20,
                     prompt_tokens=10,
@@ -2112,8 +2286,20 @@ class MemoryStorageTests(unittest.TestCase):
             )
             storage.record_llm_usage(
                 LLMUsageRecord(
+                    purpose="perception",
+                    model="gpt-5.5",
+                    prompt_chars=50,
+                    completion_chars=10,
+                    prompt_tokens=5,
+                    completion_tokens=1,
+                    total_tokens=6,
+                    created_at=150,
+                )
+            )
+            storage.record_llm_usage(
+                LLMUsageRecord(
                     purpose="response",
-                    model="test-model",
+                    model="gpt-5.5",
                     prompt_chars=300,
                     completion_chars=40,
                     prompt_tokens=30,
@@ -2125,15 +2311,16 @@ class MemoryStorageTests(unittest.TestCase):
 
             data = storage.list_dashboard_llm_usage(since=50, limit=1)
 
-            self.assertEqual(data["summary"]["calls"], 2)  # type: ignore[index]
-            self.assertEqual(data["summary"]["total_tokens"], 46)  # type: ignore[index]
-            self.assertEqual(data["summary"]["prompt_chars"], 400)  # type: ignore[index]
+            self.assertEqual(data["summary"]["calls"], 3)  # type: ignore[index]
+            self.assertEqual(data["summary"]["total_tokens"], 52)  # type: ignore[index]
+            self.assertEqual(data["summary"]["prompt_chars"], 450)  # type: ignore[index]
             by_purpose = {
                 (str(item["purpose"]), str(item["model"])): item
                 for item in data["by_purpose"]  # type: ignore[index]
             }
-            self.assertEqual(by_purpose[("response", "test-model")]["total_tokens"], 34)
-            self.assertEqual(by_purpose[("perception", "test-model")]["calls"], 1)
+            self.assertEqual(by_purpose[("response", "gpt-5.5")]["total_tokens"], 34)
+            self.assertEqual(by_purpose[("perception", "gpt-5.4-mini")]["calls"], 1)
+            self.assertEqual(by_purpose[("perception", "gpt-5.5")]["total_tokens"], 6)
             self.assertEqual(len(data["recent"]), 1)  # type: ignore[arg-type]
             self.assertEqual(data["recent"][0]["purpose"], "response")  # type: ignore[index]
         finally:

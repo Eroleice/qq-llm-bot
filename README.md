@@ -218,12 +218,22 @@ fact_context_ttl_days = 30
 ```toml
 [llm]
 provider = "openai-compatible"
-model = "你的模型名"
+model = "gpt-5.5"
 base_url = "https://你的 API 地址/v1"
 api_key_env = "OPENAI_API_KEY"
 temperature = 0.8
 max_tokens = 256
 timeout_seconds = 30.0
+
+[llm.routing]
+enabled = true
+base_model = "gpt-5.4-mini"
+flagship_model = "gpt-5.5"
+vision_base_model = "gpt-5.4-mini"
+
+[image_generation]
+enabled = false
+model = "你的生图模型名" # 必填，不再复用 [llm].model
 ```
 
 2. 修改 `.env`，写入：
@@ -248,7 +258,7 @@ LLM 当前用于回复生成、感知分析、成员 FACT 抽取、全局画像�
 ```toml
 [vision]
 enabled = true
-model = "" # 留空则复用 [llm].model
+model = "gpt-5.5" # 启用路由时作为直接问图/复杂读图的旗舰兜底
 max_images_per_message = 3
 detail = "low"
 timeout_seconds = 45.0

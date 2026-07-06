@@ -86,7 +86,7 @@ access_token_env = "QQ_LLM_BOT_DASHBOARD_TOKEN"
 [vision]
 # Enable if your OpenAI-compatible model supports image_url multimodal input.
 enabled = false
-model = ""
+model = "gpt-5.5" # Flagship fallback for direct/complex vision when routing is enabled.
 max_images_per_message = 3
 detail = "low"
 timeout_seconds = 45.0
@@ -95,7 +95,7 @@ remember_threshold = 0.78
 [image_generation]
 # Uses OpenAI Responses API /v1/responses with the image_generation tool.
 enabled = false
-model = "" # Leave empty to reuse [llm].model.
+model = "your-image-model-name" # Required; image generation no longer inherits [llm].model.
 storage_dir = "data/generated_images"
 size = "512x512"
 quality = "low"
@@ -125,10 +125,17 @@ sqlite_path = "data/bot.sqlite3"
 
 [llm]
 provider = "openai-compatible"
-model = "your-model-name"
+model = "gpt-5.5"
 base_url = "https://your-openai-compatible-api.example.com/v1"
 api_key = ""
 api_key_env = "OPENAI_API_KEY"
 temperature = 0.8
 max_tokens = 256
 timeout_seconds = 30.0
+
+[llm.routing]
+# Route cheap/background work to a small model while preserving flagship quality for final replies.
+enabled = true
+base_model = "gpt-5.4-mini"
+flagship_model = "gpt-5.5"
+vision_base_model = "gpt-5.4-mini"
