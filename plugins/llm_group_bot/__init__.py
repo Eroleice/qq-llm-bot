@@ -54,6 +54,10 @@ from qq_llm_bot.onebot_messages import (
     render_message_text_and_mentions,
     render_message_text_and_mentions_with_forwards,
 )
+from qq_llm_bot.realtime_merge import (
+    merge_realtime_contexts,
+    split_image_descriptions_by_context,
+)
 from qq_llm_bot.reply_style import settings_from_bot_config, split_reply_bubbles, style_reply_text
 from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
 
@@ -83,6 +87,19 @@ class _PendingVision:
     future: asyncio.Future[list[str]]
     created_at: float
     worker: asyncio.Task[list[str]] | None = None
+
+
+@dataclass
+class _PendingRealtimeReply:
+    group_id: str
+    user_id: str
+    mode: ParticipationMode
+    contexts: list[MessageContext]
+    first_message_at: float
+    updated_at: float
+    generation: int = 1
+    committing: bool = False
+    task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +145,8 @@ _outbound_queue: list[_QueuedOutboundMessage] = []
 _outbound_queue_lock = asyncio.Lock()
 _outbound_flush_lock = asyncio.Lock()
 _outbound_retry_worker: asyncio.Task[None] | None = None
+_pending_realtime_replies: dict[tuple[str, str], _PendingRealtimeReply] = {}
+_pending_realtime_lock = asyncio.Lock()
 
 if config.dashboard.enabled:
     register_dashboard_routes(
@@ -147,6 +166,7 @@ async def _startup() -> None:
 
 @driver.on_shutdown
 async def _shutdown() -> None:
+    await _stop_realtime_reply_workers()
     await _stop_outbound_retry_worker()
 
 
@@ -583,32 +603,48 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     _register_pending_vision(context)
 
     mode = storage.get_group_mode(group_id, config.bot.default_group_mode)
+    if await _maybe_enqueue_realtime_reply(bot, context, mode):
+        return
+
     if _should_defer_realtime_pipeline(context, mode):
         await _defer_observation(context, mode)
         return
 
-    if not await _wait_for_relevant_pending_vision(context):
-        await _handle_pending_vision_timeout(bot, context, mode)
-        return
+    sent_reply = await _process_group_context(bot, context, mode)
+    if sent_reply:
+        await group_message.finish()
 
-    await _flush_observation_batch(group_id)
+
+async def _process_group_context(
+    bot: Bot,
+    context: MessageContext,
+    mode: ParticipationMode,
+    source_contexts: Iterable[MessageContext] | None = None,
+    commit_guard: Any | None = None,
+) -> bool:
+    contexts = tuple(source_contexts or (context,))
+    if not await _wait_for_relevant_pending_vision(context):
+        return await _handle_pending_vision_timeout(bot, context, mode)
+
+    await _flush_observation_batch(context.group_id)
     snapshot = storage.build_snapshot(context)
     try:
         result = await pipeline.run(context, mode, snapshot)
-    except Exception:
-        _finish_pending_vision(context, [])
+    except asyncio.CancelledError:
         raise
+    except Exception:
+        _finish_pending_vision_contexts(contexts, [])
+        raise
+
+    if commit_guard is not None and not await commit_guard():
+        return False
 
     fact_write = storage.record_fact_candidates(result.facts)
     memory_write = storage.record_memory_candidates(result.memories)
     try:
-        storage.update_image_descriptions(
-            context.group_id,
-            context.message_id,
-            result.image_descriptions,
-        )
+        _record_image_descriptions(contexts, result.image_descriptions)
     finally:
-        _finish_pending_vision(context, result.image_descriptions)
+        _finish_pending_vision_contexts(contexts, result.image_descriptions)
     await _record_sticker_candidates(context, result.sticker_candidates)
     await _maybe_update_profiles(
         [fact.subject_user_id for fact in fact_write.accepted],
@@ -622,7 +658,7 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 
     if not final_reply:
         storage.record_decision(context, result.decision, "")
-        return
+        return False
 
     if conflict_reply:
         qa_result = await pipeline.review_reply(context, result.decision, snapshot, final_reply)
@@ -632,7 +668,7 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                 _final_qa_blocked_decision(result.decision, qa_result.reason),
                 "",
             )
-            return
+            return False
     else:
         storage.record_memory_candidates(result.reply_self_memories)
 
@@ -655,7 +691,191 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if send_result.sticker and not send_result.queued:
         storage.record_sticker_sent(send_result.sticker.id, usage_date=_draw_usage_date())
         _maybe_cleanup_unused_stickers()
-    await group_message.finish()
+    return True
+
+
+async def _maybe_enqueue_realtime_reply(
+    bot: Bot,
+    context: MessageContext,
+    mode: ParticipationMode,
+) -> bool:
+    if not config.bot.realtime_merge_enabled:
+        return False
+
+    key = _realtime_reply_key(context)
+    now = time.time()
+    async with _pending_realtime_lock:
+        pending = _pending_realtime_replies.get(key)
+        if pending is not None and _can_append_realtime_context(pending, context, now):
+            pending.contexts.append(context)
+            pending.mode = mode
+            pending.updated_at = now
+            pending.generation += 1
+            _cancel_realtime_task(pending)
+            pending.task = asyncio.create_task(
+                _run_pending_realtime_reply(bot, key, pending.generation)
+            )
+            logger.info(
+                "Merged realtime reply context group={} user={} messages={} generation={}",
+                context.group_id,
+                context.user_id,
+                len(pending.contexts),
+                pending.generation,
+            )
+            return True
+
+        if pending is not None:
+            return False
+
+        if _should_defer_realtime_pipeline(context, mode):
+            return False
+
+        pending = _PendingRealtimeReply(
+            group_id=context.group_id,
+            user_id=context.user_id,
+            mode=mode,
+            contexts=[context],
+            first_message_at=now,
+            updated_at=now,
+        )
+        pending.task = asyncio.create_task(_run_pending_realtime_reply(bot, key, pending.generation))
+        _pending_realtime_replies[key] = pending
+        return True
+
+
+async def _run_pending_realtime_reply(
+    bot: Bot,
+    key: tuple[str, str],
+    generation: int,
+) -> None:
+    try:
+        pending = await _get_pending_realtime_reply(key, generation)
+        if pending is None:
+            return
+        contexts = tuple(pending.contexts)
+        context = merge_realtime_contexts(contexts)
+
+        async def _commit_guard() -> bool:
+            await _wait_realtime_grace(key, generation)
+            return await _claim_pending_realtime_reply(key, generation)
+
+        await _process_group_context(
+            bot,
+            context,
+            pending.mode,
+            source_contexts=contexts,
+            commit_guard=_commit_guard,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - realtime task must not break the matcher loop
+        logger.exception("Realtime reply task failed for {}: {}", key, exc)
+        pending = await _get_pending_realtime_reply(key, generation)
+        if pending is not None:
+            _finish_pending_vision_contexts(tuple(pending.contexts), [])
+    finally:
+        await _discard_pending_realtime_reply(key, generation)
+
+
+async def _get_pending_realtime_reply(
+    key: tuple[str, str],
+    generation: int,
+) -> _PendingRealtimeReply | None:
+    async with _pending_realtime_lock:
+        pending = _pending_realtime_replies.get(key)
+        if pending is None or pending.generation != generation:
+            return None
+        return pending
+
+
+async def _wait_realtime_grace(key: tuple[str, str], generation: int) -> None:
+    grace_seconds = max(0.0, float(config.bot.realtime_merge_grace_seconds))
+    while grace_seconds > 0:
+        pending = await _get_pending_realtime_reply(key, generation)
+        if pending is None:
+            return
+        max_window = max(0.0, float(config.bot.realtime_merge_max_window_seconds))
+        deadline = min(pending.updated_at + grace_seconds, pending.first_message_at + max_window)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 0.25))
+
+
+async def _claim_pending_realtime_reply(key: tuple[str, str], generation: int) -> bool:
+    async with _pending_realtime_lock:
+        pending = _pending_realtime_replies.get(key)
+        if pending is None or pending.generation != generation or pending.committing:
+            return False
+        pending.committing = True
+        return True
+
+
+async def _discard_pending_realtime_reply(key: tuple[str, str], generation: int) -> None:
+    async with _pending_realtime_lock:
+        pending = _pending_realtime_replies.get(key)
+        if pending is not None and pending.generation == generation:
+            _pending_realtime_replies.pop(key, None)
+
+
+async def _stop_realtime_reply_workers() -> None:
+    async with _pending_realtime_lock:
+        tasks = [
+            pending.task
+            for pending in _pending_realtime_replies.values()
+            if pending.task is not None and not pending.task.done()
+        ]
+        _pending_realtime_replies.clear()
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _can_append_realtime_context(
+    pending: _PendingRealtimeReply,
+    context: MessageContext,
+    now: float,
+) -> bool:
+    if pending.committing:
+        return False
+    if len(pending.contexts) >= config.bot.realtime_merge_max_messages:
+        return False
+    if now - pending.first_message_at > config.bot.realtime_merge_max_window_seconds:
+        return False
+    return (
+        pending.group_id == context.group_id
+        and pending.user_id == context.user_id
+    )
+
+
+def _cancel_realtime_task(pending: _PendingRealtimeReply) -> None:
+    if pending.task is not None and not pending.task.done():
+        pending.task.cancel()
+
+
+def _realtime_reply_key(context: MessageContext) -> tuple[str, str]:
+    return (context.group_id, context.user_id)
+
+
+def _record_image_descriptions(
+    contexts: Iterable[MessageContext],
+    descriptions: list[str],
+) -> None:
+    for context, context_descriptions in split_image_descriptions_by_context(contexts, descriptions):
+        storage.update_image_descriptions(
+            context.group_id,
+            context.message_id,
+            context_descriptions,
+        )
+
+
+def _finish_pending_vision_contexts(
+    contexts: Iterable[MessageContext],
+    descriptions: list[str],
+) -> None:
+    for context, context_descriptions in split_image_descriptions_by_context(contexts, descriptions):
+        _finish_pending_vision(context, context_descriptions)
 
 
 def _register_pending_vision(context: MessageContext) -> _PendingVision | None:
@@ -739,7 +959,7 @@ async def _handle_pending_vision_timeout(
     bot: Bot,
     context: MessageContext,
     mode: ParticipationMode,
-) -> None:
+) -> bool:
     reason = "pending image vision not ready for image-context follow-up"
     if not context.is_direct:
         storage.record_decision(
@@ -747,7 +967,7 @@ async def _handle_pending_vision_timeout(
             ParticipationDecision("observe", reason, mode, 0.0),
             "",
         )
-        return
+        return False
 
     decision = ParticipationDecision(
         "reply",
@@ -768,7 +988,7 @@ async def _handle_pending_vision_timeout(
     decision_reply = _reply_record_text(send_result.parts, send_result.sticker)
     storage.record_decision(context, decision, decision_reply)
     storage.record_bot_reply_parts(context.group_id, str(bot.self_id), send_result.parts)
-    await group_message.finish()
+    return True
 
 
 def _recent_pending_vision_tasks(context: MessageContext) -> list[_PendingVision]:
@@ -1839,7 +2059,7 @@ async def _send_single_reply(
     for index, (message, attempted_sticker, used_reply) in enumerate(attempts):
         sticker_included = _message_contains_image(message)
         try:
-            await group_message.send(message)
+            await _send_group_message(message, bot=bot, context=context)
         except ActionFailed as exc:
             if first_error is None:
                 first_error = exc
@@ -1874,6 +2094,19 @@ async def _send_single_reply(
     if first_error is not None:
         raise first_error
     return _SingleReplySendResult()
+
+
+async def _send_group_message(
+    message: Message | str,
+    *,
+    bot: Bot | None,
+    context: MessageContext | None,
+) -> None:
+    group_id = _onebot_group_id(context.group_id) if context is not None else None
+    if bot is not None and group_id is not None:
+        await bot.send_group_msg(group_id=group_id, message=message)
+        return
+    await group_message.send(message)
 
 
 async def _queue_remaining_reply_parts(

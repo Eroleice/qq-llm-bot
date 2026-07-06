@@ -42,6 +42,10 @@ class BotConfig:
     reply_bubble_max_parts: int = 3
     reply_bubble_delay_seconds: float = 0.9
     reply_emoji_cooldown_messages: int = 10
+    realtime_merge_enabled: bool = True
+    realtime_merge_grace_seconds: float = 3.0
+    realtime_merge_max_messages: int = 5
+    realtime_merge_max_window_seconds: float = 12.0
     send_retry_enabled: bool = True
     send_retry_max_attempts: int = 6
     send_retry_max_age_seconds: int = 180
@@ -315,6 +319,25 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             "bot.reply_emoji_cooldown_messages",
             0,
             1000,
+        ),
+        realtime_merge_enabled=_bool_value(bot_raw.get("realtime_merge_enabled", True)),
+        realtime_merge_grace_seconds=_float_in_range(
+            bot_raw.get("realtime_merge_grace_seconds", 3.0),
+            "bot.realtime_merge_grace_seconds",
+            0,
+            30,
+        ),
+        realtime_merge_max_messages=_int_in_range(
+            bot_raw.get("realtime_merge_max_messages", 5),
+            "bot.realtime_merge_max_messages",
+            1,
+            20,
+        ),
+        realtime_merge_max_window_seconds=_float_in_range(
+            bot_raw.get("realtime_merge_max_window_seconds", 12.0),
+            "bot.realtime_merge_max_window_seconds",
+            1,
+            120,
         ),
         send_retry_enabled=_bool_value(bot_raw.get("send_retry_enabled", True)),
         send_retry_max_attempts=_int_in_range(

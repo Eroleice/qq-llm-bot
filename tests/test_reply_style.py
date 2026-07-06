@@ -129,6 +129,10 @@ def test_reply_style_config_defaults_and_validation(tmp_path: Path) -> None:
     assert config.bot.reply_bubbles_enabled is True
     assert config.bot.reply_bubble_max_parts == 3
     assert config.bot.reply_bubble_delay_seconds == 0.9
+    assert config.bot.realtime_merge_enabled is True
+    assert config.bot.realtime_merge_grace_seconds == 3.0
+    assert config.bot.realtime_merge_max_messages == 5
+    assert config.bot.realtime_merge_max_window_seconds == 12.0
 
     bad_config_path = tmp_path / "bad-config.toml"
     bad_config_path.write_text(
@@ -146,6 +150,23 @@ def test_reply_style_config_defaults_and_validation(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="bot.reply_bubble_max_parts"):
         load_config(bad_config_path)
+
+    bad_merge_config_path = tmp_path / "bad-merge-config.toml"
+    bad_merge_config_path.write_text(
+        "\n".join(
+            [
+                "[napcat]",
+                'ws_url = "ws://example.test"',
+                "",
+                "[bot]",
+                "realtime_merge_max_messages = 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="bot.realtime_merge_max_messages"):
+        load_config(bad_merge_config_path)
 
 
 def test_storage_records_bot_reply_parts_and_recent_texts(tmp_path: Path) -> None:

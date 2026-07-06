@@ -83,6 +83,10 @@ from qq_llm_bot.onebot_messages import (
     strip_forwarded_records,
     strip_quoted_messages,
 )
+from qq_llm_bot.realtime_merge import (
+    merge_realtime_contexts,
+    split_image_descriptions_by_context,
+)
 from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
 from qq_llm_bot.web_search import SearchResult, default_slang_query
 
@@ -913,6 +917,62 @@ class LLMRoutingTests(unittest.TestCase):
 
 
 class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
+    def test_realtime_merge_context_uses_latest_message_and_combines_context(self) -> None:
+        first = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m1",
+            plain_text="@coco can you explain",
+            raw_message="@coco can you explain",
+            is_direct=True,
+            timestamp=1,
+            attachments=[
+                MessageAttachment(
+                    attachment_type="image",
+                    url="https://example.test/first.png",
+                )
+            ],
+            mentions=[MessageMention(user_id="999", display_name="coco", is_bot=True)],
+        )
+        second = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m2",
+            plain_text="and estimate token cost?",
+            raw_message="and estimate token cost?",
+            timestamp=2,
+            attachments=[
+                MessageAttachment(
+                    attachment_type="image",
+                    url="https://example.test/second.png",
+                )
+            ],
+        )
+
+        merged = merge_realtime_contexts([first, second])
+        slices = split_image_descriptions_by_context([first, second], ["first image", "second image"])
+
+        self.assertEqual(merged.message_id, "m2")
+        self.assertTrue(merged.is_direct)
+        self.assertIn("用户连续发了 2 条", merged.plain_text)
+        self.assertIn("1. @coco can you explain", merged.plain_text)
+        self.assertIn("2. and estimate token cost?", merged.plain_text)
+        self.assertEqual(
+            [attachment.url for attachment in merged.attachments],
+            [
+                "https://example.test/first.png",
+                "https://example.test/second.png",
+            ],
+        )
+        self.assertEqual(merged.mentions[0].user_id, "999")
+        self.assertEqual(
+            [(item.message_id, values) for item, values in slices],
+            [
+                ("m1", ["first image"]),
+                ("m2", ["second image"]),
+            ],
+        )
+
     def test_onebot_at_segment_is_rendered_with_qq_id(self) -> None:
         message = Message("[CQ:at,qq=123,name=Alice] 叫小明")
 
@@ -2619,6 +2679,11 @@ class MemoryStorageTests(unittest.TestCase):
             for node in module.body
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_group_message"
         )
+        process_handler = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_group_context"
+        )
         defer_handler = next(
             node
             for node in module.body
@@ -2638,11 +2703,13 @@ class MemoryStorageTests(unittest.TestCase):
         record_line = _first_attribute_call_line(handler, "record_message")
         ignore_line = _first_attribute_call_line(handler, "is_user_ignored")
         register_pending_line = _first_name_call_line(handler, "_register_pending_vision")
+        realtime_enqueue_line = _first_name_call_line(handler, "_maybe_enqueue_realtime_reply")
         defer_check_line = _first_name_call_line(handler, "_should_defer_realtime_pipeline")
         defer_line = _first_name_call_line(handler, "_defer_observation")
-        pending_wait_line = _first_name_call_line(handler, "_wait_for_relevant_pending_vision")
-        flush_line = _first_name_call_line(handler, "_flush_observation_batch")
-        pipeline_line = _first_attribute_call_line(handler, "run")
+        process_line = _first_name_call_line(handler, "_process_group_context")
+        pending_wait_line = _first_name_call_line(process_handler, "_wait_for_relevant_pending_vision")
+        flush_line = _first_name_call_line(process_handler, "_flush_observation_batch")
+        pipeline_line = _first_attribute_call_line(process_handler, "run")
         ensure_deferred_task_line = _first_name_call_line(defer_handler, "_ensure_deferred_vision_task")
         buffer_append_line = _first_attribute_call_line(defer_handler, "append")
         deferred_vision_line = _first_name_call_line(
@@ -2658,16 +2725,28 @@ class MemoryStorageTests(unittest.TestCase):
 
         self.assertLess(record_line, ignore_line)
         self.assertLess(ignore_line, register_pending_line)
-        self.assertLess(register_pending_line, defer_check_line)
+        self.assertLess(register_pending_line, realtime_enqueue_line)
+        self.assertLess(realtime_enqueue_line, defer_check_line)
         self.assertLess(defer_check_line, defer_line)
-        self.assertLess(defer_line, pending_wait_line)
+        self.assertLess(defer_line, process_line)
         self.assertLess(pending_wait_line, flush_line)
-        self.assertLess(defer_line, pipeline_line)
         self.assertLess(flush_line, pipeline_line)
-        self.assertLess(ignore_line, pipeline_line)
+        self.assertLess(ignore_line, process_line)
         self.assertLess(ensure_deferred_task_line, buffer_append_line)
         self.assertLess(deferred_vision_line, pending_finish_line)
         self.assertLess(observe_vision_line, image_summary_line)
+
+    def test_realtime_merge_source_keeps_cancel_and_commit_contract(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("pending.generation += 1", source)
+        self.assertIn("_cancel_realtime_task(pending)", source)
+        self.assertIn("pending.task.cancel()", source)
+        self.assertIn("_claim_pending_realtime_reply", source)
+        self.assertIn("pending.committing = True", source)
+        self.assertIn("merge_realtime_contexts(contexts)", source)
 
     def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:
         with _project_temp_directory() as tmp:
