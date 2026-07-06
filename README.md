@@ -106,6 +106,7 @@ http://127.0.0.1:8080/dashboard
 #bot persona self reject <memory_id>
 #bot persona self forget <memory_id>
 #bot why
+#bot token
 #bot forget <memory_id>
 #bot llm status
 #bot llm test

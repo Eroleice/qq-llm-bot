@@ -35,6 +35,7 @@ from qq_llm_bot.llm import (
     normalize_chat_completions_url,
     normalize_responses_url,
 )
+from qq_llm_bot.llm_usage_report import format_llm_token_report
 from qq_llm_bot.models import (
     ConversationSnapshot,
     FactRecord,
@@ -294,6 +295,9 @@ async def _handle_admin_command(
 
     if topic == "llm":
         await _handle_llm(bot, event, rest)
+
+    if topic in {"token", "tokens"}:
+        await _handle_token_usage()
 
     if topic == "why":
         await _finish_command(admin_cmd, storage.get_last_decision(group_id))
@@ -1263,6 +1267,12 @@ async def _handle_llm(bot: Bot, event: GroupMessageEvent, rest: list[str]) -> No
         await _finish_command(admin_cmd, reply or "LLM 没有返回内容，请检查 provider/base_url/model/key。")
 
     await _finish_command(admin_cmd, "用法：#bot llm status|test [prompt]")
+
+
+async def _handle_token_usage() -> None:
+    now = int(time.time())
+    data = storage.list_dashboard_llm_usage(since=now - 24 * 3600, limit=1)
+    await _finish_command(admin_cmd, format_llm_token_report(data, hours=24))
 
 
 async def _handle_relation(rest: list[str], group_id: str) -> None:
@@ -2474,6 +2484,7 @@ def _help_text() -> str:
         "#bot stickers list [数量]|enable <id>|disable <id>|delete <id>\n"
         "#bot persona show|self [pending|conflicts|approve <id>|reject <id>|forget <id>]\n"
         "#bot llm status|test [prompt]\n"
+        "#bot token\n"
         "#bot why\n"
         "#bot relation <qq_id>|top [数量]|rank [数量]\n"
         "#bot forget <memory_id>"
