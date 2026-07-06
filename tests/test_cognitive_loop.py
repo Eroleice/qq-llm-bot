@@ -659,6 +659,8 @@ class ImageGenerationTests(unittest.TestCase):
         source = plugin_path.read_text(encoding="utf-8")
 
         self.assertIn("base64_ref = _generated_image_base64_ref(saved.local_path)", source)
+        self.assertIn("except (ActionFailed, NetworkError) as exc:", source)
+        self.assertIn("for include_reply in (True, False):", source)
         self.assertIn('return "base64://" + base64.b64encode(data).decode("ascii")', source)
 
     def test_draw_command_reports_image_generation_failure_detail_to_admins(self) -> None:

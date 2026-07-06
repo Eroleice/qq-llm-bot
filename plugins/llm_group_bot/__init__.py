@@ -14,7 +14,7 @@ from typing import Any
 from loguru import logger
 from nonebot import get_driver, on_command, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
-from nonebot.adapters.onebot.v11.exception import ActionFailed
+from nonebot.adapters.onebot.v11.exception import ActionFailed, NetworkError
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 
@@ -424,27 +424,36 @@ async def _send_generated_image(context: MessageContext, saved: Any) -> bool:
         send_refs.append(("base64", base64_ref))
 
     for ref_kind, file_ref in send_refs:
-        message = Message()
-        message += MessageSegment.reply(context.message_id)
-        message += MessageSegment.text("画好了：\n")
-        message += MessageSegment.image(file=file_ref)
-        try:
-            await draw_cmd.send(message)
-            if ref_kind != "file":
-                logger.info(
-                    "Generated image send succeeded via {} fallback for {}",
+        for include_reply in (True, False):
+            message = _generated_image_message(context.message_id if include_reply else "", file_ref)
+            try:
+                await draw_cmd.send(message)
+                if ref_kind != "file" or not include_reply:
+                    logger.info(
+                        "Generated image send succeeded via {} fallback reply={} for {}",
+                        ref_kind,
+                        include_reply,
+                        saved.local_path or saved.url or saved.file_ref,
+                    )
+                return True
+            except (ActionFailed, NetworkError) as exc:
+                logger.warning(
+                    "Generated image send failed via {} reply={} for {}: {}",
                     ref_kind,
+                    include_reply,
                     saved.local_path or saved.url or saved.file_ref,
+                    exc,
                 )
-            return True
-        except ActionFailed as exc:
-            logger.warning(
-                "Generated image send failed via {} for {}: {}",
-                ref_kind,
-                saved.local_path or saved.url or saved.file_ref,
-                exc,
-            )
     return False
+
+
+def _generated_image_message(reply_to_message_id: str, file_ref: str) -> Message:
+    message = Message()
+    if reply_to_message_id:
+        message += MessageSegment.reply(reply_to_message_id)
+    message += MessageSegment.text("画好了：\n")
+    message += MessageSegment.image(file=file_ref)
+    return message
 
 
 def _generated_image_base64_ref(local_path: str) -> str:
