@@ -1999,7 +1999,8 @@ def _reply_message(
             message += text_message
         else:
             message += MessageSegment.text(reply)
-        message += MessageSegment.text("\n")
+        if file_ref:
+            message += MessageSegment.text("\n")
     if file_ref:
         message += MessageSegment.image(file=file_ref)
     return message

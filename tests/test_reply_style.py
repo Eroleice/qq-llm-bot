@@ -180,3 +180,11 @@ def test_plugin_source_keeps_bubble_send_contract() -> None:
     assert "for index, part in enumerate(parts[:-1])" in source
     assert "last_reply_to = None" in source
     assert "storage.record_bot_reply_parts" in source
+
+
+def test_plugin_reply_message_only_adds_newline_before_image() -> None:
+    source = (Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'if file_ref:\n            message += MessageSegment.text("\\n")' in source
