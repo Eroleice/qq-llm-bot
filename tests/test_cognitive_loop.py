@@ -2187,6 +2187,11 @@ class MemoryStorageTests(unittest.TestCase):
             for node in module.body
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_defer_observation"
         )
+        pending_deferred_handler = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_pending_deferred_vision"
+        )
         deferred_vision_handler = next(
             node
             for node in module.body
@@ -2195,22 +2200,36 @@ class MemoryStorageTests(unittest.TestCase):
 
         record_line = _first_attribute_call_line(handler, "record_message")
         ignore_line = _first_attribute_call_line(handler, "is_user_ignored")
+        register_pending_line = _first_name_call_line(handler, "_register_pending_vision")
         defer_check_line = _first_name_call_line(handler, "_should_defer_realtime_pipeline")
         defer_line = _first_name_call_line(handler, "_defer_observation")
+        pending_wait_line = _first_name_call_line(handler, "_wait_for_relevant_pending_vision")
         flush_line = _first_name_call_line(handler, "_flush_observation_batch")
         pipeline_line = _first_attribute_call_line(handler, "run")
-        deferred_vision_line = _first_name_call_line(defer_handler, "_record_deferred_vision")
+        ensure_deferred_task_line = _first_name_call_line(defer_handler, "_ensure_deferred_vision_task")
         buffer_append_line = _first_attribute_call_line(defer_handler, "append")
+        deferred_vision_line = _first_name_call_line(
+            pending_deferred_handler,
+            "_record_deferred_vision",
+        )
+        pending_finish_line = _first_name_call_line(
+            pending_deferred_handler,
+            "_finish_pending_vision",
+        )
         observe_vision_line = _first_attribute_call_line(deferred_vision_handler, "observe_vision")
         image_summary_line = _first_attribute_call_line(deferred_vision_handler, "update_image_descriptions")
 
         self.assertLess(record_line, ignore_line)
-        self.assertLess(record_line, defer_check_line)
+        self.assertLess(ignore_line, register_pending_line)
+        self.assertLess(register_pending_line, defer_check_line)
         self.assertLess(defer_check_line, defer_line)
+        self.assertLess(defer_line, pending_wait_line)
+        self.assertLess(pending_wait_line, flush_line)
         self.assertLess(defer_line, pipeline_line)
         self.assertLess(flush_line, pipeline_line)
         self.assertLess(ignore_line, pipeline_line)
-        self.assertLess(deferred_vision_line, buffer_append_line)
+        self.assertLess(ensure_deferred_task_line, buffer_append_line)
+        self.assertLess(deferred_vision_line, pending_finish_line)
         self.assertLess(observe_vision_line, image_summary_line)
 
     def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:
