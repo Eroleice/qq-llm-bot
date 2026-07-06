@@ -306,6 +306,12 @@ class DrawReferenceTests(unittest.TestCase):
         llm = FakeLLM(
             [
                 (
+                    '{"references":[{"work_name":"异环","reference_name":"真红",'
+                    '"reference_type":"character","role":"appearance",'
+                    '"search_query":"异环 真红 角色 外观 设定",'
+                    '"should_search":true,"confidence":0.92}]}'
+                ),
+                (
                     '{"is_match":true,'
                     '"visual_summary":"白色长发，红黑制服，带有尖锐头饰和冷淡表情",'
                     '"confidence":0.86}'
@@ -332,13 +338,22 @@ class DrawReferenceTests(unittest.TestCase):
         self.assertEqual(len(search.calls), 1)
         self.assertIn("异环", search.calls[0])
         self.assertIn("真红", search.calls[0])
-        self.assertEqual(llm.text_call_purposes, ["draw_reference"])
+        self.assertEqual(llm.text_call_purposes, ["draw_reference_detect", "draw_reference"])
         context = format_draw_reference_context(reference, has_reference_image_context=True)
         self.assertIn("可画视觉事实", context)
         self.assertIn("优先使用图片视觉内容", context)
 
     def test_resolver_degrades_when_reference_search_has_no_results(self) -> None:
-        llm = FakeLLM()
+        llm = FakeLLM(
+            [
+                (
+                    '{"references":[{"work_name":"异环","reference_name":"真红",'
+                    '"reference_type":"character","role":"appearance",'
+                    '"search_query":"异环 真红 角色 外观 设定",'
+                    '"should_search":true,"confidence":0.92}]}'
+                )
+            ]
+        )
         search = FakeSearch([])
         resolver = DrawReferenceResolver(llm, search)
 
@@ -348,14 +363,38 @@ class DrawReferenceTests(unittest.TestCase):
         assert reference is not None
         self.assertEqual(reference.status, "unresolved")
         self.assertEqual(len(search.calls), 1)
-        self.assertEqual(llm.text_calls, [])
+        self.assertEqual(llm.text_call_purposes, ["draw_reference_detect"])
         context = format_draw_reference_context(reference)
-        self.assertIn("不要把角色名按字面解释成颜色", context)
+        self.assertIn("不要把参考名按字面解释成颜色", context)
         self.assertIn("真红", context)
+
+    def test_llm_detector_empty_result_prevents_regex_fallback(self) -> None:
+        llm = FakeLLM(['{"references":[]}'])
+        search = FakeSearch(
+            [
+                SearchResult(
+                    title="should not search",
+                    url="https://example.test/nope",
+                    snippet="",
+                )
+            ]
+        )
+        resolver = DrawReferenceResolver(llm, search)
+
+        references = asyncio.run(resolver.resolve_all("参考异环里的红色，画一个配色方案"))
+
+        self.assertEqual(references, [])
+        self.assertEqual(search.calls, [])
 
     def test_resolver_reuses_cached_reference(self) -> None:
         llm = FakeLLM(
             [
+                (
+                    '{"references":[{"work_name":"异环","reference_name":"真红",'
+                    '"reference_type":"character","role":"appearance",'
+                    '"search_query":"异环 真红 角色 外观 设定",'
+                    '"should_search":true,"confidence":0.92}]}'
+                ),
                 (
                     '{"is_match":true,'
                     '"visual_summary":"银白长发，红色眼睛，黑红配色服装",'
@@ -382,7 +421,105 @@ class DrawReferenceTests(unittest.TestCase):
         assert first is not None and second is not None
         self.assertEqual(first.visual_summary, second.visual_summary)
         self.assertEqual(len(search.calls), 1)
-        self.assertEqual(len(llm.text_calls), 1)
+        self.assertEqual(len(llm.text_calls), 3)
+
+    def test_llm_detector_handles_species_and_clothing_references(self) -> None:
+        llm = FakeLLM(
+            [
+                (
+                    '{"references":['
+                    '{"work_name":"FF14","reference_name":"敖龙族",'
+                    '"reference_type":"species","role":"species",'
+                    '"search_query":"FF14 敖龙族 种族 特征 外观",'
+                    '"should_search":true,"confidence":0.94},'
+                    '{"work_name":"","reference_name":"嗷齁仙子",'
+                    '"reference_type":"costume","role":"clothing",'
+                    '"search_query":"嗷齁仙子 服装 造型 外观",'
+                    '"should_search":true,"confidence":0.88}]}'
+                ),
+                (
+                    '{"is_match":true,'
+                    '"visual_summary":"额角长角，尾巴，鳞片点缀，偏龙族少女体貌",'
+                    '"confidence":0.83}'
+                ),
+                (
+                    '{"is_match":true,'
+                    '"visual_summary":"飘逸仙子裙装，轻薄长袖，华丽头饰和柔和浅色配色",'
+                    '"confidence":0.81}'
+                ),
+            ]
+        )
+        search = FakeSearch(
+            [
+                SearchResult(
+                    title="参考资料",
+                    url="https://example.test/ref",
+                    snippet="参考项包含可用于生图的外观设定。",
+                )
+            ]
+        )
+        resolver = DrawReferenceResolver(llm, search)
+
+        references = asyncio.run(
+            resolver.resolve_all(
+                "参考ff14里的敖龙族，画一个白肤色的敖龙族少女，"
+                "服饰参考一下嗷齁仙子，需要紫色唇色紫色眼影"
+            )
+        )
+
+        self.assertEqual(len(references), 2)
+        self.assertEqual(references[0].candidate.reference_type, "species")
+        self.assertEqual(references[0].candidate.role, "species")
+        self.assertEqual(references[1].candidate.reference_type, "costume")
+        self.assertEqual(references[1].candidate.role, "clothing")
+        self.assertEqual(len(search.calls), 2)
+        self.assertIn("敖龙族", search.calls[0])
+        self.assertIn("嗷齁仙子", search.calls[1])
+        context = format_draw_reference_context(references)
+        self.assertIn("种族体貌", context)
+        self.assertIn("服饰锚点", context)
+
+    def test_llm_detector_handles_fusion_references(self) -> None:
+        llm = FakeLLM(
+            [
+                (
+                    '{"references":['
+                    '{"work_name":"异环","reference_name":"真红",'
+                    '"reference_type":"character","role":"fusion",'
+                    '"search_query":"异环 真红 角色 外观 特征",'
+                    '"should_search":true,"confidence":0.93},'
+                    '{"work_name":"异环","reference_name":"伊洛伊",'
+                    '"reference_type":"character","role":"fusion",'
+                    '"search_query":"异环 伊洛伊 角色 外观 特征",'
+                    '"should_search":true,"confidence":0.93}]}'
+                ),
+                '{"is_match":true,"visual_summary":"白发，红黑服饰，冷淡神情","confidence":0.84}',
+                '{"is_match":true,"visual_summary":"金色装饰，活泼轮廓，明亮配色","confidence":0.82}',
+            ]
+        )
+        search = FakeSearch(
+            [
+                SearchResult(
+                    title="异环角色资料",
+                    url="https://example.test/yihuan",
+                    snippet="角色资料含外观设定。",
+                )
+            ]
+        )
+        resolver = DrawReferenceResolver(llm, search)
+
+        references = asyncio.run(
+            resolver.resolve_all("可可，参考异环里的真红和伊洛伊，画一个融合他俩特征的二创角色。")
+        )
+
+        self.assertEqual(len(references), 2)
+        self.assertEqual([item.candidate.character_name for item in references], ["真红", "伊洛伊"])
+        self.assertTrue(all(item.candidate.role == "fusion" for item in references))
+        self.assertEqual(len(search.calls), 2)
+        context = format_draw_reference_context(references)
+        self.assertIn("融合特征", context)
+        self.assertIn("真红", context)
+        self.assertIn("伊洛伊", context)
 
 
 class ImageGenerationTests(unittest.TestCase):
@@ -628,9 +765,9 @@ class ImageGenerationTests(unittest.TestCase):
         )
         source = plugin_path.read_text(encoding="utf-8")
 
-        self.assertIn("draw_reference_resolver.resolve(draw_request)", source)
+        self.assertIn("draw_reference_resolver.resolve_all(draw_request)", source)
         self.assertIn("已解析生图参考", source)
-        self.assertIn("不要把角色名按字面颜色", source)
+        self.assertIn("不要把参考名按字面颜色", source)
 
 
 class LLMRoutingTests(unittest.TestCase):
@@ -694,6 +831,7 @@ class LLMRoutingTests(unittest.TestCase):
         client._post_chat_completion = fake_post_chat_completion  # type: ignore[method-assign]
 
         asyncio.run(client.complete_text("s", "u", purpose="perception"))
+        asyncio.run(client.complete_text("s", "u", purpose="draw_reference_detect"))
         asyncio.run(client.complete_text("s", "u", purpose="draw_reference"))
         asyncio.run(client.complete_text("s", "u", purpose="response"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa"))
@@ -703,6 +841,7 @@ class LLMRoutingTests(unittest.TestCase):
             captured,
             [
                 ("perception", "gpt-5.4-mini"),
+                ("draw_reference_detect", "gpt-5.4-mini"),
                 ("draw_reference", "gpt-5.4-mini"),
                 ("response", "gpt-5.5"),
                 ("final_qa", "gpt-5.4-mini"),

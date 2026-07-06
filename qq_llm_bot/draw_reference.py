@@ -18,6 +18,8 @@ class DrawReferenceCandidate:
     query: str
     confidence: float
     reason: str = ""
+    reference_type: str = "character"
+    role: str = "appearance"
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,17 @@ _REFERENCE_CUE_PATTERN = re.compile(
     r"(参考|参照|照着|像|按|借鉴|基于|二创|同人|cos|COS|同款|角色|人物|设定|外观|立绘|"
     r"游戏|手游|动漫|动画|番剧|作品)"
 )
+_REFERENCE_TYPES = {"character", "species", "costume", "style", "object", "other"}
+_REFERENCE_ROLES = {
+    "appearance",
+    "species",
+    "clothing",
+    "makeup",
+    "fusion",
+    "style",
+    "pose",
+    "other",
+}
 
 
 class DrawReferenceResolver:
@@ -113,21 +126,44 @@ class DrawReferenceResolver:
         web_search: DrawReferenceSearch,
         *,
         max_results: int = 5,
+        max_references: int = 4,
         cache_ttl_seconds: int = 6 * 60 * 60,
         min_search_confidence: float = 0.7,
     ) -> None:
         self.llm = llm
         self.web_search = web_search
         self.max_results = max(1, max_results)
+        self.max_references = max(1, max_references)
         self.cache_ttl_seconds = max(60, cache_ttl_seconds)
         self.min_search_confidence = min_search_confidence
         self._cache: dict[str, DrawResolvedReference] = {}
 
     async def resolve(self, draw_request: str) -> DrawResolvedReference | None:
-        candidate = detect_draw_reference(draw_request)
-        if candidate is None:
-            return None
+        references = await self.resolve_all(draw_request)
+        return references[0] if references else None
 
+    async def resolve_all(self, draw_request: str) -> list[DrawResolvedReference]:
+        candidates = await self._detect_candidates(draw_request)
+        if not candidates:
+            return []
+
+        resolved: list[DrawResolvedReference] = []
+        for candidate in candidates[: self.max_references]:
+            resolved.append(await self._resolve_candidate(candidate))
+        return resolved
+
+    async def _detect_candidates(self, draw_request: str) -> list[DrawReferenceCandidate]:
+        candidates = await _detect_references_with_llm(self.llm, draw_request)
+        if candidates is not None:
+            return _dedupe_candidates(candidates)
+
+        fallback = detect_draw_reference(draw_request)
+        return [fallback] if fallback else []
+
+    async def _resolve_candidate(
+        self,
+        candidate: DrawReferenceCandidate,
+    ) -> DrawResolvedReference:
         key = draw_reference_cache_key(candidate)
         cached = self._cache.get(key)
         now = int(time.time())
@@ -213,24 +249,71 @@ def detect_draw_reference(draw_request: str) -> DrawReferenceCandidate | None:
     return candidates[0]
 
 
+async def _detect_references_with_llm(
+    llm: DrawReferenceLLM,
+    draw_request: str,
+) -> list[DrawReferenceCandidate] | None:
+    text = " ".join(str(draw_request or "").split())
+    if not text:
+        return []
+
+    reply = await llm.complete_text(
+        "你是生图请求里的参考需求识别器。只输出 JSON，不要解释。",
+        (
+            "判断用户画图请求中是否提到了需要联网查证外观的已有作品、游戏、角色、种族、服饰、"
+            "梗名、皮肤、道具或风格参考。把每个独立参考拆成一项。"
+            "重点规则："
+            "1. “FF14里的敖龙族”是 species/reference；“服饰参考嗷齁仙子”是 clothing/reference。"
+            "2. “异环里的真红和伊洛伊，融合他俩特征”要拆成真红、伊洛伊两项，role=fusion。"
+            "3. 不要把用户明确给出的普通颜色、妆容、肤色、构图要求当成参考项，"
+            "例如“真红色”“紫色唇色”“白肤色”“紫色眼影”不是搜索 reference。"
+            "4. 只有确实指向外部既有对象且需要查证视觉信息时 should_search=true。"
+            "输出 JSON："
+            '{"references":[{"work_name":"作品/系列/游戏，可空",'
+            '"reference_name":"角色/种族/服饰/风格名",'
+            '"reference_type":"character|species|costume|style|object|other",'
+            '"role":"appearance|species|clothing|makeup|fusion|style|pose|other",'
+            '"search_query":"适合搜索外观设定的查询",'
+            '"should_search":bool,"confidence":0.0}]}\n'
+            f"用户请求：{text}"
+        ),
+        purpose="draw_reference_detect",
+    )
+    data = _extract_json_object(reply)
+    if not data:
+        return None
+
+    raw_items = data.get("references")
+    if not isinstance(raw_items, list):
+        return None
+
+    candidates: list[DrawReferenceCandidate] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        candidate = _candidate_from_detector_item(item)
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
 def draw_reference_cache_key(candidate: DrawReferenceCandidate) -> str:
     return (
         f"work:{_normalize_cache_part(candidate.work_name)}|"
+        f"type:{_normalize_cache_part(candidate.reference_type)}|"
         f"character:{_normalize_cache_part(candidate.character_name)}"
     )
 
 
 def format_draw_reference_context(
-    reference: DrawResolvedReference | None,
+    reference: DrawResolvedReference | list[DrawResolvedReference] | None,
     *,
     has_reference_image_context: bool = False,
 ) -> str:
-    if reference is None:
+    references = _normalize_resolved_references(reference)
+    if not references:
         return "(none)"
 
-    candidate = reference.candidate
-    work = f"《{candidate.work_name}》" if candidate.work_name else "未指定作品"
-    character = f"「{candidate.character_name}」"
     lines = []
     if has_reference_image_context:
         lines.append(
@@ -238,30 +321,72 @@ def format_draw_reference_context(
             "联网参考只作补充。"
         )
 
-    if reference.status == "resolved" and reference.visual_summary:
-        lines.extend(
-            [
-                f"已查证参考：{work}角色{character}。",
-                f"联网查询：{candidate.query}",
-                f"可画视觉事实：{reference.visual_summary}",
-                "使用方式：只把这些已查证外观特征当作二创锚点；不要 1:1 复刻，"
-                "也不要补充来源没有支持的服装、武器或发色。",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                f"疑似专名参考：{work}角色{character}，但未取得可靠外观摘要。",
-                f"尝试查询：{candidate.query}",
-                "处理要求：不要把角色名按字面解释成颜色或普通词，"
-                "不要编造该角色的发色、服装、武器、性格或标志物；"
-                "如果仍要出图，只生成更泛化的原创版本，并保留“参考未确认”的不确定性。",
-            ]
-        )
-
-    if reference.source_urls:
-        lines.append("来源URL：" + "；".join(reference.source_urls[:3]))
+    for index, item in enumerate(references, start=1):
+        candidate = item.candidate
+        work = f"《{candidate.work_name}》" if candidate.work_name else "未指定作品"
+        ref_name = f"「{candidate.character_name}」"
+        ref_kind = _reference_kind_label(candidate)
+        role_label = _reference_role_label(candidate.role)
+        if item.status == "resolved" and item.visual_summary:
+            lines.extend(
+                [
+                    f"参考{index}：已查证 {work}{ref_kind}{ref_name}，用途={role_label}。",
+                    f"联网查询：{candidate.query}",
+                    f"可画视觉事实：{item.visual_summary}",
+                    "使用方式：只把这些已查证外观特征当作本次画面的锚点；不要 1:1 复刻，"
+                    "也不要补充来源没有支持的服装、武器、发色、妆容或体貌。",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"参考{index}：疑似专名参考 {work}{ref_kind}{ref_name}，用途={role_label}，"
+                    "但未取得可靠外观摘要。",
+                    f"尝试查询：{candidate.query}",
+                    "处理要求：不要把参考名按字面解释成颜色或普通词，"
+                    "不要编造该参考的发色、服装、武器、性格、妆容或标志物；"
+                    "如果仍要出图，只生成更泛化的原创版本，并保留“参考未确认”的不确定性。",
+                ]
+            )
+        if item.source_urls:
+            lines.append("来源URL：" + "；".join(item.source_urls[:3]))
     return "\n".join(lines)
+
+
+def _normalize_resolved_references(
+    reference: DrawResolvedReference | list[DrawResolvedReference] | None,
+) -> list[DrawResolvedReference]:
+    if reference is None:
+        return []
+    if isinstance(reference, list):
+        return reference
+    return [reference]
+
+
+def _reference_kind_label(candidate: DrawReferenceCandidate) -> str:
+    labels = {
+        "character": "角色",
+        "species": "种族/族群",
+        "costume": "服饰参考",
+        "style": "风格参考",
+        "object": "物件参考",
+        "other": "参考",
+    }
+    return labels.get(candidate.reference_type, "参考")
+
+
+def _reference_role_label(role: str) -> str:
+    labels = {
+        "appearance": "外观锚点",
+        "species": "种族体貌",
+        "clothing": "服饰锚点",
+        "makeup": "妆容锚点",
+        "fusion": "融合特征",
+        "style": "风格锚点",
+        "pose": "姿态锚点",
+        "other": "参考锚点",
+    }
+    return labels.get(role, "参考锚点")
 
 
 def _candidate_from_match(
@@ -293,6 +418,40 @@ def _candidate_from_match(
     )
 
 
+def _candidate_from_detector_item(item: dict[str, object]) -> DrawReferenceCandidate | None:
+    if not _as_bool(item.get("should_search"), True):
+        return None
+
+    work = _clean_work_name(str(item.get("work_name", "") or ""))
+    reference_name = _clean_character_name(
+        str(
+            item.get("reference_name")
+            or item.get("character_name")
+            or item.get("name")
+            or ""
+        )
+    )
+    reference_type = _safe_reference_type(str(item.get("reference_type", "other") or "other"))
+    role = _safe_reference_role(str(item.get("role", "appearance") or "appearance"))
+    confidence = _clamp_float(item.get("confidence", 0.0))
+    if confidence < 0.45 or not _valid_reference_names(work, reference_name):
+        return None
+
+    query = _clean_query(str(item.get("search_query", "") or ""))
+    if not query:
+        query = build_draw_reference_query(work, reference_name, reference_type, role)
+
+    return DrawReferenceCandidate(
+        work_name=work,
+        character_name=reference_name,
+        query=query,
+        confidence=confidence,
+        reason="llm_detect",
+        reference_type=reference_type,
+        role=role,
+    )
+
+
 def _match_has_reference_cue(match: re.Match[str], full_text: str) -> bool:
     groups = match.groupdict()
     if groups.get("ref_prefix") or groups.get("work_quoted"):
@@ -300,8 +459,14 @@ def _match_has_reference_cue(match: re.Match[str], full_text: str) -> bool:
     return bool(_REFERENCE_CUE_PATTERN.search(full_text))
 
 
-def build_draw_reference_query(work_name: str, character_name: str) -> str:
-    parts = [work_name, character_name, "角色", "外观", "设定"]
+def build_draw_reference_query(
+    work_name: str,
+    character_name: str,
+    reference_type: str = "character",
+    role: str = "appearance",
+) -> str:
+    hint = _query_hint(reference_type, role)
+    parts = [work_name, character_name, hint, "外观", "设定"]
     return " ".join(part for part in parts if part)
 
 
@@ -315,12 +480,16 @@ async def _summarize_reference(
         (
             "根据搜索结果判断用户请求的作品/角色引用是否匹配，并提取可画的视觉事实。"
             "只能依据搜索结果里的标题和摘要；不要补充来源没有明确支持的外观。"
-            "visual_summary 只写发型、服装、配色、体态、标志物等可画信息，"
+            "根据 reference_type 和 role 决定提取重点：species 关注种族体貌、角、尾、鳞片、肤色范围等；"
+            "clothing/costume 关注服饰轮廓、配色、材质和装饰；fusion 关注最可辨识的外观锚点；"
+            "makeup 关注妆容。visual_summary 只写发型、服装、配色、体态、标志物等可画信息，"
             "不写剧情评价或无关背景。没有可靠外观就 is_match=false。"
             "输出 JSON："
             '{"is_match":bool,"visual_summary":"可画视觉摘要","confidence":0.0}\n'
             f"作品：{candidate.work_name or '(unknown)'}\n"
-            f"角色：{candidate.character_name}\n"
+            f"参考名：{candidate.character_name}\n"
+            f"参考类型：{candidate.reference_type}\n"
+            f"本次用途：{candidate.role}\n"
             f"搜索查询：{candidate.query}\n"
             f"搜索结果：\n{_format_reference_search_results(results)}"
         ),
@@ -400,6 +569,48 @@ def _valid_reference_names(work: str, character: str) -> bool:
     if character.endswith("色") and len(character) <= 4 and not work:
         return False
     return True
+
+
+def _dedupe_candidates(candidates: list[DrawReferenceCandidate]) -> list[DrawReferenceCandidate]:
+    seen: set[str] = set()
+    deduped: list[DrawReferenceCandidate] = []
+    for candidate in candidates:
+        key = draw_reference_cache_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _safe_reference_type(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _REFERENCE_TYPES else "other"
+
+
+def _safe_reference_role(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _REFERENCE_ROLES else "appearance"
+
+
+def _query_hint(reference_type: str, role: str) -> str:
+    if reference_type == "species" or role == "species":
+        return "种族 特征"
+    if reference_type == "costume" or role == "clothing":
+        return "服装 造型"
+    if role == "makeup":
+        return "妆容 外观"
+    if role == "fusion":
+        return "角色 外观 特征"
+    if reference_type == "style" or role == "style":
+        return "风格 外观"
+    if reference_type == "object":
+        return "道具 外观"
+    return "角色"
+
+
+def _clean_query(value: str) -> str:
+    return " ".join(str(value or "").split())[:120]
 
 
 def _normalize_cache_part(value: str) -> str:
