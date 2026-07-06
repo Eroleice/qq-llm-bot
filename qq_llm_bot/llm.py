@@ -15,6 +15,7 @@ from qq_llm_bot.config import ImageGenerationConfig, LLMConfig, VisionConfig
 
 BASE_TEXT_PURPOSES = {
     "batch_observation",
+    "draw_reference",
     "fact_extract",
     "followup_gate",
     "lexicon_detect",

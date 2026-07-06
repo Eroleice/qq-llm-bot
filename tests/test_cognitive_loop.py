@@ -44,6 +44,11 @@ from qq_llm_bot.config import (
     VisionConfig,
     load_config,
 )
+from qq_llm_bot.draw_reference import (
+    DrawReferenceResolver,
+    detect_draw_reference,
+    format_draw_reference_context,
+)
 from qq_llm_bot.models import (
     ConversationSnapshot,
     FactCandidate,
@@ -270,6 +275,114 @@ def _first_name_call_line(node: ast.AST, function_name: str) -> int:
 class WebSearchTests(unittest.TestCase):
     def test_default_slang_query_uses_readable_chinese_terms(self) -> None:
         self.assertEqual(default_slang_query("内卷"), "内卷 网络用语 梗 意思")
+
+
+class DrawReferenceTests(unittest.TestCase):
+    def test_detector_finds_work_character_reference(self) -> None:
+        candidate = detect_draw_reference("参考异环中的真红，画一个二创的龙娘角色")
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.work_name, "异环")
+        self.assertEqual(candidate.character_name, "真红")
+        self.assertIn("异环", candidate.query)
+        self.assertIn("真红", candidate.query)
+
+    def test_detector_finds_game_role_reference(self) -> None:
+        candidate = detect_draw_reference("游戏异环角色真红的二创头像")
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.work_name, "异环")
+        self.assertEqual(candidate.character_name, "真红")
+
+    def test_detector_does_not_treat_literal_color_as_character_reference(self) -> None:
+        self.assertIsNone(detect_draw_reference("画一个真红色的龙娘"))
+
+    def test_detector_does_not_treat_plain_scene_as_character_reference(self) -> None:
+        self.assertIsNone(detect_draw_reference("画花园中的女孩，阳光明亮"))
+
+    def test_resolver_searches_and_summarizes_visual_reference(self) -> None:
+        llm = FakeLLM(
+            [
+                (
+                    '{"is_match":true,'
+                    '"visual_summary":"白色长发，红黑制服，带有尖锐头饰和冷淡表情",'
+                    '"confidence":0.86}'
+                )
+            ]
+        )
+        search = FakeSearch(
+            [
+                SearchResult(
+                    title="异环 真红 角色图鉴",
+                    url="https://example.test/shinku",
+                    snippet="真红是异环角色，角色立绘展示白色长发、红黑制服和尖锐头饰。",
+                )
+            ]
+        )
+        resolver = DrawReferenceResolver(llm, search, max_results=3)
+
+        reference = asyncio.run(resolver.resolve("参考异环中的真红，画一个二创的龙娘角色"))
+
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        self.assertEqual(reference.status, "resolved")
+        self.assertIn("白色长发", reference.visual_summary)
+        self.assertEqual(len(search.calls), 1)
+        self.assertIn("异环", search.calls[0])
+        self.assertIn("真红", search.calls[0])
+        self.assertEqual(llm.text_call_purposes, ["draw_reference"])
+        context = format_draw_reference_context(reference, has_reference_image_context=True)
+        self.assertIn("可画视觉事实", context)
+        self.assertIn("优先使用图片视觉内容", context)
+
+    def test_resolver_degrades_when_reference_search_has_no_results(self) -> None:
+        llm = FakeLLM()
+        search = FakeSearch([])
+        resolver = DrawReferenceResolver(llm, search)
+
+        reference = asyncio.run(resolver.resolve("参考异环中的真红，画一个二创的龙娘角色"))
+
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        self.assertEqual(reference.status, "unresolved")
+        self.assertEqual(len(search.calls), 1)
+        self.assertEqual(llm.text_calls, [])
+        context = format_draw_reference_context(reference)
+        self.assertIn("不要把角色名按字面解释成颜色", context)
+        self.assertIn("真红", context)
+
+    def test_resolver_reuses_cached_reference(self) -> None:
+        llm = FakeLLM(
+            [
+                (
+                    '{"is_match":true,'
+                    '"visual_summary":"银白长发，红色眼睛，黑红配色服装",'
+                    '"confidence":0.82}'
+                )
+            ]
+        )
+        search = FakeSearch(
+            [
+                SearchResult(
+                    title="异环 真红 角色设定",
+                    url="https://example.test/shinku",
+                    snippet="真红拥有银白长发、红色眼睛和黑红配色服装。",
+                )
+            ]
+        )
+        resolver = DrawReferenceResolver(llm, search)
+
+        first = asyncio.run(resolver.resolve("参考异环中的真红，画一个龙娘"))
+        second = asyncio.run(resolver.resolve("像异环里的真红，画一个二创头像"))
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual(first.visual_summary, second.visual_summary)
+        self.assertEqual(len(search.calls), 1)
+        self.assertEqual(len(llm.text_calls), 1)
 
 
 class ImageGenerationTests(unittest.TestCase):
@@ -509,6 +622,16 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertIn('"appearance_prompt": config.persona.appearance_prompt', storage_source)
         self.assertIn("appearance_prompt 只约束人物样貌，不固定服装、场景", plugin_source)
 
+    def test_draw_prompt_includes_resolved_reference_context(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        self.assertIn("draw_reference_resolver.resolve(draw_request)", source)
+        self.assertIn("已解析生图参考", source)
+        self.assertIn("不要把角色名按字面颜色", source)
+
 
 class LLMRoutingTests(unittest.TestCase):
     def test_llm_routing_config_is_loaded_from_nested_table(self) -> None:
@@ -571,6 +694,7 @@ class LLMRoutingTests(unittest.TestCase):
         client._post_chat_completion = fake_post_chat_completion  # type: ignore[method-assign]
 
         asyncio.run(client.complete_text("s", "u", purpose="perception"))
+        asyncio.run(client.complete_text("s", "u", purpose="draw_reference"))
         asyncio.run(client.complete_text("s", "u", purpose="response"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa", model_tier="flagship"))
@@ -579,6 +703,7 @@ class LLMRoutingTests(unittest.TestCase):
             captured,
             [
                 ("perception", "gpt-5.4-mini"),
+                ("draw_reference", "gpt-5.4-mini"),
                 ("response", "gpt-5.5"),
                 ("final_qa", "gpt-5.4-mini"),
                 ("final_qa", "gpt-5.5"),
