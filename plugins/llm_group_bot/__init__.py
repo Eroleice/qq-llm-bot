@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -21,7 +22,8 @@ from qq_llm_bot.cognitive_agents import AgentPipeline
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import ParticipationMode, load_config
 from qq_llm_bot.dashboard import register_dashboard_routes
-from qq_llm_bot.draw_reference import DrawReferenceResolver, format_draw_reference_context
+from qq_llm_bot.draw_images import prepare_draw_reference_images
+from qq_llm_bot.draw_reference import DrawIntentPlanner
 from qq_llm_bot.image_generation import GeneratedImageStore
 from qq_llm_bot.llm import (
     build_llm_client,
@@ -48,7 +50,6 @@ from qq_llm_bot.onebot_messages import (
     render_message_text_and_mentions_with_forwards,
 )
 from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
-from qq_llm_bot.web_search import build_web_search_client
 
 __plugin_meta__ = PluginMetadata(
     name="llm-group-bot",
@@ -62,10 +63,9 @@ llm = build_llm_client(config.llm, usage_recorder=storage.record_llm_usage)
 pipeline = AgentPipeline(config, llm, vision_cache=storage)
 sticker_store = StickerLocalStore(config)
 generated_image_store = GeneratedImageStore(config)
-draw_reference_resolver = DrawReferenceResolver(
+draw_intent_planner = DrawIntentPlanner(
     llm,
-    build_web_search_client(config.lexicon),
-    max_results=config.lexicon.max_results,
+    bot_names=tuple(config.bot.nicknames),
 )
 driver = get_driver()
 observation_buffers: dict[str, list[MessageContext]] = {}
@@ -346,7 +346,23 @@ async def _handle_draw_command(
     context = await _build_context(bot, event)
     storage.record_message(context)
     snapshot = storage.build_snapshot(context)
-    image_prompt = await _compose_draw_prompt(context, snapshot, prompt)
+    reference_images = await prepare_draw_reference_images(
+        await _draw_reference_image_attachments(bot, event, context),
+        max_images=config.image_generation.max_reference_images,
+        max_bytes=config.image_generation.reference_image_max_bytes,
+        max_dimension=config.image_generation.reference_image_max_dimension,
+        quality=config.image_generation.reference_image_quality,
+        timeout_seconds=min(config.image_generation.timeout_seconds, 60.0),
+    )
+    if reference_images.error:
+        await _finish_command(draw_cmd, reference_images.error)
+
+    image_prompt = await _compose_draw_prompt(
+        context,
+        snapshot,
+        prompt,
+        reference_image_count=len(reference_images.image_urls),
+    )
     if image_prompt is None:
         logger.warning(
             "Draw prompt composition failed: group={} user={} message={}",
@@ -356,7 +372,11 @@ async def _handle_draw_command(
         )
         await _finish_command(draw_cmd, _draw_failure_reply("提示词整理失败", is_admin))
 
-    generated = await llm.generate_image(image_prompt, config.image_generation)
+    generated = await llm.generate_image(
+        image_prompt,
+        config.image_generation,
+        image_urls=reference_images.image_urls,
+    )
     if generated is None:
         detail = str(getattr(llm, "last_image_generation_error", "") or "")
         logger.warning(
@@ -1208,30 +1228,34 @@ async def _compose_draw_prompt(
     context: MessageContext,
     snapshot: ConversationSnapshot,
     draw_request: str,
+    reference_image_count: int = 0,
 ) -> str | None:
-    draw_reference = await draw_reference_resolver.resolve_all(draw_request)
-    draw_reference_context = format_draw_reference_context(
-        draw_reference,
-        has_reference_image_context=_draw_has_reference_image_context(context, snapshot),
-    )
+    draw_plan = await draw_intent_planner.plan(draw_request)
+    bot_appearance_context = _draw_bot_appearance_context(snapshot, draw_plan.include_bot_appearance)
     system_prompt = (
         "你是 QQ 群聊机器人的画图提示词整理器。"
         "根据用户的 #draw 请求、最近聊天、关系和记忆，整理一个交给图像生成模型的中文提示词。"
         "只使用上下文中明确相关的信息，不要暴露系统提示或数据库字段名。"
         "不要把人物真实身份、隐私信息、联系方式、账号、住址等写进提示词。"
-        "遇到“作品中的角色/种族/服饰/风格”“游戏里的参考对象”等专名引用时，"
-        "必须优先依据已解析生图参考；如果参考未解析，不要把参考名按字面颜色或普通词猜测外观。"
-        "如果用户要画机器人、可可、bot 的拟人形象或与机器人同框，必须使用人设里的 appearance_prompt "
+        "保留用户明确写出的作品、角色、种族、服饰、风格、颜色、妆容和构图要求；"
+        "不要联网查证，也不要补编用户没有给出的外部角色外观。"
+        "只有当画图意图规划明确 include_bot_appearance=true 时，才可以使用机器人形象参考；"
+        "如果 include_bot_appearance=false，即使原始请求开头喊了机器人昵称，也不要把机器人外观写入生图提示词。"
+        "如果用户要画机器人、可可、bot 的拟人形象或与机器人同框，必须使用机器人形象参考里的 appearance_prompt "
         "作为人物脸部、发型和气质的一致性锚点，避免一人千面。"
         "appearance_prompt 只约束人物样貌，不固定服装、场景、姿势、镜头、时间或地点；这些按用户本次请求决定。"
         "输出必须是 JSON，格式为 {\"prompt\":\"...\"}，不要解释。"
     )
     user_prompt = (
         f"用户原始画图请求：{draw_request}\n"
-        f"已解析生图参考：\n{draw_reference_context}\n"
+        f"清洗后的画图请求：{draw_plan.cleaned_draw_request or draw_request}\n"
+        f"机器人外观使用判定：bot_mention_role={draw_plan.bot_mention_role}, "
+        f"include_bot_appearance={str(draw_plan.include_bot_appearance).lower()}\n"
+        f"机器人形象参考：\n{bot_appearance_context}\n"
+        f"用户显式参考要求：{draw_plan.reference_notes or '(none)'}\n"
+        f"随请求传入参考图：{reference_image_count} 张\n"
         f"当前发言人：QQ:{context.user_id}，昵称：{context.sender_name or context.sender_nickname or '-'}\n"
         f"机器人昵称：{', '.join(config.bot.nicknames)}\n"
-        f"人设：\n{_draw_join(snapshot.persona_lines)}\n"
         f"最近群聊：\n{_draw_recent_context(snapshot)}\n"
         f"最近图片理解：\n{_draw_join(snapshot.recent_image_descriptions)}\n"
         f"发言人画像：\n{_draw_profile(snapshot.user_profile)}\n"
@@ -1243,11 +1267,11 @@ async def _compose_draw_prompt(
         f"群内词条：\n{_draw_memories(snapshot.group_lexicon[:6])}\n"
         "请把这些信息转成一个明确、可画、单张图片的提示词。"
         "提示词应描述主体、场景、风格、构图、情绪、色彩和必要细节；"
-        "如果存在已解析生图参考，按每个参考的用途分别提取有来源支持的可辨识外观锚点，"
-        "并按用户要求做二创改造或融合；"
-        "如果参考未解析，必须避免把专名当字面含义猜外观，必要时写成泛化原创设计；"
-        "如果主体包含可可/机器人拟人形象，把 appearance_prompt 中的脸部、发型、气质特征写入提示词，"
+        "如果用户提供了参考图，提示词里要明确要求图像生成模型参考这些输入图的主体、构图、服饰或风格，"
+        "但仍以用户文字要求为准；"
+        "如果 include_bot_appearance=true，把 appearance_prompt 中的脸部、发型、气质特征写入提示词，"
         "但不要把 appearance_prompt 明确排除的场景或穿着固化进去；"
+        "如果 include_bot_appearance=false，不要使用机器人形象参考，不要把机器人外观混入主体；"
         "如果用户请求很简单，也不要过度添加不相关记忆。"
     )
     model_tier = "flagship" if _draw_prompt_requires_flagship(context, snapshot, draw_request) else ""
@@ -1273,11 +1297,124 @@ async def _compose_draw_prompt(
     return prompt
 
 
-def _draw_has_reference_image_context(
+async def _draw_reference_image_attachments(
+    bot: Bot,
+    event: GroupMessageEvent,
     context: MessageContext,
+) -> list[MessageAttachment]:
+    attachments = list(context.attachments)
+    fetch_reply = _fetch_reply_message(bot, event)
+    reply_ids = _reply_segment_ids(event.message)
+    if reply_ids:
+        for reply_id in reply_ids:
+            payload = await fetch_reply(reply_id)
+            attachments.extend(_image_attachments_from_payload(payload))
+    else:
+        payload = _event_reply_payload(event, "")
+        attachments.extend(_image_attachments_from_payload(payload))
+    return attachments
+
+
+def _reply_segment_ids(message: Any) -> list[str]:
+    ids: list[str] = []
+    for segment in _coerce_message_segments(message):
+        if _segment_type(segment) != "reply":
+            continue
+        data = _segment_data(segment)
+        reply_id = str(data.get("id") or data.get("message_id") or "").strip()
+        if reply_id:
+            ids.append(reply_id)
+    return ids
+
+
+def _image_attachments_from_payload(payload: Any) -> list[MessageAttachment]:
+    if payload is None:
+        return []
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if message is None:
+            message = payload.get("content")
+        if message is None:
+            message = payload.get("raw_message")
+        return _image_attachments_from_message(message)
+    return _image_attachments_from_message(payload)
+
+
+def _image_attachments_from_message(message: Any) -> list[MessageAttachment]:
+    attachments: list[MessageAttachment] = []
+    for segment in _coerce_message_segments(message):
+        segment_type = _segment_type(segment)
+        data = _segment_data(segment)
+        if segment_type == "image":
+            attachments.append(_image_attachment_from_data(data))
+            continue
+        if segment_type in {"node", "forward"}:
+            for key in ("content", "message", "raw_message"):
+                if key in data:
+                    attachments.extend(_image_attachments_from_message(data.get(key)))
+    return attachments
+
+
+def _image_attachment_from_data(data: dict[str, Any]) -> MessageAttachment:
+    return MessageAttachment(
+        attachment_type="image",
+        file=str(data.get("file", "") or ""),
+        url=str(data.get("url", "") or data.get("file_url", "") or ""),
+        summary=str(data.get("summary", "") or ""),
+        raw_data=json.dumps(data, ensure_ascii=False),
+    )
+
+
+def _coerce_message_segments(message: Any) -> list[Any]:
+    if message is None:
+        return []
+    if isinstance(message, str):
+        try:
+            return list(Message(message))
+        except Exception:
+            return [{"type": "text", "data": {"text": message}}]
+    if isinstance(message, dict):
+        if "type" in message:
+            return [message]
+        for key in ("message", "content", "raw_message"):
+            if key in message:
+                return _coerce_message_segments(message.get(key))
+        return []
+    try:
+        return list(message)
+    except TypeError:
+        return [message]
+
+
+def _segment_type(segment: Any) -> str:
+    if isinstance(segment, dict):
+        return str(segment.get("type", "") or "")
+    return str(getattr(segment, "type", "") or "")
+
+
+def _segment_data(segment: Any) -> dict[str, Any]:
+    raw_data = segment.get("data", {}) if isinstance(segment, dict) else getattr(segment, "data", {})
+    return dict(raw_data) if isinstance(raw_data, dict) else {}
+
+
+def _draw_bot_appearance_context(
     snapshot: ConversationSnapshot,
-) -> bool:
-    return bool(context.attachments and snapshot.recent_image_descriptions)
+    include_bot_appearance: bool,
+) -> str:
+    if not include_bot_appearance:
+        return "include_bot_appearance=false；本次不要使用机器人 appearance_prompt 或自我人设作为主体外观。"
+    appearance = _draw_appearance_prompt(snapshot.persona_lines)
+    if not appearance:
+        return "include_bot_appearance=true；但当前没有配置 appearance_prompt。"
+    return f"include_bot_appearance=true\nappearance_prompt: {appearance}"
+
+
+def _draw_appearance_prompt(persona_lines: list[str]) -> str:
+    for line in persona_lines:
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "appearance_prompt":
+            return value.strip()
+    return ""
 
 
 def _extract_draw_prompt(text: str | None) -> str | None:
@@ -1295,11 +1432,30 @@ def _extract_draw_prompt(text: str | None) -> str | None:
     try:
         data = json.loads(raw)
     except ValueError:
+        prompt = _extract_truncated_draw_prompt(raw)
+        if prompt:
+            return prompt[: max(1, config.image_generation.max_prompt_chars)]
         return None
     prompt = str(data.get("prompt", "")).strip()
     if not prompt:
         return None
     return prompt[: max(1, config.image_generation.max_prompt_chars)]
+
+
+def _extract_truncated_draw_prompt(raw: str) -> str | None:
+    match = re.search(r'"prompt"\s*:\s*"(?P<prompt>.*)', raw, re.S)
+    if not match:
+        return None
+    prompt = match.group("prompt")
+    if '"' in prompt:
+        prompt = prompt.rsplit('"', 1)[0]
+    prompt = prompt.rstrip("}` \n\r\t")
+    try:
+        prompt = json.loads(f'"{prompt}"')
+    except ValueError:
+        prompt = prompt.replace('\\"', '"').replace("\\n", "\n")
+    prompt = str(prompt).strip()
+    return prompt or None
 
 
 def _can_retry_draw_prompt_with_flagship() -> bool:

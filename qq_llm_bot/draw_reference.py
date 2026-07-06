@@ -2,37 +2,20 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass
 from typing import Protocol
 
-from loguru import logger
-
-from qq_llm_bot.web_search import SearchResult
-
 
 @dataclass(frozen=True)
-class DrawReferenceCandidate:
-    work_name: str
-    character_name: str
-    query: str
-    confidence: float
-    reason: str = ""
-    reference_type: str = "character"
-    role: str = "appearance"
+class DrawRequestPlan:
+    original_request: str
+    cleaned_draw_request: str
+    bot_mention_role: str = "none"
+    include_bot_appearance: bool = False
+    reference_notes: str = ""
 
 
-@dataclass(frozen=True)
-class DrawResolvedReference:
-    candidate: DrawReferenceCandidate
-    status: str
-    visual_summary: str = ""
-    source_urls: tuple[str, ...] = ()
-    confidence: float = 0.0
-    cached_at: int = 0
-
-
-class DrawReferenceLLM(Protocol):
+class DrawIntentLLM(Protocol):
     async def complete_text(
         self,
         system_prompt: str,
@@ -43,478 +26,60 @@ class DrawReferenceLLM(Protocol):
         ...
 
 
-class DrawReferenceSearch(Protocol):
-    async def search(self, query: str, max_results: int | None = None) -> list[SearchResult]:
-        ...
-
-
-_NAME_TOKEN = r"[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9_·・:：.\-]{0,29}"
-_CHAR_TOKEN = r"[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9_·・:：.\-]{0,23}"
-_REF_PREFIX = r"(?P<ref_prefix>参考|参照|照着|像|按|来自|以|借鉴|基于|cos|COS|同款|二创)?"
-_WORK_PART = rf"(?:《(?P<work_quoted>[^》]{{1,30}})》|(?P<work>{_NAME_TOKEN}))"
-_CHAR_PART = (
-    rf"(?:「(?P<char_corner>[^」]{{1,24}})」|"
-    rf"“(?P<char_quote>[^”]{{1,24}})”|(?P<char>{_CHAR_TOKEN}))"
-)
-
-_WORK_IN_CHARACTER_PATTERNS = (
-    re.compile(
-        rf"{_REF_PREFIX}\s*{_WORK_PART}\s*"
-        rf"(?:中|里|中的|里的|里面的)\s*"
-        rf"(?:角色|人物|女主|男主|角色名|人物名)?\s*"
-        rf"(?:叫|名叫|名为)?\s*{_CHAR_PART}",
-        re.I,
-    ),
-    re.compile(
-        rf"(?:游戏|手游|动漫|动画|番剧|作品)\s*{_WORK_PART}\s*"
-        rf"(?:的|中|里|中的|里的)?\s*"
-        rf"(?:角色|人物|女主|男主|角色名|人物名)\s*"
-        rf"(?:叫|名叫|名为|是)?\s*{_CHAR_PART}",
-        re.I,
-    ),
-    re.compile(
-        rf"{_REF_PREFIX}\s*(?:来自|出自)\s*{_WORK_PART}\s*(?:的)?\s*"
-        rf"(?:角色|人物|女主|男主)?\s*{_CHAR_PART}",
-        re.I,
-    ),
-)
-
-_QUOTED_CHARACTER_ONLY_PATTERN = re.compile(
-    rf"(?:参考|参照|照着|像|按|借鉴|基于|cos|COS|二创)\s*"
-    rf"(?:角色|人物)?\s*{_CHAR_PART}\s*"
-    rf"(?:这个|这一)?(?:角色|人物|人设|设定|外观|同款|cos|COS|二创)",
-    re.I,
-)
-
-_BAD_NAME_VALUES = {
-    "角色",
-    "人物",
-    "女主",
-    "男主",
-    "一个",
-    "一位",
-    "这个",
-    "那个",
-    "龙娘",
-    "女孩",
-    "男孩",
-    "少女",
-    "少年",
-}
-
-_REFERENCE_CUE_PATTERN = re.compile(
-    r"(参考|参照|照着|像|按|借鉴|基于|二创|同人|cos|COS|同款|角色|人物|设定|外观|立绘|"
-    r"游戏|手游|动漫|动画|番剧|作品)"
-)
-_REFERENCE_TYPES = {"character", "species", "costume", "style", "object", "other"}
-_REFERENCE_ROLES = {
-    "appearance",
-    "species",
-    "clothing",
-    "makeup",
-    "fusion",
-    "style",
-    "pose",
-    "other",
-}
-
-
-class DrawReferenceResolver:
+class DrawIntentPlanner:
     def __init__(
         self,
-        llm: DrawReferenceLLM,
-        web_search: DrawReferenceSearch,
+        llm: DrawIntentLLM,
         *,
-        max_results: int = 5,
-        max_references: int = 4,
-        cache_ttl_seconds: int = 6 * 60 * 60,
-        min_search_confidence: float = 0.7,
+        bot_names: tuple[str, ...] = (),
     ) -> None:
         self.llm = llm
-        self.web_search = web_search
-        self.max_results = max(1, max_results)
-        self.max_references = max(1, max_references)
-        self.cache_ttl_seconds = max(60, cache_ttl_seconds)
-        self.min_search_confidence = min_search_confidence
-        self._cache: dict[str, DrawResolvedReference] = {}
+        self.bot_names = tuple(name for name in bot_names if str(name).strip())
 
-    async def resolve(self, draw_request: str) -> DrawResolvedReference | None:
-        references = await self.resolve_all(draw_request)
-        return references[0] if references else None
+    async def plan(self, draw_request: str) -> DrawRequestPlan:
+        cleaned_fallback = _clean_draw_request_text(draw_request)
+        if not cleaned_fallback:
+            return DrawRequestPlan(draw_request, "")
 
-    async def resolve_all(self, draw_request: str) -> list[DrawResolvedReference]:
-        candidates = await self._detect_candidates(draw_request)
-        if not candidates:
-            return []
-
-        resolved: list[DrawResolvedReference] = []
-        for candidate in candidates[: self.max_references]:
-            resolved.append(await self._resolve_candidate(candidate))
-        return resolved
-
-    async def _detect_candidates(self, draw_request: str) -> list[DrawReferenceCandidate]:
-        candidates = await _detect_references_with_llm(self.llm, draw_request)
-        if candidates is not None:
-            return _dedupe_candidates(candidates)
-
-        fallback = detect_draw_reference(draw_request)
-        return [fallback] if fallback else []
-
-    async def _resolve_candidate(
-        self,
-        candidate: DrawReferenceCandidate,
-    ) -> DrawResolvedReference:
-        key = draw_reference_cache_key(candidate)
-        cached = self._cache.get(key)
-        now = int(time.time())
-        if cached and now - cached.cached_at <= self.cache_ttl_seconds:
-            return cached
-
-        results: list[SearchResult] = []
-        if candidate.confidence >= self.min_search_confidence:
-            try:
-                results = await self.web_search.search(candidate.query, self.max_results)
-            except Exception as exc:  # pragma: no cover - third-party search boundary
-                logger.warning("Draw reference search failed: {}", exc)
-                results = []
-
-        resolved = await self._resolve_from_results(candidate, results, now)
-        self._cache[key] = resolved
-        return resolved
-
-    async def _resolve_from_results(
-        self,
-        candidate: DrawReferenceCandidate,
-        results: list[SearchResult],
-        now: int,
-    ) -> DrawResolvedReference:
-        source_urls = tuple(_dedupe_urls(result.url for result in results))
-        if not results:
-            return DrawResolvedReference(
-                candidate=candidate,
-                status="unresolved",
-                source_urls=source_urls,
-                cached_at=now,
-            )
-
-        summary, confidence = await _summarize_reference(
-            self.llm,
-            candidate,
-            results,
+        reply = await self.llm.complete_text(
+            "你是生图请求意图规划器。只输出 JSON，不要解释。",
+            (
+                "请规划用户的画图请求：清理开头对机器人的称呼，判断是否真的要画机器人形象，"
+                "并保留用户提到的作品、角色、种族、服饰、风格或参考图要求。"
+                "重点规则："
+                "1. 如果请求开头只是喊机器人昵称，例如“可可，参考...”或“可可 帮我画...”，"
+                "bot_mention_role=addressing_bot，cleaned_draw_request 要去掉这个称呼，include_bot_appearance=false。"
+                "2. 只有用户明确要求画机器人/可可/bot 的形象、拟人、头像、或和机器人同框时，"
+                "bot_mention_role=draw_bot 或 draw_with_bot，include_bot_appearance=true。"
+                "3. 不要改写、删除用户明确给出的颜色、妆容、肤色、服饰、构图和参考对象。"
+                "4. reference_notes 只简短整理用户显式要求保留的参考关系；不要联网、不要补编外观。"
+                "输出 JSON："
+                '{"cleaned_draw_request":"去掉机器人称呼后的画图请求",'
+                '"bot_mention_role":"none|addressing_bot|draw_bot|draw_with_bot|unclear",'
+                '"include_bot_appearance":bool,'
+                '"reference_notes":"用户显式参考要求的简短整理，可空"}\n'
+                f"机器人昵称：{', '.join(self.bot_names) or '(none)'}\n"
+                f"用户请求：{cleaned_fallback}"
+            ),
+            purpose="draw_intent",
         )
-        if not summary:
-            return DrawResolvedReference(
-                candidate=candidate,
-                status="unresolved",
-                source_urls=source_urls,
-                cached_at=now,
+        data = _extract_json_object(reply)
+        if not data:
+            return DrawRequestPlan(
+                original_request=draw_request,
+                cleaned_draw_request=cleaned_fallback,
+                bot_mention_role="unknown",
+                include_bot_appearance=False,
             )
 
-        return DrawResolvedReference(
-            candidate=candidate,
-            status="resolved",
-            visual_summary=summary,
-            source_urls=source_urls,
-            confidence=confidence,
-            cached_at=now,
+        cleaned = _clean_draw_request_text(str(data.get("cleaned_draw_request", "") or cleaned_fallback))
+        return DrawRequestPlan(
+            original_request=draw_request,
+            cleaned_draw_request=cleaned or cleaned_fallback,
+            bot_mention_role=_safe_bot_mention_role(str(data.get("bot_mention_role", "none") or "none")),
+            include_bot_appearance=_as_bool(data.get("include_bot_appearance"), False),
+            reference_notes=_clean_draw_request_text(str(data.get("reference_notes", "") or "")),
         )
-
-
-def detect_draw_reference(draw_request: str) -> DrawReferenceCandidate | None:
-    text = " ".join(str(draw_request or "").split())
-    if not text:
-        return None
-
-    candidates: list[DrawReferenceCandidate] = []
-    for index, pattern in enumerate(_WORK_IN_CHARACTER_PATTERNS):
-        for match in pattern.finditer(text):
-            candidate = _candidate_from_match(
-                match,
-                confidence=0.92,
-                reason="work_character",
-                full_text=text,
-                require_reference_cue=index == 0,
-            )
-            if candidate:
-                candidates.append(candidate)
-
-    for match in _QUOTED_CHARACTER_ONLY_PATTERN.finditer(text):
-        candidate = _candidate_from_match(match, confidence=0.72, reason="character_only")
-        if candidate:
-            candidates.append(candidate)
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item.confidence, reverse=True)
-    return candidates[0]
-
-
-async def _detect_references_with_llm(
-    llm: DrawReferenceLLM,
-    draw_request: str,
-) -> list[DrawReferenceCandidate] | None:
-    text = " ".join(str(draw_request or "").split())
-    if not text:
-        return []
-
-    reply = await llm.complete_text(
-        "你是生图请求里的参考需求识别器。只输出 JSON，不要解释。",
-        (
-            "判断用户画图请求中是否提到了需要联网查证外观的已有作品、游戏、角色、种族、服饰、"
-            "梗名、皮肤、道具或风格参考。把每个独立参考拆成一项。"
-            "重点规则："
-            "1. “FF14里的敖龙族”是 species/reference；“服饰参考嗷齁仙子”是 clothing/reference。"
-            "2. “异环里的真红和伊洛伊，融合他俩特征”要拆成真红、伊洛伊两项，role=fusion。"
-            "3. 不要把用户明确给出的普通颜色、妆容、肤色、构图要求当成参考项，"
-            "例如“真红色”“紫色唇色”“白肤色”“紫色眼影”不是搜索 reference。"
-            "4. 只有确实指向外部既有对象且需要查证视觉信息时 should_search=true。"
-            "输出 JSON："
-            '{"references":[{"work_name":"作品/系列/游戏，可空",'
-            '"reference_name":"角色/种族/服饰/风格名",'
-            '"reference_type":"character|species|costume|style|object|other",'
-            '"role":"appearance|species|clothing|makeup|fusion|style|pose|other",'
-            '"search_query":"适合搜索外观设定的查询",'
-            '"should_search":bool,"confidence":0.0}]}\n'
-            f"用户请求：{text}"
-        ),
-        purpose="draw_reference_detect",
-    )
-    data = _extract_json_object(reply)
-    if not data:
-        return None
-
-    raw_items = data.get("references")
-    if not isinstance(raw_items, list):
-        return None
-
-    candidates: list[DrawReferenceCandidate] = []
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-        candidate = _candidate_from_detector_item(item)
-        if candidate:
-            candidates.append(candidate)
-    return candidates
-
-
-def draw_reference_cache_key(candidate: DrawReferenceCandidate) -> str:
-    return (
-        f"work:{_normalize_cache_part(candidate.work_name)}|"
-        f"type:{_normalize_cache_part(candidate.reference_type)}|"
-        f"character:{_normalize_cache_part(candidate.character_name)}"
-    )
-
-
-def format_draw_reference_context(
-    reference: DrawResolvedReference | list[DrawResolvedReference] | None,
-    *,
-    has_reference_image_context: bool = False,
-) -> str:
-    references = _normalize_resolved_references(reference)
-    if not references:
-        return "(none)"
-
-    lines = []
-    if has_reference_image_context:
-        lines.append(
-            "用户本次请求附近包含图片理解结果；如果图片与请求相关，优先使用图片视觉内容，"
-            "联网参考只作补充。"
-        )
-
-    for index, item in enumerate(references, start=1):
-        candidate = item.candidate
-        work = f"《{candidate.work_name}》" if candidate.work_name else "未指定作品"
-        ref_name = f"「{candidate.character_name}」"
-        ref_kind = _reference_kind_label(candidate)
-        role_label = _reference_role_label(candidate.role)
-        if item.status == "resolved" and item.visual_summary:
-            lines.extend(
-                [
-                    f"参考{index}：已查证 {work}{ref_kind}{ref_name}，用途={role_label}。",
-                    f"联网查询：{candidate.query}",
-                    f"可画视觉事实：{item.visual_summary}",
-                    "使用方式：只把这些已查证外观特征当作本次画面的锚点；不要 1:1 复刻，"
-                    "也不要补充来源没有支持的服装、武器、发色、妆容或体貌。",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    f"参考{index}：疑似专名参考 {work}{ref_kind}{ref_name}，用途={role_label}，"
-                    "但未取得可靠外观摘要。",
-                    f"尝试查询：{candidate.query}",
-                    "处理要求：不要把参考名按字面解释成颜色或普通词，"
-                    "不要编造该参考的发色、服装、武器、性格、妆容或标志物；"
-                    "如果仍要出图，只生成更泛化的原创版本，并保留“参考未确认”的不确定性。",
-                ]
-            )
-        if item.source_urls:
-            lines.append("来源URL：" + "；".join(item.source_urls[:3]))
-    return "\n".join(lines)
-
-
-def _normalize_resolved_references(
-    reference: DrawResolvedReference | list[DrawResolvedReference] | None,
-) -> list[DrawResolvedReference]:
-    if reference is None:
-        return []
-    if isinstance(reference, list):
-        return reference
-    return [reference]
-
-
-def _reference_kind_label(candidate: DrawReferenceCandidate) -> str:
-    labels = {
-        "character": "角色",
-        "species": "种族/族群",
-        "costume": "服饰参考",
-        "style": "风格参考",
-        "object": "物件参考",
-        "other": "参考",
-    }
-    return labels.get(candidate.reference_type, "参考")
-
-
-def _reference_role_label(role: str) -> str:
-    labels = {
-        "appearance": "外观锚点",
-        "species": "种族体貌",
-        "clothing": "服饰锚点",
-        "makeup": "妆容锚点",
-        "fusion": "融合特征",
-        "style": "风格锚点",
-        "pose": "姿态锚点",
-        "other": "参考锚点",
-    }
-    return labels.get(role, "参考锚点")
-
-
-def _candidate_from_match(
-    match: re.Match[str],
-    *,
-    confidence: float,
-    reason: str,
-    full_text: str = "",
-    require_reference_cue: bool = False,
-) -> DrawReferenceCandidate | None:
-    if require_reference_cue and not _match_has_reference_cue(match, full_text):
-        return None
-    work = _clean_work_name(match.groupdict().get("work_quoted") or match.groupdict().get("work") or "")
-    character = _clean_character_name(
-        match.groupdict().get("char_corner")
-        or match.groupdict().get("char_quote")
-        or match.groupdict().get("char")
-        or ""
-    )
-    if not _valid_reference_names(work, character):
-        return None
-    query = build_draw_reference_query(work, character)
-    return DrawReferenceCandidate(
-        work_name=work,
-        character_name=character,
-        query=query,
-        confidence=confidence,
-        reason=reason,
-    )
-
-
-def _candidate_from_detector_item(item: dict[str, object]) -> DrawReferenceCandidate | None:
-    if not _as_bool(item.get("should_search"), True):
-        return None
-
-    work = _clean_work_name(str(item.get("work_name", "") or ""))
-    reference_name = _clean_character_name(
-        str(
-            item.get("reference_name")
-            or item.get("character_name")
-            or item.get("name")
-            or ""
-        )
-    )
-    reference_type = _safe_reference_type(str(item.get("reference_type", "other") or "other"))
-    role = _safe_reference_role(str(item.get("role", "appearance") or "appearance"))
-    confidence = _clamp_float(item.get("confidence", 0.0))
-    if confidence < 0.45 or not _valid_reference_names(work, reference_name):
-        return None
-
-    query = _clean_query(str(item.get("search_query", "") or ""))
-    if not query:
-        query = build_draw_reference_query(work, reference_name, reference_type, role)
-
-    return DrawReferenceCandidate(
-        work_name=work,
-        character_name=reference_name,
-        query=query,
-        confidence=confidence,
-        reason="llm_detect",
-        reference_type=reference_type,
-        role=role,
-    )
-
-
-def _match_has_reference_cue(match: re.Match[str], full_text: str) -> bool:
-    groups = match.groupdict()
-    if groups.get("ref_prefix") or groups.get("work_quoted"):
-        return True
-    return bool(_REFERENCE_CUE_PATTERN.search(full_text))
-
-
-def build_draw_reference_query(
-    work_name: str,
-    character_name: str,
-    reference_type: str = "character",
-    role: str = "appearance",
-) -> str:
-    hint = _query_hint(reference_type, role)
-    parts = [work_name, character_name, hint, "外观", "设定"]
-    return " ".join(part for part in parts if part)
-
-
-async def _summarize_reference(
-    llm: DrawReferenceLLM,
-    candidate: DrawReferenceCandidate,
-    results: list[SearchResult],
-) -> tuple[str, float]:
-    text = await llm.complete_text(
-        "你是生图参考资料提取器。只输出 JSON，不要解释。",
-        (
-            "根据搜索结果判断用户请求的作品/角色引用是否匹配，并提取可画的视觉事实。"
-            "只能依据搜索结果里的标题和摘要；不要补充来源没有明确支持的外观。"
-            "根据 reference_type 和 role 决定提取重点：species 关注种族体貌、角、尾、鳞片、肤色范围等；"
-            "clothing/costume 关注服饰轮廓、配色、材质和装饰；fusion 关注最可辨识的外观锚点；"
-            "makeup 关注妆容。visual_summary 只写发型、服装、配色、体态、标志物等可画信息，"
-            "不写剧情评价或无关背景。没有可靠外观就 is_match=false。"
-            "输出 JSON："
-            '{"is_match":bool,"visual_summary":"可画视觉摘要","confidence":0.0}\n'
-            f"作品：{candidate.work_name or '(unknown)'}\n"
-            f"参考名：{candidate.character_name}\n"
-            f"参考类型：{candidate.reference_type}\n"
-            f"本次用途：{candidate.role}\n"
-            f"搜索查询：{candidate.query}\n"
-            f"搜索结果：\n{_format_reference_search_results(results)}"
-        ),
-        purpose="draw_reference",
-    )
-    data = _extract_json_object(text)
-    if not data:
-        return "", 0.0
-    if not _as_bool(data.get("is_match"), False):
-        return "", 0.0
-    summary = _clean_visual_summary(str(data.get("visual_summary", "")))
-    confidence = _clamp_float(data.get("confidence", 0.0))
-    if not summary or confidence < 0.55:
-        return "", 0.0
-    return summary, confidence
-
-
-def _format_reference_search_results(results: list[SearchResult]) -> str:
-    lines = []
-    for index, result in enumerate(results[:5], start=1):
-        title = " ".join(result.title.split())[:120]
-        url = result.url.strip()
-        snippet = " ".join(result.snippet.split())[:240]
-        lines.append(f"{index}. {title}\nURL: {url}\n摘要: {snippet or '(empty)'}")
-    return "\n".join(lines) if lines else "(none)"
 
 
 def _extract_json_object(text: str | None) -> dict[str, object] | None:
@@ -536,97 +101,10 @@ def _extract_json_object(text: str | None) -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
-def _clean_work_name(value: str) -> str:
-    text = _clean_name(value)
-    text = re.sub(r"^(?:参考|参照|照着|像|按|来自|以|借鉴|基于)", "", text, flags=re.I)
-    return _clean_name(text)
-
-
-def _clean_character_name(value: str) -> str:
-    text = _clean_name(value)
-    text = re.sub(r"^(?:角色|人物|女主|男主|叫|名叫|名为|是|的)", "", text, flags=re.I)
-    text = re.split(
-        r"(?:的(?:二创|同人|设定|外观|风格|同款)?|，|,|。|！|!|？|\?|画|绘|做成|变成|改成)",
-        text,
-        maxsplit=1,
-    )[0]
-    return _clean_name(text)
-
-
-def _clean_name(value: str) -> str:
-    text = str(value or "").strip()
-    text = text.strip("「」“”\"'《》[]（）()【】")
-    return " ".join(text.split())[:30]
-
-
-def _valid_reference_names(work: str, character: str) -> bool:
-    if not character or character in _BAD_NAME_VALUES:
-        return False
-    if work and work == character:
-        return False
-    if work in _BAD_NAME_VALUES:
-        return False
-    if character.endswith("色") and len(character) <= 4 and not work:
-        return False
-    return True
-
-
-def _dedupe_candidates(candidates: list[DrawReferenceCandidate]) -> list[DrawReferenceCandidate]:
-    seen: set[str] = set()
-    deduped: list[DrawReferenceCandidate] = []
-    for candidate in candidates:
-        key = draw_reference_cache_key(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(candidate)
-    return deduped
-
-
-def _safe_reference_type(value: str) -> str:
+def _safe_bot_mention_role(value: str) -> str:
     normalized = str(value or "").strip().lower()
-    return normalized if normalized in _REFERENCE_TYPES else "other"
-
-
-def _safe_reference_role(value: str) -> str:
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in _REFERENCE_ROLES else "appearance"
-
-
-def _query_hint(reference_type: str, role: str) -> str:
-    if reference_type == "species" or role == "species":
-        return "种族 特征"
-    if reference_type == "costume" or role == "clothing":
-        return "服装 造型"
-    if role == "makeup":
-        return "妆容 外观"
-    if role == "fusion":
-        return "角色 外观 特征"
-    if reference_type == "style" or role == "style":
-        return "风格 外观"
-    if reference_type == "object":
-        return "道具 外观"
-    return "角色"
-
-
-def _clean_query(value: str) -> str:
-    return " ".join(str(value or "").split())[:120]
-
-
-def _normalize_cache_part(value: str) -> str:
-    return re.sub(r"\s+", "", str(value or "").strip().lower())
-
-
-def _dedupe_urls(urls: object) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for raw in urls:
-        url = str(raw or "").strip()
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        deduped.append(url)
-    return deduped
+    allowed = {"none", "addressing_bot", "draw_bot", "draw_with_bot", "unclear", "unknown"}
+    return normalized if normalized in allowed else "none"
 
 
 def _as_bool(value: object, default: bool) -> bool:
@@ -641,14 +119,5 @@ def _as_bool(value: object, default: bool) -> bool:
     return default
 
 
-def _clamp_float(value: object) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(1.0, parsed))
-
-
-def _clean_visual_summary(value: str) -> str:
-    text = " ".join(str(value or "").split())
-    return text[:240]
+def _clean_draw_request_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:500]

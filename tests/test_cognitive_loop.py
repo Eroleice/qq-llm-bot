@@ -44,11 +44,8 @@ from qq_llm_bot.config import (
     VisionConfig,
     load_config,
 )
-from qq_llm_bot.draw_reference import (
-    DrawReferenceResolver,
-    detect_draw_reference,
-    format_draw_reference_context,
-)
+from qq_llm_bot.draw_images import prepare_draw_reference_images
+from qq_llm_bot.draw_reference import DrawIntentPlanner
 from qq_llm_bot.models import (
     ConversationSnapshot,
     FactCandidate,
@@ -73,6 +70,7 @@ from qq_llm_bot.llm import (
     OpenAICompatibleLLMClient,
     extract_generated_image,
     normalize_responses_url,
+    _image_generation_input,
 )
 from qq_llm_bot.onebot_messages import (
     FORWARDED_RECORD_END,
@@ -105,6 +103,7 @@ class FakeLLM:
         self.vision_calls: list[list[str]] = []
         self.vision_call_tiers: list[str] = []
         self.image_calls: list[str] = []
+        self.image_url_calls: list[list[str]] = []
         self.last_image_generation_error = ""
 
     async def complete_text(
@@ -140,8 +139,10 @@ class FakeLLM:
         self,
         prompt: str,
         image_config: ImageGenerationConfig,
+        image_urls: list[str] | None = None,
     ) -> GeneratedImage | None:
         self.image_calls.append(prompt)
+        self.image_url_calls.append(list(image_urls or []))
         if self.image_replies:
             return self.image_replies.pop(0)
         return None
@@ -277,249 +278,46 @@ class WebSearchTests(unittest.TestCase):
         self.assertEqual(default_slang_query("内卷"), "内卷 网络用语 梗 意思")
 
 
-class DrawReferenceTests(unittest.TestCase):
-    def test_detector_finds_work_character_reference(self) -> None:
-        candidate = detect_draw_reference("参考异环中的真红，画一个二创的龙娘角色")
-
-        self.assertIsNotNone(candidate)
-        assert candidate is not None
-        self.assertEqual(candidate.work_name, "异环")
-        self.assertEqual(candidate.character_name, "真红")
-        self.assertIn("异环", candidate.query)
-        self.assertIn("真红", candidate.query)
-
-    def test_detector_finds_game_role_reference(self) -> None:
-        candidate = detect_draw_reference("游戏异环角色真红的二创头像")
-
-        self.assertIsNotNone(candidate)
-        assert candidate is not None
-        self.assertEqual(candidate.work_name, "异环")
-        self.assertEqual(candidate.character_name, "真红")
-
-    def test_detector_does_not_treat_literal_color_as_character_reference(self) -> None:
-        self.assertIsNone(detect_draw_reference("画一个真红色的龙娘"))
-
-    def test_detector_does_not_treat_plain_scene_as_character_reference(self) -> None:
-        self.assertIsNone(detect_draw_reference("画花园中的女孩，阳光明亮"))
-
-    def test_resolver_searches_and_summarizes_visual_reference(self) -> None:
+class DrawIntentTests(unittest.TestCase):
+    def test_intent_planner_keeps_references_without_searching(self) -> None:
         llm = FakeLLM(
             [
                 (
-                    '{"references":[{"work_name":"异环","reference_name":"真红",'
-                    '"reference_type":"character","role":"appearance",'
-                    '"search_query":"异环 真红 角色 外观 设定",'
-                    '"should_search":true,"confidence":0.92}]}'
+                    '{"cleaned_draw_request":"参考异环里的真红和伊洛伊，画一个融合他俩特征的二创角色。",'
+                    '"bot_mention_role":"addressing_bot","include_bot_appearance":false,'
+                    '"reference_notes":"参考异环里的真红和伊洛伊，融合两者特征"}'
                 ),
-                (
-                    '{"is_match":true,'
-                    '"visual_summary":"白色长发，红黑制服，带有尖锐头饰和冷淡表情",'
-                    '"confidence":0.86}'
-                )
             ]
         )
-        search = FakeSearch(
-            [
-                SearchResult(
-                    title="异环 真红 角色图鉴",
-                    url="https://example.test/shinku",
-                    snippet="真红是异环角色，角色立绘展示白色长发、红黑制服和尖锐头饰。",
-                )
-            ]
+        planner = DrawIntentPlanner(llm, bot_names=("可可",))
+
+        plan = asyncio.run(
+            planner.plan("可可，参考异环里的真红和伊洛伊，画一个融合他俩特征的二创角色。")
         )
-        resolver = DrawReferenceResolver(llm, search, max_results=3)
 
-        reference = asyncio.run(resolver.resolve("参考异环中的真红，画一个二创的龙娘角色"))
+        self.assertEqual(plan.cleaned_draw_request, "参考异环里的真红和伊洛伊，画一个融合他俩特征的二创角色。")
+        self.assertEqual(plan.bot_mention_role, "addressing_bot")
+        self.assertFalse(plan.include_bot_appearance)
+        self.assertIn("真红", plan.reference_notes)
+        self.assertEqual(llm.text_call_purposes, ["draw_intent"])
 
-        self.assertIsNotNone(reference)
-        assert reference is not None
-        self.assertEqual(reference.status, "resolved")
-        self.assertIn("白色长发", reference.visual_summary)
-        self.assertEqual(len(search.calls), 1)
-        self.assertIn("异环", search.calls[0])
-        self.assertIn("真红", search.calls[0])
-        self.assertEqual(llm.text_call_purposes, ["draw_reference_detect", "draw_reference"])
-        context = format_draw_reference_context(reference, has_reference_image_context=True)
-        self.assertIn("可画视觉事实", context)
-        self.assertIn("优先使用图片视觉内容", context)
-
-    def test_resolver_degrades_when_reference_search_has_no_results(self) -> None:
+    def test_intent_planner_includes_bot_appearance_only_when_bot_is_subject(self) -> None:
         llm = FakeLLM(
             [
                 (
-                    '{"references":[{"work_name":"异环","reference_name":"真红",'
-                    '"reference_type":"character","role":"appearance",'
-                    '"search_query":"异环 真红 角色 外观 设定",'
-                    '"should_search":true,"confidence":0.92}]}'
+                    '{"cleaned_draw_request":"画可可的拟人头像",'
+                    '"bot_mention_role":"draw_bot","include_bot_appearance":true,'
+                    '"reference_notes":""}'
                 )
             ]
         )
-        search = FakeSearch([])
-        resolver = DrawReferenceResolver(llm, search)
+        planner = DrawIntentPlanner(llm, bot_names=("可可",))
 
-        reference = asyncio.run(resolver.resolve("参考异环中的真红，画一个二创的龙娘角色"))
+        plan = asyncio.run(planner.plan("画可可的拟人头像"))
 
-        self.assertIsNotNone(reference)
-        assert reference is not None
-        self.assertEqual(reference.status, "unresolved")
-        self.assertEqual(len(search.calls), 1)
-        self.assertEqual(llm.text_call_purposes, ["draw_reference_detect"])
-        context = format_draw_reference_context(reference)
-        self.assertIn("不要把参考名按字面解释成颜色", context)
-        self.assertIn("真红", context)
-
-    def test_llm_detector_empty_result_prevents_regex_fallback(self) -> None:
-        llm = FakeLLM(['{"references":[]}'])
-        search = FakeSearch(
-            [
-                SearchResult(
-                    title="should not search",
-                    url="https://example.test/nope",
-                    snippet="",
-                )
-            ]
-        )
-        resolver = DrawReferenceResolver(llm, search)
-
-        references = asyncio.run(resolver.resolve_all("参考异环里的红色，画一个配色方案"))
-
-        self.assertEqual(references, [])
-        self.assertEqual(search.calls, [])
-
-    def test_resolver_reuses_cached_reference(self) -> None:
-        llm = FakeLLM(
-            [
-                (
-                    '{"references":[{"work_name":"异环","reference_name":"真红",'
-                    '"reference_type":"character","role":"appearance",'
-                    '"search_query":"异环 真红 角色 外观 设定",'
-                    '"should_search":true,"confidence":0.92}]}'
-                ),
-                (
-                    '{"is_match":true,'
-                    '"visual_summary":"银白长发，红色眼睛，黑红配色服装",'
-                    '"confidence":0.82}'
-                )
-            ]
-        )
-        search = FakeSearch(
-            [
-                SearchResult(
-                    title="异环 真红 角色设定",
-                    url="https://example.test/shinku",
-                    snippet="真红拥有银白长发、红色眼睛和黑红配色服装。",
-                )
-            ]
-        )
-        resolver = DrawReferenceResolver(llm, search)
-
-        first = asyncio.run(resolver.resolve("参考异环中的真红，画一个龙娘"))
-        second = asyncio.run(resolver.resolve("像异环里的真红，画一个二创头像"))
-
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
-        assert first is not None and second is not None
-        self.assertEqual(first.visual_summary, second.visual_summary)
-        self.assertEqual(len(search.calls), 1)
-        self.assertEqual(len(llm.text_calls), 3)
-
-    def test_llm_detector_handles_species_and_clothing_references(self) -> None:
-        llm = FakeLLM(
-            [
-                (
-                    '{"references":['
-                    '{"work_name":"FF14","reference_name":"敖龙族",'
-                    '"reference_type":"species","role":"species",'
-                    '"search_query":"FF14 敖龙族 种族 特征 外观",'
-                    '"should_search":true,"confidence":0.94},'
-                    '{"work_name":"","reference_name":"嗷齁仙子",'
-                    '"reference_type":"costume","role":"clothing",'
-                    '"search_query":"嗷齁仙子 服装 造型 外观",'
-                    '"should_search":true,"confidence":0.88}]}'
-                ),
-                (
-                    '{"is_match":true,'
-                    '"visual_summary":"额角长角，尾巴，鳞片点缀，偏龙族少女体貌",'
-                    '"confidence":0.83}'
-                ),
-                (
-                    '{"is_match":true,'
-                    '"visual_summary":"飘逸仙子裙装，轻薄长袖，华丽头饰和柔和浅色配色",'
-                    '"confidence":0.81}'
-                ),
-            ]
-        )
-        search = FakeSearch(
-            [
-                SearchResult(
-                    title="参考资料",
-                    url="https://example.test/ref",
-                    snippet="参考项包含可用于生图的外观设定。",
-                )
-            ]
-        )
-        resolver = DrawReferenceResolver(llm, search)
-
-        references = asyncio.run(
-            resolver.resolve_all(
-                "参考ff14里的敖龙族，画一个白肤色的敖龙族少女，"
-                "服饰参考一下嗷齁仙子，需要紫色唇色紫色眼影"
-            )
-        )
-
-        self.assertEqual(len(references), 2)
-        self.assertEqual(references[0].candidate.reference_type, "species")
-        self.assertEqual(references[0].candidate.role, "species")
-        self.assertEqual(references[1].candidate.reference_type, "costume")
-        self.assertEqual(references[1].candidate.role, "clothing")
-        self.assertEqual(len(search.calls), 2)
-        self.assertIn("敖龙族", search.calls[0])
-        self.assertIn("嗷齁仙子", search.calls[1])
-        context = format_draw_reference_context(references)
-        self.assertIn("种族体貌", context)
-        self.assertIn("服饰锚点", context)
-
-    def test_llm_detector_handles_fusion_references(self) -> None:
-        llm = FakeLLM(
-            [
-                (
-                    '{"references":['
-                    '{"work_name":"异环","reference_name":"真红",'
-                    '"reference_type":"character","role":"fusion",'
-                    '"search_query":"异环 真红 角色 外观 特征",'
-                    '"should_search":true,"confidence":0.93},'
-                    '{"work_name":"异环","reference_name":"伊洛伊",'
-                    '"reference_type":"character","role":"fusion",'
-                    '"search_query":"异环 伊洛伊 角色 外观 特征",'
-                    '"should_search":true,"confidence":0.93}]}'
-                ),
-                '{"is_match":true,"visual_summary":"白发，红黑服饰，冷淡神情","confidence":0.84}',
-                '{"is_match":true,"visual_summary":"金色装饰，活泼轮廓，明亮配色","confidence":0.82}',
-            ]
-        )
-        search = FakeSearch(
-            [
-                SearchResult(
-                    title="异环角色资料",
-                    url="https://example.test/yihuan",
-                    snippet="角色资料含外观设定。",
-                )
-            ]
-        )
-        resolver = DrawReferenceResolver(llm, search)
-
-        references = asyncio.run(
-            resolver.resolve_all("可可，参考异环里的真红和伊洛伊，画一个融合他俩特征的二创角色。")
-        )
-
-        self.assertEqual(len(references), 2)
-        self.assertEqual([item.candidate.character_name for item in references], ["真红", "伊洛伊"])
-        self.assertTrue(all(item.candidate.role == "fusion" for item in references))
-        self.assertEqual(len(search.calls), 2)
-        context = format_draw_reference_context(references)
-        self.assertIn("融合特征", context)
-        self.assertIn("真红", context)
-        self.assertIn("伊洛伊", context)
+        self.assertEqual(plan.cleaned_draw_request, "画可可的拟人头像")
+        self.assertEqual(plan.bot_mention_role, "draw_bot")
+        self.assertTrue(plan.include_bot_appearance)
 
 
 class ImageGenerationTests(unittest.TestCase):
@@ -676,6 +474,136 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(tool["output_format"], "jpeg")
         self.assertEqual(tool["output_compression"], 65)
 
+    def test_image_generation_input_includes_reference_images(self) -> None:
+        payload = _image_generation_input(
+            "画一只猫",
+            ["", "data:image/png;base64,ZmFrZQ==", "https://example.test/ref.png"],
+        )
+
+        self.assertIsInstance(payload, list)
+        message = payload[0]  # type: ignore[index]
+        content = message["content"]  # type: ignore[index]
+        self.assertEqual(content[0], {"type": "input_text", "text": "画一只猫"})
+        self.assertEqual(
+            content[1],
+            {"type": "input_image", "image_url": "data:image/png;base64,ZmFrZQ=="},
+        )
+        self.assertEqual(
+            content[2],
+            {"type": "input_image", "image_url": "https://example.test/ref.png"},
+        )
+
+    def test_image_generation_request_passes_reference_images_to_responses_api(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="openai-compatible",
+                model="gpt-image-test",
+                base_url="https://example.test/v1",
+                api_key="test-key",
+            )
+        )
+        captured_payload: dict = {}
+
+        async def fake_post_image_generation_response(
+            payload: dict,
+            timeout_seconds: float,
+        ) -> GeneratedImage | None:
+            captured_payload.update(payload)
+            return GeneratedImage(data=b"fake-png", mime_type="image/png")
+
+        client._post_image_generation_response = fake_post_image_generation_response  # type: ignore[method-assign]
+
+        image = asyncio.run(
+            client.generate_image(
+                "cat",
+                ImageGenerationConfig(model="gpt-image-test"),
+                image_urls=["data:image/png;base64,ZmFrZQ=="],
+            )
+        )
+
+        self.assertIsNotNone(image)
+        content = captured_payload["input"][0]["content"]
+        self.assertEqual(content[0], {"type": "input_text", "text": "cat"})
+        self.assertEqual(
+            content[1],
+            {"type": "input_image", "image_url": "data:image/png;base64,ZmFrZQ=="},
+        )
+
+    def test_prepare_draw_reference_images_rejects_more_than_three_images(self) -> None:
+        attachments = [
+            MessageAttachment(attachment_type="image", url=f"https://example.test/{index}.png")
+            for index in range(4)
+        ]
+
+        prepared = asyncio.run(
+            prepare_draw_reference_images(
+                attachments,
+                max_images=3,
+                max_bytes=1024 * 1024,
+                max_dimension=512,
+                quality=85,
+                timeout_seconds=1.0,
+            )
+        )
+
+        self.assertEqual(prepared.image_urls, [])
+        self.assertIn("参考图最多支持 3 张", prepared.error)
+
+    def test_prepare_draw_reference_images_keeps_small_data_url(self) -> None:
+        try:
+            from PIL import Image
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest("Pillow is not installed in this environment") from exc
+
+        source = io.BytesIO()
+        Image.new("RGB", (32, 32), "white").save(source, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(source.getvalue()).decode("ascii")
+
+        prepared = asyncio.run(
+            prepare_draw_reference_images(
+                [MessageAttachment(attachment_type="image", url=data_url)],
+                max_images=3,
+                max_bytes=1024 * 1024,
+                max_dimension=512,
+                quality=85,
+                timeout_seconds=1.0,
+            )
+        )
+
+        self.assertEqual(prepared.error, "")
+        self.assertEqual(prepared.image_urls, [data_url])
+
+    def test_prepare_draw_reference_images_compresses_large_reference(self) -> None:
+        try:
+            from PIL import Image
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest("Pillow is not installed in this environment") from exc
+
+        source = io.BytesIO()
+        Image.new("RGB", (1024, 768), "purple").save(source, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(source.getvalue()).decode("ascii")
+
+        prepared = asyncio.run(
+            prepare_draw_reference_images(
+                [MessageAttachment(attachment_type="image", url=data_url)],
+                max_images=3,
+                max_bytes=128 * 1024,
+                max_dimension=128,
+                quality=85,
+                timeout_seconds=1.0,
+            )
+        )
+
+        self.assertEqual(prepared.error, "")
+        self.assertEqual(len(prepared.image_urls), 1)
+        compressed_url = prepared.image_urls[0]
+        self.assertTrue(compressed_url.startswith("data:image/jpeg;base64,"))
+        compressed = base64.b64decode(compressed_url.split(",", 1)[1])
+        self.assertLessEqual(len(compressed), 128 * 1024)
+        with Image.open(io.BytesIO(compressed)) as image:
+            self.assertLessEqual(max(image.size), 128)
+            self.assertEqual(image.format, "JPEG")
+
     def test_processing_ack_uses_napcat_emoji_like_action(self) -> None:
         plugin_path = (
             Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
@@ -759,15 +687,54 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertIn('"appearance_prompt": config.persona.appearance_prompt', storage_source)
         self.assertIn("appearance_prompt 只约束人物样貌，不固定服装、场景", plugin_source)
 
-    def test_draw_prompt_includes_resolved_reference_context(self) -> None:
+    def test_draw_prompt_uses_intent_plan_without_reference_search(self) -> None:
         plugin_path = (
             Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
         )
         source = plugin_path.read_text(encoding="utf-8")
 
-        self.assertIn("draw_reference_resolver.resolve_all(draw_request)", source)
-        self.assertIn("已解析生图参考", source)
-        self.assertIn("不要把参考名按字面颜色", source)
+        self.assertIn("draw_intent_planner.plan(draw_request)", source)
+        self.assertIn("用户显式参考要求", source)
+        self.assertIn("不要联网查证", source)
+        self.assertIn("_draw_bot_appearance_context", source)
+        self.assertNotIn('f"人设：\\n{_draw_join(snapshot.persona_lines)}\\n"', source)
+
+    def test_draw_command_passes_prepared_reference_images_to_image_model(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+
+        self.assertIn("prepare_draw_reference_images(", source)
+        self.assertIn("max_images=config.image_generation.max_reference_images", source)
+        self.assertIn("reference_image_count=len(reference_images.image_urls)", source)
+        self.assertIn("image_urls=reference_images.image_urls", source)
+
+    def test_draw_prompt_extractor_recovers_truncated_json_string(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
+        )
+        source = plugin_path.read_text(encoding="utf-8")
+        module = ast.parse(source)
+        selected = [
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_extract_draw_prompt", "_extract_truncated_draw_prompt"}
+        ]
+        test_module = ast.Module(body=selected, type_ignores=[])
+        ast.fix_missing_locations(test_module)
+        image_generation = type("ImageGeneration", (), {"max_prompt_chars": 800})()
+        fake_config = type("Config", (), {"image_generation": image_generation})()
+        namespace = {"json": json, "re": __import__("re"), "config": fake_config}
+        exec(compile(test_module, str(plugin_path), "exec"), namespace)
+
+        extract_draw_prompt = namespace["_extract_draw_prompt"]
+
+        self.assertEqual(
+            extract_draw_prompt('{"prompt":"白发角色，融合红黑服饰和金色装饰'),
+            "白发角色，融合红黑服饰和金色装饰",
+        )
 
 
 class LLMRoutingTests(unittest.TestCase):
@@ -817,7 +784,7 @@ class LLMRoutingTests(unittest.TestCase):
                 ),
             )
         )
-        captured: list[tuple[str, str]] = []
+        captured: list[tuple[str, str, int]] = []
 
         async def fake_post_chat_completion(
             payload: dict,
@@ -825,14 +792,14 @@ class LLMRoutingTests(unittest.TestCase):
             purpose: str,
             prompt_chars: int,
         ) -> str | None:
-            captured.append((purpose, str(payload["model"])))
+            captured.append((purpose, str(payload["model"]), int(payload["max_tokens"])))
             return "ok"
 
         client._post_chat_completion = fake_post_chat_completion  # type: ignore[method-assign]
 
         asyncio.run(client.complete_text("s", "u", purpose="perception"))
-        asyncio.run(client.complete_text("s", "u", purpose="draw_reference_detect"))
-        asyncio.run(client.complete_text("s", "u", purpose="draw_reference"))
+        asyncio.run(client.complete_text("s", "u", purpose="draw_intent"))
+        asyncio.run(client.complete_text("s", "u", purpose="draw_prompt"))
         asyncio.run(client.complete_text("s", "u", purpose="response"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa", model_tier="flagship"))
@@ -840,12 +807,12 @@ class LLMRoutingTests(unittest.TestCase):
         self.assertEqual(
             captured,
             [
-                ("perception", "gpt-5.4-mini"),
-                ("draw_reference_detect", "gpt-5.4-mini"),
-                ("draw_reference", "gpt-5.4-mini"),
-                ("response", "gpt-5.5"),
-                ("final_qa", "gpt-5.4-mini"),
-                ("final_qa", "gpt-5.5"),
+                ("perception", "gpt-5.4-mini", 4096),
+                ("draw_intent", "gpt-5.4-mini", 4096),
+                ("draw_prompt", "gpt-5.4-mini", 4096),
+                ("response", "gpt-5.5", 4096),
+                ("final_qa", "gpt-5.4-mini", 4096),
+                ("final_qa", "gpt-5.5", 4096),
             ],
         )
 

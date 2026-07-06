@@ -222,7 +222,7 @@ model = "gpt-5.5"
 base_url = "https://你的 API 地址/v1"
 api_key_env = "OPENAI_API_KEY"
 temperature = 0.8
-max_tokens = 256
+max_tokens = 4096
 timeout_seconds = 30.0
 
 [llm.routing]

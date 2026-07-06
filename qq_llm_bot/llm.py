@@ -15,8 +15,7 @@ from qq_llm_bot.config import ImageGenerationConfig, LLMConfig, VisionConfig
 
 BASE_TEXT_PURPOSES = {
     "batch_observation",
-    "draw_reference",
-    "draw_reference_detect",
+    "draw_intent",
     "fact_extract",
     "followup_gate",
     "lexicon_detect",
@@ -90,6 +89,7 @@ class LLMClient(Protocol):
         self,
         prompt: str,
         image_config: ImageGenerationConfig,
+        image_urls: list[str] | None = None,
     ) -> GeneratedImage | None:
         ...
 
@@ -121,6 +121,7 @@ class DisabledLLMClient:
         self,
         prompt: str,
         image_config: ImageGenerationConfig,
+        image_urls: list[str] | None = None,
     ) -> GeneratedImage | None:
         return None
 
@@ -165,7 +166,7 @@ class OpenAICompatibleLLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
+            "max_tokens": self._max_tokens_for_text_purpose(purpose or "text"),
         }
         return await self._post_chat_completion(
             payload,
@@ -243,6 +244,7 @@ class OpenAICompatibleLLMClient:
         self,
         prompt: str,
         image_config: ImageGenerationConfig,
+        image_urls: list[str] | None = None,
     ) -> GeneratedImage | None:
         self.last_image_generation_error = ""
         self._last_image_generation_failure_kind = ""
@@ -276,7 +278,7 @@ class OpenAICompatibleLLMClient:
 
         payload = {
             "model": image_model,
-            "input": clean_prompt,
+            "input": _image_generation_input(clean_prompt, image_urls or []),
             "tools": [tool],
             "tool_choice": {"type": "image_generation"},
         }
@@ -461,6 +463,14 @@ class OpenAICompatibleLLMClient:
             return self.config.routing.base_model or self.config.model
         return self.config.model
 
+    def _max_tokens_for_text_purpose(self, purpose: str) -> int:
+        normalized = (purpose or "text").strip().lower()
+        if normalized == "draw_prompt":
+            return max(self.config.max_tokens, 1024)
+        if normalized == "draw_intent":
+            return max(self.config.max_tokens, 512)
+        return self.config.max_tokens
+
     def _vision_model_for_tier(
         self,
         vision_config: VisionConfig,
@@ -580,6 +590,15 @@ def _generated_image_from_result(result: str) -> GeneratedImage:
         mime_type = header[5:].split(";", 1)[0] or "image/png"
         return GeneratedImage(data=base64.b64decode(encoded), mime_type=mime_type)
     return GeneratedImage(data=base64.b64decode(result), mime_type="image/png")
+
+
+def _image_generation_input(prompt: str, image_urls: list[str]) -> object:
+    clean_urls = [url.strip() for url in image_urls if str(url or "").strip()]
+    if not clean_urls:
+        return prompt
+    content: list[dict[str, str]] = [{"type": "input_text", "text": prompt}]
+    content.extend({"type": "input_image", "image_url": url} for url in clean_urls)
+    return [{"role": "user", "content": content}]
 
 
 def _response_request_id(response: httpx.Response) -> str:

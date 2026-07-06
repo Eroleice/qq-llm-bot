@@ -138,6 +138,10 @@ class ImageGenerationConfig:
     min_trust: int = 5
     daily_limit: int = 5
     max_prompt_chars: int = 800
+    max_reference_images: int = 3
+    reference_image_max_bytes: int = 4 * 1024 * 1024
+    reference_image_max_dimension: int = 1536
+    reference_image_quality: int = 85
 
 
 @dataclass(frozen=True)
@@ -175,7 +179,7 @@ class LLMConfig:
     api_key: str = ""
     api_key_env: str = "OPENAI_API_KEY"
     temperature: float = 0.8
-    max_tokens: int = 256
+    max_tokens: int = 4096
     timeout_seconds: float = 30.0
     routing: LLMRoutingConfig = field(default_factory=LLMRoutingConfig)
 
@@ -505,6 +509,30 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
                 image_generation_raw.get("max_prompt_chars", 800),
                 "image_generation.max_prompt_chars",
             ),
+            max_reference_images=_int_in_range(
+                image_generation_raw.get("max_reference_images", 3),
+                "image_generation.max_reference_images",
+                0,
+                3,
+            ),
+            reference_image_max_bytes=_int_in_range(
+                image_generation_raw.get("reference_image_max_bytes", 4 * 1024 * 1024),
+                "image_generation.reference_image_max_bytes",
+                64 * 1024,
+                20 * 1024 * 1024,
+            ),
+            reference_image_max_dimension=_int_in_range(
+                image_generation_raw.get("reference_image_max_dimension", 1536),
+                "image_generation.reference_image_max_dimension",
+                256,
+                4096,
+            ),
+            reference_image_quality=_int_in_range(
+                image_generation_raw.get("reference_image_quality", 85),
+                "image_generation.reference_image_quality",
+                30,
+                95,
+            ),
         ),
         stickers=StickerConfig(
             enabled=_bool_value(stickers_raw.get("enabled", False)),
@@ -561,7 +589,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             api_key_env=str(llm_raw.get("api_key_env", "OPENAI_API_KEY")).strip()
             or "OPENAI_API_KEY",
             temperature=_float_in_range(llm_raw.get("temperature", 0.8), "llm.temperature", 0, 2),
-            max_tokens=_positive_int(llm_raw.get("max_tokens", 256), "llm.max_tokens"),
+            max_tokens=_positive_int(llm_raw.get("max_tokens", 4096), "llm.max_tokens"),
             timeout_seconds=_float_in_range(
                 llm_raw.get("timeout_seconds", 30.0),
                 "llm.timeout_seconds",
