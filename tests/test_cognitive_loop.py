@@ -170,7 +170,14 @@ class InMemoryBotStorage(BotStorage):
                 raise
 
 
+PROJECT_TMP = Path(__file__).resolve().parents[1] / ".tmp"
+
+
 def test_config(db_path: Path) -> AppConfig:
+    if not db_path.is_absolute():
+        PROJECT_TMP.mkdir(parents=True, exist_ok=True)
+        db_path = PROJECT_TMP / db_path
+
     return AppConfig(
         napcat=NapCatConfig(ws_url="ws://example.test"),
         bot=BotConfig(
@@ -190,6 +197,13 @@ def test_config(db_path: Path) -> AppConfig:
 
 
 test_config.__test__ = False
+
+
+@contextmanager
+def _project_temp_directory():
+    PROJECT_TMP.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as tmp:
+        yield tmp
 
 
 class FakeDashboardDriver:
@@ -261,7 +275,7 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(image.mime_type, "image/png")  # type: ignore[union-attr]
 
     def test_generated_image_store_saves_single_image_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             base_config = test_config(Path(tmp) / "bot.sqlite3")
             config = replace(
                 base_config,
@@ -293,7 +307,7 @@ class ImageGenerationTests(unittest.TestCase):
         except ModuleNotFoundError as exc:
             raise unittest.SkipTest("Pillow is not installed in this environment") from exc
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             source = io.BytesIO()
             Image.new("RGB", (1400, 1000), "white").save(source, format="PNG")
             base_config = test_config(Path(tmp) / "bot.sqlite3")
@@ -327,7 +341,7 @@ class ImageGenerationTests(unittest.TestCase):
                 self.assertEqual(image.format, "JPEG")
 
     def test_image_generation_config_uses_small_chat_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config_path = Path(tmp) / "config.toml"
             config_path.write_text(
                 "\n".join(
@@ -1205,7 +1219,7 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.reply)
 
     async def test_vision_analysis_reuses_cached_image_url(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = replace(
                 test_config(Path(tmp) / "bot.sqlite3"),
                 vision=VisionConfig(enabled=True, remember_threshold=0.78),
@@ -1983,7 +1997,7 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
 
 class MemoryStorageTests(unittest.TestCase):
     def test_global_ignore_list_is_seeded_and_updated(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             base_config = test_config(Path(tmp) / "bot.sqlite3")
             config = replace(
                 base_config,
@@ -2006,7 +2020,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertCountEqual(storage.list_ignored_users(), ["123", "7"])
 
     def test_image_generation_usage_is_counted_by_user_and_date(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2161,7 +2175,7 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertLess(observe_vision_line, image_summary_line)
 
     def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2230,7 +2244,7 @@ class MemoryStorageTests(unittest.TestCase):
             )
 
     def test_snapshot_includes_recent_bot_reply_to_same_user(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2261,7 +2275,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertGreaterEqual(snapshot.recent_bot_reply_to_user_seconds, 0)
 
     def test_sticker_asset_is_saved_and_can_be_disabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2296,7 +2310,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(len(storage.list_sticker_assets("100", enabled_only=False)), 1)
 
     def test_sticker_asset_reuses_same_ocr_with_different_hash(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2352,7 +2366,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(active[0].hit_count, 2)
 
     def test_sticker_file_ref_uses_absolute_local_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             sticker_path = Path(tmp) / "meme.gif"
             sticker_path.write_bytes(b"fake image")
             asset = StickerAssetRecord(
@@ -2382,7 +2396,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertFalse(file_ref.startswith("file:"))
 
     def test_dashboard_stickers_include_delete_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2413,7 +2427,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertIn("100", storage.list_dashboard_groups())
 
     def test_delete_sticker_asset_and_local_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             store = StickerLocalStore(config)
             sticker_dir = config.resolve_path(config.stickers.storage_dir) / "100"
@@ -2455,7 +2469,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.list_sticker_assets("100", enabled_only=False), [])
 
     def test_sticker_usage_is_counted_by_day(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2498,7 +2512,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(daily[0]["send_count"], 2)
 
     def test_unused_sticker_cleanup_removes_assets_after_72_hours(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             store = StickerLocalStore(config)
             sticker_dir = config.resolve_path(config.stickers.storage_dir) / "100"
@@ -2586,7 +2600,7 @@ class MemoryStorageTests(unittest.TestCase):
             storage.connection.close()
 
     def test_bot_sourced_lexicon_group_fact_is_accepted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2613,7 +2627,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertTrue(storage.has_group_lexicon("100", "内卷"))
 
     def test_lexicon_duplicate_uses_term_subject_not_exact_content(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2654,7 +2668,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(active[0].confidence, 0.9)
 
     def test_multiple_self_past_events_can_coexist(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2693,7 +2707,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(len(active), 2)
 
     def test_self_preference_conflict_is_marked_without_overwriting(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2739,7 +2753,7 @@ class MemoryStorageTests(unittest.TestCase):
             )
 
     def test_different_self_preferences_can_coexist(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2777,7 +2791,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(len(storage.list_memories("self", "bot", status="active")), 2)
 
     def test_self_report_fact_is_accepted_for_speaker(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2806,7 +2820,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.list_memories("user", "42", status="active"), [])
 
     def test_member_aliases_allow_multiple_names_and_resolve_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2856,7 +2870,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertIn("牛牛", by_first.target_users[0].aliases)
 
     def test_relationship_titles_are_rejected_as_member_aliases(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2932,7 +2946,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(snapshot.unknown_name_refs, ["主人"])
 
     def test_mixed_relationship_title_claim_keeps_reasonable_alias_only(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -2970,7 +2984,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(by_bad_title.unknown_name_refs, ["主人"])
 
     def test_mention_target_injects_member_facts_for_non_speaker(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3010,7 +3024,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertIn("牛宝宝", snapshot.target_users[0].facts[0].claim_text)
 
     def test_alias_correction_supersedes_only_denied_alias(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3067,7 +3081,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertIn("牛牛", new_lookup.target_users[0].aliases)
 
     def test_forgotten_and_stale_low_importance_facts_do_not_enter_context(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3104,7 +3118,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.get_fact_record(low.id).status, "forgotten")
 
     def test_low_value_fact_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3130,7 +3144,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.list_user_facts("42"), [])
 
     def test_low_trust_third_party_fact_is_pending_not_accepted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3157,7 +3171,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.list_user_facts("77", status="pending_confirmation")[0].claim_text, "用户77喜欢吃鱼")
 
     def test_user_can_manage_only_own_pending_facts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3216,7 +3230,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(record_88.status, "rejected")  # type: ignore[union-attr]
 
     def test_high_trust_third_party_fact_is_accepted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3242,7 +3256,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.list_user_facts("77")[0].claim_text, "用户77喜欢吃鱼")
 
     def test_profile_updates_after_five_accepted_facts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3285,7 +3299,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertFalse(storage.should_update_user_profile("42"))
 
     def test_conflicting_memory_is_marked_without_overwriting_active_memory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3328,7 +3342,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(conflicts[0].content, "小张")
 
     def test_conflict_confirmation_respects_mode_and_direct_mention(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3373,7 +3387,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertIn("吃鱼", storage.build_conflict_confirmation(write.conflicts, context, "passive") or "")
 
     def test_admin_can_approve_and_reject_pending_memory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3416,7 +3430,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.list_memories("user", "name:小红", status="pending_confirmation"), [])
 
     def test_dashboard_user_cognition_includes_relationship_and_profile(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3457,7 +3471,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(items[0]["facts"][0]["claim_text"], "用户42喜欢海边")  # type: ignore[index]
 
     def test_relationship_summary_filters_low_value_message_log_items(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3496,7 +3510,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(items[0]["relationship"]["summary"], "主动找可可讨论技术问题")  # type: ignore[index]
 
     def test_dashboard_user_cognition_groups_by_qq_id_across_groups(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3553,7 +3567,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(filtered_user_items[0]["facts"][0]["claim_text"], "用户42喜欢海边")  # type: ignore[index]
 
     def test_relationship_ranking_formats_top_five_by_closeness_and_familiarity(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3601,7 +3615,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(storage.format_relationship_ranking("404"), "本群暂无关系记录。")
 
     def test_dashboard_user_cognition_uses_latest_qq_nickname(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3637,7 +3651,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(items[0]["display_name"], "新群名片")
 
     def test_dashboard_messages_can_filter_by_group_user_and_date(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3675,7 +3689,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(messages[0]["plain_text"], "今天聊海边")
 
     def test_dashboard_messages_include_mentions(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3715,7 +3729,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(by_message_id["m-plain"]["mentions"], [])
 
     def test_dashboard_messages_include_image_attachments_and_summary(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3744,7 +3758,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(messages[0]["attachments"][0]["summary"], "一张财务报表截图")
 
     def test_image_description_update_keeps_unsampled_images_blank(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3773,7 +3787,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(summaries, ["第一张", "", "中间张", "", "最后张"])
 
     def test_dashboard_pending_generates_group_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3804,7 +3818,7 @@ class MemoryStorageTests(unittest.TestCase):
 
     def test_dashboard_api_can_manage_pending_fact(self) -> None:
         FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3853,7 +3867,7 @@ class MemoryStorageTests(unittest.TestCase):
 
     def test_dashboard_api_can_reject_pending_memory_and_fact(self) -> None:
         FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -3913,7 +3927,7 @@ class MemoryStorageTests(unittest.TestCase):
 
     def test_dashboard_api_can_bulk_manage_pending_items(self) -> None:
         FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -4022,7 +4036,7 @@ class MemoryStorageTests(unittest.TestCase):
 
     def test_dashboard_api_deletes_sticker_asset_and_file(self) -> None:
         FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -4060,7 +4074,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertFalse(sticker_file.exists())
 
     def test_last_decision_includes_proactive_value_metadata(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with _project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
             storage = BotStorage.from_config(config)
             storage.setup()
@@ -4093,3 +4107,4 @@ class MemoryStorageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
