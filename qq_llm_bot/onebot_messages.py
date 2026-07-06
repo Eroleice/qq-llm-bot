@@ -9,6 +9,8 @@ from qq_llm_bot.models import MessageMention
 
 FORWARDED_RECORD_START = "[合并转发聊天记录开始]"
 FORWARDED_RECORD_END = "[合并转发聊天记录结束]"
+QUOTED_MESSAGE_START = "[被引用消息开始]"
+QUOTED_MESSAGE_END = "[被引用消息结束]"
 OUTGOING_MENTION_PATTERN = re.compile(
     r"@(?:"
     r"(?P<label>[^@\r\n()]{1,80}?)\s*\(\s*[Qq][Qq]\s*[:：]\s*(?P<label_qq>\d{1,20})\s*\)"
@@ -17,6 +19,7 @@ OUTGOING_MENTION_PATTERN = re.compile(
 )
 
 ForwardFetcher = Callable[[str], Awaitable[Any]]
+ReplyFetcher = Callable[[str], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,7 @@ async def render_message_text_and_mentions_with_forwards(
     bot_id: str = "",
     forward_fetcher: ForwardFetcher | None = None,
     *,
+    reply_fetcher: ReplyFetcher | None = None,
     max_forward_depth: int = 2,
     max_forward_nodes: int = 80,
     max_forward_chars: int = 6000,
@@ -71,6 +75,7 @@ async def render_message_text_and_mentions_with_forwards(
         segments,
         bot_id=str(bot_id),
         forward_fetcher=forward_fetcher,
+        reply_fetcher=reply_fetcher,
         depth=0,
         max_forward_depth=max(0, max_forward_depth),
         state=state,
@@ -80,8 +85,16 @@ async def render_message_text_and_mentions_with_forwards(
 
 
 def strip_forwarded_records(text: str) -> str:
+    return _strip_marked_block(text, FORWARDED_RECORD_START, FORWARDED_RECORD_END)
+
+
+def strip_quoted_messages(text: str) -> str:
+    return _strip_marked_block(text, QUOTED_MESSAGE_START, QUOTED_MESSAGE_END)
+
+
+def _strip_marked_block(text: str, start_marker: str, end_marker: str) -> str:
     pattern = re.compile(
-        rf"{re.escape(FORWARDED_RECORD_START)}.*?{re.escape(FORWARDED_RECORD_END)}",
+        rf"{re.escape(start_marker)}.*?{re.escape(end_marker)}",
         re.S,
     )
     return "\n".join(line for line in pattern.sub("", text).splitlines() if line.strip()).strip()
@@ -142,6 +155,7 @@ async def _render_segments(
     *,
     bot_id: str,
     forward_fetcher: ForwardFetcher | None,
+    reply_fetcher: ReplyFetcher | None,
     depth: int,
     max_forward_depth: int,
     state: _ForwardRenderState,
@@ -166,12 +180,26 @@ async def _render_segments(
                 data,
                 bot_id=bot_id,
                 forward_fetcher=forward_fetcher,
+                reply_fetcher=reply_fetcher,
                 depth=depth,
                 max_forward_depth=max_forward_depth,
                 state=state,
             )
             _append_block(parts, forward_text)
             mentions.extend(forward_mentions)
+            continue
+        if segment_type == "reply":
+            reply_text, reply_mentions = await _render_reply_segment(
+                data,
+                bot_id=bot_id,
+                forward_fetcher=forward_fetcher,
+                reply_fetcher=reply_fetcher,
+                depth=depth,
+                max_forward_depth=max_forward_depth,
+                state=state,
+            )
+            _append_block(parts, reply_text)
+            mentions.extend(reply_mentions)
             continue
         if include_placeholders:
             parts.append(_segment_placeholder(segment_type, data))
@@ -184,6 +212,7 @@ async def _render_forward_segment(
     *,
     bot_id: str,
     forward_fetcher: ForwardFetcher | None,
+    reply_fetcher: ReplyFetcher | None,
     depth: int,
     max_forward_depth: int,
     state: _ForwardRenderState,
@@ -211,6 +240,7 @@ async def _render_forward_segment(
             node.content,
             bot_id=bot_id,
             forward_fetcher=forward_fetcher,
+            reply_fetcher=reply_fetcher,
             depth=depth + 1,
             max_forward_depth=max_forward_depth,
             state=state,
@@ -220,6 +250,51 @@ async def _render_forward_segment(
         parts.append(_format_forward_node(node, node_text))
     parts.append(FORWARDED_RECORD_END)
     return "\n".join(part for part in parts if part), mentions
+
+
+async def _render_reply_segment(
+    data: dict[str, Any],
+    *,
+    bot_id: str,
+    forward_fetcher: ForwardFetcher | None,
+    reply_fetcher: ReplyFetcher | None,
+    depth: int,
+    max_forward_depth: int,
+    state: _ForwardRenderState,
+) -> tuple[str, list[MessageMention]]:
+    reply_id = _first_text(data, "id", "message_id")
+    if not reply_fetcher or not reply_id:
+        return _quoted_fallback(reply_id), []
+    if depth >= max_forward_depth:
+        return f"[被引用消息: {reply_id}，已到展开深度上限]", []
+
+    payload = await reply_fetcher(reply_id)
+    node = _extract_quoted_message(payload)
+    if node is None:
+        return _quoted_fallback(reply_id), []
+
+    node_text, _ = await _render_segments(
+        node.content,
+        bot_id=bot_id,
+        forward_fetcher=forward_fetcher,
+        reply_fetcher=reply_fetcher,
+        depth=depth + 1,
+        max_forward_depth=max_forward_depth,
+        state=state,
+        include_placeholders=True,
+    )
+    return _format_quoted_message(node, node_text, reply_id), []
+
+
+def _extract_quoted_message(payload: Any) -> _ForwardNode | None:
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        node = _node_from_item(payload)
+        if node is not None:
+            return node
+    nodes = _nodes_from_value(payload)
+    return nodes[0] if nodes else None
 
 
 def _mention_from_data(data: dict[str, Any], bot_id: str) -> MessageMention:
@@ -311,7 +386,7 @@ def _node_from_item(item: Any) -> _ForwardNode | None:
         return None
     sender = data.get("sender")
     sender_data = sender if isinstance(sender, dict) else {}
-    content = _first_existing(data, "content", "message")
+    content = _first_existing(data, "content", "message", "raw_message")
     if content is None:
         return None
     user_id = _first_text(data, "user_id", "uin", "qq") or _first_text(
@@ -342,6 +417,19 @@ def _format_forward_sender(node: _ForwardNode) -> str:
     if user_id:
         return f"QQ:{user_id}"
     return "unknown"
+
+
+def _format_quoted_message(node: _ForwardNode, text: str, message_id: str) -> str:
+    sender = _format_forward_sender(node)
+    title = "[被引用消息"
+    if message_id:
+        title += f" #{message_id}"
+    if sender != "unknown":
+        title += f" | {sender}"
+    title += "]"
+    body = text.strip() or "[空消息]"
+    body = "\n  ".join(body.splitlines())
+    return f"{QUOTED_MESSAGE_START}\n{title}\n  {body}\n{QUOTED_MESSAGE_END}"
 
 
 def _segment_placeholder(segment_type: str, data: dict[str, Any]) -> str:
@@ -400,12 +488,18 @@ def _forward_fallback(forward_id: str) -> str:
     return f"[合并转发聊天记录: {forward_id or '无法展开'}]"
 
 
+def _quoted_fallback(message_id: str) -> str:
+    return f"[被引用消息: {message_id or '无法展开'}]"
+
+
 def _append_block(parts: list[str], block: str) -> None:
     if not block:
         return
     if parts and parts[-1] and not parts[-1].endswith(("\n", " ")):
         parts.append("\n")
     parts.append(block)
+    if not block.endswith("\n"):
+        parts.append("\n")
 
 
 def _first_existing(data: dict[str, Any], *keys: str) -> Any:

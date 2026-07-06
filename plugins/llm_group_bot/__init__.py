@@ -442,8 +442,6 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         await _defer_observation(context, mode)
         return
 
-    await _acknowledge_processing(bot, context.message_id, "realtime pipeline")
-
     await _flush_observation_batch(group_id)
     snapshot = storage.build_snapshot(context)
     result = await pipeline.run(context, mode, snapshot)
@@ -900,7 +898,6 @@ async def _handle_llm(bot: Bot, event: GroupMessageEvent, rest: list[str]) -> No
 
     if action == "test":
         prompt = " ".join(rest[1:]).strip() or "用一句话自然地打个招呼。"
-        await _acknowledge_processing(bot, event.message_id, "llm test")
         reply = await llm.complete_text(
             "你是 QQ 群里的拟人角色，说话自然、简短。",
             prompt,
@@ -1363,6 +1360,7 @@ async def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
         event.message,
         str(bot.self_id),
         _fetch_forward_message(bot),
+        reply_fetcher=_fetch_reply_message(bot, event),
     )
     sender = getattr(event, "sender", None)
     sender_nickname = _sender_field(sender, "nickname")
@@ -1394,6 +1392,49 @@ def _fetch_forward_message(bot: Bot):
             return None
 
     return _fetch
+
+
+def _fetch_reply_message(bot: Bot, event: GroupMessageEvent):
+    async def _fetch(message_id: str) -> Any:
+        event_reply = _event_reply_payload(event, message_id)
+        if event_reply is not None:
+            return event_reply
+        target_message_id = _onebot_message_id(message_id)
+        if target_message_id is None:
+            return None
+        try:
+            return await bot.get_msg(message_id=target_message_id)
+        except Exception as exc:
+            logger.warning("Failed to fetch quoted message {}: {}", message_id, exc)
+            return None
+
+    return _fetch
+
+
+def _event_reply_payload(event: GroupMessageEvent, message_id: str) -> dict[str, Any] | None:
+    reply = getattr(event, "reply", None)
+    if reply is None:
+        return None
+    reply_message_id = str(
+        getattr(reply, "message_id", "") or getattr(reply, "id", "") or ""
+    ).strip()
+    if reply_message_id and message_id and reply_message_id != str(message_id):
+        return None
+    message = getattr(reply, "message", None)
+    if message is None:
+        message = getattr(reply, "content", None)
+    raw_message = str(getattr(reply, "raw_message", "") or "")
+    sender = getattr(reply, "sender", None)
+    return {
+        "message_id": reply_message_id or str(message_id),
+        "message": message if message is not None else raw_message,
+        "raw_message": raw_message,
+        "sender": {
+            "user_id": _sender_field(sender, "user_id"),
+            "nickname": _sender_field(sender, "nickname") or _sender_field(sender, "card"),
+            "card": _sender_field(sender, "card"),
+        },
+    }
 
 
 def _is_direct_message(bot: Bot, event: GroupMessageEvent, plain_text: str) -> bool:

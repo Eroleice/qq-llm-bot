@@ -69,10 +69,13 @@ from qq_llm_bot.llm import (
 from qq_llm_bot.onebot_messages import (
     FORWARDED_RECORD_END,
     FORWARDED_RECORD_START,
+    QUOTED_MESSAGE_END,
+    QUOTED_MESSAGE_START,
     parse_outgoing_mention_parts,
     render_message_text_and_mentions,
     render_message_text_and_mentions_with_forwards,
     strip_forwarded_records,
+    strip_quoted_messages,
 )
 from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
 from qq_llm_bot.web_search import SearchResult, default_slang_query
@@ -424,18 +427,16 @@ class ImageGenerationTests(unittest.TestCase):
 
         self.assertLess(ack_position, prompt_position)
 
-    def test_realtime_pipeline_acknowledges_before_llm_work(self) -> None:
+    def test_processing_ack_is_limited_to_draw_command(self) -> None:
         plugin_path = (
             Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py"
         )
         source = plugin_path.read_text(encoding="utf-8")
 
-        ack_position = source.index(
-            'await _acknowledge_processing(bot, context.message_id, "realtime pipeline")'
-        )
-        pipeline_position = source.index("result = await pipeline.run")
-
-        self.assertLess(ack_position, pipeline_position)
+        self.assertEqual(source.count("await _acknowledge_processing("), 1)
+        self.assertIn('await _acknowledge_processing(bot, event.message_id, "draw")', source)
+        self.assertNotIn('"realtime pipeline"', source)
+        self.assertNotIn('"llm test"', source)
 
     def test_draw_command_exempts_admins_from_trust_and_daily_limit(self) -> None:
         plugin_path = (
@@ -534,6 +535,33 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(FORWARDED_RECORD_END, plain_text)
         self.assertEqual([mention.user_id for mention in mentions], ["456"])
 
+    async def test_onebot_reply_segment_is_expanded_as_quoted_context(self) -> None:
+        message = Message("[CQ:reply,id=reply-1]这句怎么回")
+
+        async def fetch_reply(message_id: str) -> dict[str, object]:
+            self.assertEqual(message_id, "reply-1")
+            return {
+                "sender": {"user_id": 123, "nickname": "Alice"},
+                "message": [
+                    {"type": "text", "data": {"text": "我喜欢吃鱼 "}},
+                    {"type": "at", "data": {"qq": "456", "name": "Bob"}},
+                    {"type": "image", "data": {"summary": "chart"}},
+                ],
+            }
+
+        plain_text, mentions = await render_message_text_and_mentions_with_forwards(
+            message,
+            bot_id="999",
+            reply_fetcher=fetch_reply,
+        )
+
+        self.assertIn(QUOTED_MESSAGE_START, plain_text)
+        self.assertIn("[被引用消息 #reply-1 | Alice(QQ:123)]", plain_text)
+        self.assertIn("我喜欢吃鱼 @Bob(QQ:456)[图片: chart]", plain_text)
+        self.assertIn(QUOTED_MESSAGE_END, plain_text)
+        self.assertTrue(plain_text.endswith("这句怎么回"))
+        self.assertEqual(mentions, [])
+
     def test_strip_forwarded_records_keeps_direct_text_only(self) -> None:
         text = (
             "summarize this\n"
@@ -543,6 +571,17 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(strip_forwarded_records(text), "summarize this")
+
+    def test_strip_quoted_messages_keeps_direct_text_only(self) -> None:
+        text = (
+            f"{QUOTED_MESSAGE_START}\n"
+            "[被引用消息 #reply-1 | Alice(QQ:123)]\n"
+            "  我喜欢吃鱼\n"
+            f"{QUOTED_MESSAGE_END}\n"
+            "这句怎么回"
+        )
+
+        self.assertEqual(strip_quoted_messages(text), "这句怎么回")
 
     async def test_batch_observation_agent_parses_structured_summary(self) -> None:
         llm = FakeLLM(

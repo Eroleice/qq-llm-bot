@@ -31,7 +31,11 @@ from qq_llm_bot.models import (
     UserProfileDraft,
     UserProfileRecord,
 )
-from qq_llm_bot.onebot_messages import format_mention_label, strip_forwarded_records
+from qq_llm_bot.onebot_messages import (
+    format_mention_label,
+    strip_forwarded_records,
+    strip_quoted_messages,
+)
 from qq_llm_bot.relationship_summary import clean_relationship_summary_patch
 from qq_llm_bot.web_search import SearchResult, WebSearchClient, build_web_search_client, default_slang_query
 
@@ -388,6 +392,9 @@ class MemoryCuratorAgent:
                 "Forwarded record rule: text between [合并转发聊天记录开始] and "
                 "[合并转发聊天记录结束] is quoted chat history. First-person words inside it "
                 "refer to the sender label on that forwarded line, not the member who forwarded it.\n"
+                "Quoted message rule: text between [被引用消息开始] and [被引用消息结束] "
+                "is quoted context. First-person words inside it refer to the quoted sender label, "
+                "not the current speaker.\n"
                 f"Current mentions:\n{_format_mentions(context)}\n"
                 f"说话人已有记忆：\n{_format_memories(snapshot.user_memories)}\n"
                 f"消息：{context.plain_text}"
@@ -439,7 +446,8 @@ class MemoryCuratorAgent:
         context: MessageContext,
         perception: PerceptionResult,
     ) -> list[MemoryCandidate]:
-        direct_context = replace(context, plain_text=strip_forwarded_records(context.plain_text))
+        direct_text = strip_quoted_messages(strip_forwarded_records(context.plain_text))
+        direct_context = replace(context, plain_text=direct_text)
         memories: list[MemoryCandidate] = []
         memories.extend(self._heuristic_group_facts(direct_context))
         memories.extend(self._heuristic_third_party(direct_context))
@@ -590,6 +598,9 @@ class FactExtractorAgent:
                 "Forwarded record rule: text between [合并转发聊天记录开始] and "
                 "[合并转发聊天记录结束] is quoted chat history. First-person words inside it "
                 "refer to the sender label on that forwarded line, not the member who forwarded it.\n"
+                "Quoted message rule: text between [被引用消息开始] and [被引用消息结束] "
+                "is quoted context. First-person words inside it refer to the quoted sender label, "
+                "not the current speaker.\n"
                 f"Current mentions:\n{_format_mentions(context)}\n"
                 f"最近上下文：\n{_format_recent_context(snapshot)}\n"
                 f"当前消息：{context.plain_text}"
@@ -638,7 +649,10 @@ class FactExtractorAgent:
         )
 
     def _heuristic(self, context: MessageContext) -> list[FactCandidate]:
-        text = _strip_bot_call(strip_forwarded_records(context.plain_text), [])
+        text = _strip_bot_call(
+            strip_quoted_messages(strip_forwarded_records(context.plain_text)),
+            [],
+        )
         if not text or _looks_low_value_fact_text(text, text, text):
             return []
         facts: list[FactCandidate] = []

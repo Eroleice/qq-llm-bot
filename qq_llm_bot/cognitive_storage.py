@@ -31,6 +31,7 @@ from qq_llm_bot.models import (
     UserProfileRecord,
     UserProfileDraft,
 )
+from qq_llm_bot.onebot_messages import strip_quoted_messages
 from qq_llm_bot.relationship_summary import merge_relationship_summary
 
 CONFLICT_SENSITIVE_KINDS = {
@@ -2716,6 +2717,7 @@ class BotStorage:
         self,
         context: MessageContext,
     ) -> tuple[list[TargetUserContext], list[str], dict[str, list[str]]]:
+        context = replace(context, plain_text=strip_quoted_messages(context.plain_text))
         target_reasons: dict[str, str] = {}
         for user_id in _extract_explicit_target_user_ids(context):
             target_reasons.setdefault(user_id, "explicit_qq")
