@@ -15,6 +15,13 @@ proactive_busy_value_threshold = 0.78
 proactive_busy_human_messages = 6
 interaction_followup_seconds = 180
 max_reply_chars = 180
+reply_style_enabled = true
+reply_bubbles_enabled = true
+reply_bubble_trigger_chars = 45
+reply_bubble_target_chars = 28
+reply_bubble_max_parts = 3
+reply_bubble_delay_seconds = 0.9
+reply_emoji_cooldown_messages = 10
 final_qa_enabled = true
 
 [persona]

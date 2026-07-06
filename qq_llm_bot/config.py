@@ -35,6 +35,13 @@ class BotConfig:
     proactive_busy_human_messages: int = 6
     interaction_followup_seconds: int = 180
     max_reply_chars: int = 180
+    reply_style_enabled: bool = True
+    reply_bubbles_enabled: bool = True
+    reply_bubble_trigger_chars: int = 45
+    reply_bubble_target_chars: int = 28
+    reply_bubble_max_parts: int = 3
+    reply_bubble_delay_seconds: float = 0.9
+    reply_emoji_cooldown_messages: int = 10
     final_qa_enabled: bool = True
 
 
@@ -275,6 +282,34 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             "bot.interaction_followup_seconds",
         ),
         max_reply_chars=_positive_int(bot_raw.get("max_reply_chars", 180), "bot.max_reply_chars"),
+        reply_style_enabled=_bool_value(bot_raw.get("reply_style_enabled", True)),
+        reply_bubbles_enabled=_bool_value(bot_raw.get("reply_bubbles_enabled", True)),
+        reply_bubble_trigger_chars=_positive_int(
+            bot_raw.get("reply_bubble_trigger_chars", 45),
+            "bot.reply_bubble_trigger_chars",
+        ),
+        reply_bubble_target_chars=_positive_int(
+            bot_raw.get("reply_bubble_target_chars", 28),
+            "bot.reply_bubble_target_chars",
+        ),
+        reply_bubble_max_parts=_int_in_range(
+            bot_raw.get("reply_bubble_max_parts", 3),
+            "bot.reply_bubble_max_parts",
+            1,
+            3,
+        ),
+        reply_bubble_delay_seconds=_float_in_range(
+            bot_raw.get("reply_bubble_delay_seconds", 0.9),
+            "bot.reply_bubble_delay_seconds",
+            0,
+            10,
+        ),
+        reply_emoji_cooldown_messages=_int_in_range(
+            bot_raw.get("reply_emoji_cooldown_messages", 10),
+            "bot.reply_emoji_cooldown_messages",
+            0,
+            1000,
+        ),
         final_qa_enabled=_bool_value(bot_raw.get("final_qa_enabled", True)),
     )
 

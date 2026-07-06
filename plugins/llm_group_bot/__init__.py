@@ -9,7 +9,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from loguru import logger
 from nonebot import get_driver, on_command, on_message
@@ -49,6 +49,7 @@ from qq_llm_bot.onebot_messages import (
     render_message_text_and_mentions,
     render_message_text_and_mentions_with_forwards,
 )
+from qq_llm_bot.reply_style import settings_from_bot_config, split_reply_bubbles, style_reply_text
 from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
 
 __plugin_meta__ = PluginMetadata(
@@ -77,6 +78,12 @@ class _PendingVision:
     future: asyncio.Future[list[str]]
     created_at: float
     worker: asyncio.Task[list[str]] | None = None
+
+
+@dataclass(frozen=True)
+class _ReplySendResult:
+    parts: tuple[str, ...]
+    sticker: StickerAssetRecord | None = None
 
 
 pending_vision_tasks: dict[tuple[str, str], _PendingVision] = {}
@@ -546,12 +553,23 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     else:
         storage.record_memory_candidates(result.reply_self_memories)
 
-    sent_sticker = await _send_group_reply(final_reply, selected_sticker, context.message_id)
-    decision_reply = _reply_record_text(final_reply, sent_sticker)
+    send_result = await _send_group_reply(
+        final_reply,
+        selected_sticker,
+        context.message_id,
+        context=context,
+        decision=result.decision,
+        allow_bubbles=not bool(conflict_reply),
+    )
+    decision_reply = _reply_record_text(send_result.parts, send_result.sticker)
     storage.record_decision(context, result.decision, decision_reply)
-    storage.record_bot_reply(context.group_id, str(bot.self_id), decision_reply)
-    if sent_sticker:
-        storage.record_sticker_sent(sent_sticker.id, usage_date=_draw_usage_date())
+    storage.record_bot_reply_parts(
+        context.group_id,
+        str(bot.self_id),
+        send_result.parts or ((decision_reply,) if decision_reply else ()),
+    )
+    if send_result.sticker:
+        storage.record_sticker_sent(send_result.sticker.id, usage_date=_draw_usage_date())
         _maybe_cleanup_unused_stickers()
     await group_message.finish()
 
@@ -655,9 +673,15 @@ async def _handle_pending_vision_timeout(
         value_type="clarifying_question",
         value_score=0.55,
     )
-    await _send_group_reply(_PENDING_VISION_WAIT_REPLY, None, context.message_id)
-    storage.record_decision(context, decision, _PENDING_VISION_WAIT_REPLY)
-    storage.record_bot_reply(context.group_id, str(bot.self_id), _PENDING_VISION_WAIT_REPLY)
+    send_result = await _send_group_reply(
+        _PENDING_VISION_WAIT_REPLY,
+        None,
+        context.message_id,
+        allow_bubbles=False,
+    )
+    decision_reply = _reply_record_text(send_result.parts, send_result.sticker)
+    storage.record_decision(context, decision, decision_reply)
+    storage.record_bot_reply_parts(context.group_id, str(bot.self_id), send_result.parts)
     await group_message.finish()
 
 
@@ -1666,6 +1690,36 @@ async def _send_group_reply(
     reply: str,
     sticker: StickerAssetRecord | None,
     reply_to_message_id: str | None,
+    *,
+    context: MessageContext | None = None,
+    decision: ParticipationDecision | None = None,
+    allow_bubbles: bool = True,
+) -> _ReplySendResult:
+    parts = _prepare_reply_parts(reply, sticker, context, decision, allow_bubbles)
+    if not parts and sticker is None:
+        return _ReplySendResult(())
+
+    delay_seconds = config.bot.reply_bubble_delay_seconds if allow_bubbles else 0
+    if len(parts) > 1:
+        for index, part in enumerate(parts[:-1]):
+            first_reply_to = reply_to_message_id if index == 0 else None
+            await _send_single_reply(part, None, first_reply_to)
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+        last_reply_to = None
+        last_part = parts[-1]
+    else:
+        last_reply_to = reply_to_message_id
+        last_part = parts[0] if parts else ""
+
+    sent_sticker = await _send_single_reply(last_part, sticker, last_reply_to)
+    return _ReplySendResult(parts, sent_sticker)
+
+
+async def _send_single_reply(
+    reply: str,
+    sticker: StickerAssetRecord | None,
+    reply_to_message_id: str | None,
 ) -> StickerAssetRecord | None:
     first_error: ActionFailed | None = None
     for message, attempted_sticker, used_reply in _reply_send_attempts(
@@ -1692,6 +1746,37 @@ async def _send_group_reply(
     return None
 
 
+def _prepare_reply_parts(
+    reply: str,
+    sticker: StickerAssetRecord | None,
+    context: MessageContext | None,
+    decision: ParticipationDecision | None,
+    allow_bubbles: bool,
+) -> tuple[str, ...]:
+    text = str(reply or "").strip()
+    if not text:
+        return ()
+    if not allow_bubbles:
+        return (text,)
+
+    settings = settings_from_bot_config(config.bot)
+    if context is not None and decision is not None:
+        recent_replies = storage.get_recent_bot_reply_texts(
+            context.group_id,
+            config.bot.reply_emoji_cooldown_messages,
+        )
+        text = style_reply_text(
+            text,
+            settings,
+            action=decision.action,
+            value_type=decision.value_type,
+            trigger_text=context.plain_text,
+            has_sticker=sticker is not None,
+            recent_bot_replies=recent_replies,
+        )
+    return split_reply_bubbles(text, settings)
+
+
 def _reply_send_attempts(
     reply: str,
     sticker: StickerAssetRecord | None,
@@ -1713,6 +1798,8 @@ def _reply_send_attempts(
     attempts: list[tuple[Message | str, StickerAssetRecord | None, bool]] = []
     seen: set[tuple[bool, int | None]] = set()
     for attempt_reply_to, attempt_sticker in requested:
+        if not reply and attempt_sticker is None:
+            continue
         key = (bool(attempt_reply_to), attempt_sticker.id if attempt_sticker is not None else None)
         if key in seen:
             continue
@@ -1802,8 +1889,11 @@ def _same_local_path(left: str, right: str) -> bool:
         return str(left).strip() == str(right).strip()
 
 
-def _reply_record_text(reply: str | None, sticker: StickerAssetRecord | None) -> str:
-    text = reply or ""
+def _reply_record_text(reply: str | Iterable[str] | None, sticker: StickerAssetRecord | None) -> str:
+    if isinstance(reply, str) or reply is None:
+        text = reply or ""
+    else:
+        text = "\n".join(part for part in reply if str(part or "").strip())
     if sticker is None:
         return text
     label = sticker.usage or sticker.description or sticker.local_path or sticker.url

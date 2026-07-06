@@ -580,19 +580,40 @@ class BotStorage:
         )
 
     def record_bot_reply(self, group_id: str, bot_id: str, reply: str) -> None:
+        self.record_bot_reply_parts(group_id, bot_id, [reply])
+
+    def record_bot_reply_parts(self, group_id: str, bot_id: str, replies: Iterable[str]) -> None:
         now = int(time.time())
-        self.record_message(
-            MessageContext(
-                group_id=str(group_id),
-                user_id=str(bot_id),
-                message_id=f"bot-{now}",
-                plain_text=reply,
-                raw_message=reply,
-                sender_name="bot",
-                sender_role="bot",
-                timestamp=now,
+        clean_replies = [str(reply or "").strip() for reply in replies if str(reply or "").strip()]
+        for index, reply in enumerate(clean_replies, start=1):
+            self.record_message(
+                MessageContext(
+                    group_id=str(group_id),
+                    user_id=str(bot_id),
+                    message_id=f"bot-{now}-{index}",
+                    plain_text=reply,
+                    raw_message=reply,
+                    sender_name="bot",
+                    sender_role="bot",
+                    timestamp=now,
+                )
             )
-        )
+
+    def get_recent_bot_reply_texts(self, group_id: str, limit: int = 10) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT plain_text
+                FROM messages
+                WHERE group_id = ?
+                  AND sender_role = 'bot'
+                  AND plain_text != ''
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (str(group_id), max(1, int(limit))),
+            ).fetchall()
+        return [str(row["plain_text"] or "") for row in rows if str(row["plain_text"] or "").strip()]
 
     def _record_attachments(self, conn: sqlite3.Connection, context: MessageContext) -> None:
         if not context.attachments:

@@ -1184,7 +1184,7 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertEqual(draft.text, "牛宝宝是 QQ:1657222326。")
+        self.assertEqual(draft.text, "牛宝宝是 QQ:1657222326")
         self.assertIn("被询问/提及成员资料", llm.text_calls[0][1])
         self.assertIn("不要主动转移话题", llm.text_calls[0][1])
 
@@ -1560,7 +1560,7 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
             ConversationSnapshot(self_memories=[existing]),
         )
 
-        self.assertEqual(result.reply, "可以先把蓝图职责拆开，别让一个 Actor 管太多事。")
+        self.assertEqual(result.reply, "可以先把蓝图职责拆开，别让一个 Actor 管太多事")
         self.assertEqual(result.reply_self_memories, [])
 
     async def test_direct_technical_reply_degrades_when_background_candidate_is_rejected(self) -> None:
@@ -2136,7 +2136,7 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
 
         draft = await agent.generate(context, perception, decision, ConversationSnapshot())
 
-        self.assertEqual(draft.text, "可以拆成两点：想要角色就抽，追性价比就等复刻。")
+        self.assertEqual(draft.text, "可以拆成两点：想要角色就抽，追性价比就等复刻")
 
     async def test_response_prompt_treats_max_chars_as_hard_cap(self) -> None:
         config = test_config(Path("unused.sqlite3"))
@@ -2156,13 +2156,15 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         draft = await agent.generate(context, perception, decision, ConversationSnapshot())
         system_prompt, user_prompt = llm.text_calls[0]
 
-        self.assertEqual(draft.text, "懂，先短短说一句就好。")
+        self.assertEqual(draft.text, "懂，先短短说一句就好")
         self.assertIn("一两句群聊短句", system_prompt)
         self.assertIn("小作文", system_prompt)
+        self.assertIn("不要固定写成两行", system_prompt)
         self.assertIn("共享内容默认信任", system_prompt)
         self.assertIn("实时事件克制", system_prompt)
         self.assertIn("max_reply_chars 只是硬上限，不是目标长度", user_prompt)
-        self.assertIn("通常不超过 40 个字", user_prompt)
+        self.assertIn("direct_reply 目标 6-25 字", user_prompt)
+        self.assertIn("proactive_reply 目标 8-30 字", user_prompt)
 
     async def test_final_qa_reviews_recent_chat_with_candidate_reply(self) -> None:
         config = test_config(Path("unused.sqlite3"))

@@ -37,6 +37,7 @@ from qq_llm_bot.onebot_messages import (
     strip_quoted_messages,
 )
 from qq_llm_bot.relationship_summary import clean_relationship_summary_patch
+from qq_llm_bot.reply_style import settings_from_bot_config, style_reply_text
 from qq_llm_bot.web_search import SearchResult, WebSearchClient, build_web_search_client, default_slang_query
 
 
@@ -1934,7 +1935,10 @@ class ResponseAgent:
             "你是一个自然参与 QQ 群聊天的拟人角色。"
             "回复要短、口语化、有一点自己的性格，但不要像客服或助手。"
             "平时优先用一两句群聊短句，像顺手接话，不要写成小作文。"
+            "不要固定写成两行，不要用空行排版；60 字以内尽量单行。"
+            "少用句号收尾，少用 emoji，避免每次都像同一个模板。"
             "只有在解释问题、整理方案、总结分歧或补充必要背景时，才适当说长一点。"
+            "只有对方明确问怎么做、为什么、方案、解释、步骤或实现方式时，才展开到 60 字以上。"
             "即使需要说长，也用短句分开表达，别堆长段落。"
             "主动插话时必须提供新信息、总结分歧、提出遗漏角度、补充有用背景或问能推进讨论的问题。"
             "主动插话时禁止只说赞同、共情、复述、热闹、哈哈或“确实”。"
@@ -1966,7 +1970,8 @@ class ResponseAgent:
             f"对方消息：{context.plain_text}\n"
             f"参与决策：{decision.action}，原因：{decision.reason}\n"
             f"主动价值：{decision.value_type}:{decision.value_score:.2f}，聊天密度：{decision.traffic_level}\n"
-            "默认长度：尽量 1-2 个短句，通常不超过 40 个字；能一句说清就一句。\n"
+            "默认长度：direct_reply 目标 6-25 字，proactive_reply 目标 8-30 字；能一句说清就一句。\n"
+            "不要为了自然感补废话；不要固定换行；不要用空行；短回复多数不需要句号。\n"
             "长度规则：max_reply_chars 只是硬上限，不是目标长度；不要为了接近上限而展开。\n"
             f"请直接给出要发送到群里的中文回复，最多 {self.config.bot.max_reply_chars} 个字。"
         )
@@ -1985,6 +1990,7 @@ class ResponseAgent:
                 fallback_reply = _target_fact_fallback_reply(context, snapshot)
                 if fallback_reply:
                     guarded_reply = fallback_reply
+            guarded_reply = self._style_reply(guarded_reply, context, decision)
             return ReplyDraft(
                 text=guarded_reply,
                 self_memory_candidates=approved_self_memories,
@@ -1993,14 +1999,32 @@ class ResponseAgent:
         if decision.action == "reply":
             fallback_reply = _target_fact_fallback_reply(context, snapshot)
             if fallback_reply:
-                return ReplyDraft(text=fallback_reply)
+                return ReplyDraft(text=self._style_reply(fallback_reply, context, decision))
             if approved_self_memories:
                 return ReplyDraft(
-                    text=_fallback_reply_with_self_memory(approved_self_memories[0]),
+                    text=self._style_reply(
+                        _fallback_reply_with_self_memory(approved_self_memories[0]),
+                        context,
+                        decision,
+                    ),
                     self_memory_candidates=approved_self_memories,
                 )
-            return ReplyDraft(text="我在，刚才这句我先记下了。")
+            return ReplyDraft(text=self._style_reply("我在，刚才这句我先记下了。", context, decision))
         return ReplyDraft()
+
+    def _style_reply(
+        self,
+        reply: str,
+        context: MessageContext,
+        decision: ParticipationDecision,
+    ) -> str:
+        return style_reply_text(
+            reply,
+            settings_from_bot_config(self.config.bot),
+            action=decision.action,
+            value_type=decision.value_type,
+            trigger_text=context.plain_text,
+        )
 
     async def _guard_unapproved_self_claims(
         self,
