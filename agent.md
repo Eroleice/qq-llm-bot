@@ -6,7 +6,7 @@
 
 - 这是 Python 3.10+ 项目，依赖和测试工具在 `pyproject.toml` 里。
 - 默认在仓库根目录 `E:\vibe\qq-llm-bot` 运行命令。
-- 优先使用本地虚拟环境：
+- 跑测试、ruff 和项目 Python 命令必须使用项目内虚拟环境 `.\.venv\Scripts\python.exe`，不要直接用系统 `python`：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
@@ -19,7 +19,13 @@
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-- 如果 `.venv` 不存在，再退回 `python -m pytest` / `python -m ruff check .`。
+- 如果 `.venv` 不存在，不要直接用系统 Python 跑测试；先创建项目内虚拟环境并安装依赖：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
 - PowerShell 里 extras 必须加引号：`".[dev]"` 或 `".[dev]"` 等价形式。
 
 ## 沙箱/权限注意
