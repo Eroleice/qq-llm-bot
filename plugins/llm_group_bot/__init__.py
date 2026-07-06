@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import re
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import count
 from pathlib import Path
 from typing import Any, Iterable
 
 from loguru import logger
 from nonebot import get_driver, on_command, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
-from nonebot.adapters.onebot.v11.exception import ActionFailed, NetworkError
+from nonebot.adapters.onebot.v11.exception import ActionFailed, ApiNotAvailable, NetworkError
+from nonebot.exception import WebSocketClosed
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
+from websockets.exceptions import ConnectionClosed
 
 from qq_llm_bot.cognitive_agents import AgentPipeline
 from qq_llm_bot.cognitive_storage import BotStorage
@@ -84,6 +88,32 @@ class _PendingVision:
 class _ReplySendResult:
     parts: tuple[str, ...]
     sticker: StickerAssetRecord | None = None
+    queued: bool = False
+
+
+@dataclass(frozen=True)
+class _SingleReplySendResult:
+    sticker: StickerAssetRecord | None = None
+    queued: bool = False
+
+
+@dataclass(frozen=True)
+class _QueuedSendAttempt:
+    message: Message | str
+    sticker: StickerAssetRecord | None = None
+
+
+@dataclass
+class _QueuedOutboundMessage:
+    id: int
+    bot_self_id: str
+    group_id: str
+    send_attempts: tuple[_QueuedSendAttempt, ...]
+    created_at: float
+    next_attempt_at: float
+    attempts: int = 0
+    source: str = ""
+    reason: str = ""
 
 
 pending_vision_tasks: dict[tuple[str, str], _PendingVision] = {}
@@ -91,6 +121,12 @@ _PENDING_VISION_WAIT_SECONDS = 8.0
 _PENDING_VISION_MAX_MESSAGES = 3
 _PENDING_VISION_MAX_AGE_SECONDS = 120.0
 _PENDING_VISION_WAIT_REPLY = "我还在看图，等图片内容出来再说，先不硬猜。"
+_OUTBOUND_RETRY_WORKER_INTERVAL_SECONDS = 3.0
+_outbound_queue_ids = count(1)
+_outbound_queue: list[_QueuedOutboundMessage] = []
+_outbound_queue_lock = asyncio.Lock()
+_outbound_flush_lock = asyncio.Lock()
+_outbound_retry_worker: asyncio.Task[None] | None = None
 
 if config.dashboard.enabled:
     register_dashboard_routes(
@@ -105,6 +141,25 @@ if config.dashboard.enabled:
 async def _startup() -> None:
     storage.setup()
     _maybe_cleanup_unused_stickers()
+    _start_outbound_retry_worker()
+
+
+@driver.on_shutdown
+async def _shutdown() -> None:
+    await _stop_outbound_retry_worker()
+
+
+@driver.on_bot_connect
+async def _on_bot_connect(bot: Bot) -> None:
+    await asyncio.sleep(0.2)
+    await _flush_outbound_queue(bot, "bot connected")
+
+
+@driver.on_bot_disconnect
+async def _on_bot_disconnect(bot: Bot) -> None:
+    queued = await _outbound_queue_size(bot.self_id)
+    if queued:
+        logger.warning("Bot {} disconnected with {} outbound messages waiting", bot.self_id, queued)
 
 
 admin_cmd = on_command("bot", priority=5, block=True)
@@ -407,7 +462,7 @@ async def _handle_draw_command(
         )
         await _finish_command(draw_cmd, _draw_failure_reply("图片保存失败", is_admin))
 
-    if not await _send_generated_image(context, saved):
+    if not await _send_generated_image(bot, context, saved):
         detail = saved.local_path or saved.url or saved.file_ref
         await _finish_command(
             draw_cmd,
@@ -424,33 +479,57 @@ async def _handle_draw_command(
     await draw_cmd.finish()
 
 
-async def _send_generated_image(context: MessageContext, saved: Any) -> bool:
+async def _send_generated_image(bot: Bot, context: MessageContext, saved: Any) -> bool:
     send_refs = [("file", saved.file_ref)]
     base64_ref = _generated_image_base64_ref(saved.local_path)
     if base64_ref:
         send_refs.append(("base64", base64_ref))
 
-    for ref_kind, file_ref in send_refs:
-        for include_reply in (True, False):
-            message = _generated_image_message(context.message_id if include_reply else "", file_ref)
-            try:
-                await draw_cmd.send(message)
-                if ref_kind != "file" or not include_reply:
-                    logger.info(
-                        "Generated image send succeeded via {} fallback reply={} for {}",
-                        ref_kind,
-                        include_reply,
-                        saved.local_path or saved.url or saved.file_ref,
-                    )
-                return True
-            except (ActionFailed, NetworkError) as exc:
-                logger.warning(
-                    "Generated image send failed via {} reply={} for {}: {}",
+    prepared_attempts = [
+        (ref_kind, include_reply, _generated_image_message(context.message_id if include_reply else "", file_ref))
+        for ref_kind, file_ref in send_refs
+        for include_reply in (True, False)
+    ]
+    for index, (ref_kind, include_reply, message) in enumerate(prepared_attempts):
+        try:
+            await draw_cmd.send(message)
+            if ref_kind != "file" or not include_reply:
+                logger.info(
+                    "Generated image send succeeded via {} fallback reply={} for {}",
                     ref_kind,
                     include_reply,
                     saved.local_path or saved.url or saved.file_ref,
+                )
+            return True
+        except ActionFailed as exc:
+            logger.warning(
+                "Generated image send failed via {} reply={} for {}: {}",
+                ref_kind,
+                include_reply,
+                saved.local_path or saved.url or saved.file_ref,
+                exc,
+            )
+        except Exception as exc:
+            if not _should_queue_send_error(exc):
+                raise
+            queued = await _queue_outbound_group_attempts(
+                bot,
+                context.group_id,
+                tuple(
+                    _QueuedSendAttempt(attempt_message)
+                    for _, _, attempt_message in prepared_attempts[index:]
+                ),
+                source="draw image",
+                reason=_send_error_detail(exc),
+            )
+            if queued:
+                logger.warning(
+                    "Generated image send queued after transient failure for {}: {}",
+                    saved.local_path or saved.url or saved.file_ref,
                     exc,
                 )
+                return True
+            return False
     return False
 
 
@@ -557,6 +636,7 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         final_reply,
         selected_sticker,
         context.message_id,
+        bot=bot,
         context=context,
         decision=result.decision,
         allow_bubbles=not bool(conflict_reply),
@@ -568,7 +648,7 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         str(bot.self_id),
         send_result.parts or ((decision_reply,) if decision_reply else ()),
     )
-    if send_result.sticker:
+    if send_result.sticker and not send_result.queued:
         storage.record_sticker_sent(send_result.sticker.id, usage_date=_draw_usage_date())
         _maybe_cleanup_unused_stickers()
     await group_message.finish()
@@ -677,6 +757,8 @@ async def _handle_pending_vision_timeout(
         _PENDING_VISION_WAIT_REPLY,
         None,
         context.message_id,
+        bot=bot,
+        context=context,
         allow_bubbles=False,
     )
     decision_reply = _reply_record_text(send_result.parts, send_result.sticker)
@@ -1691,6 +1773,7 @@ async def _send_group_reply(
     sticker: StickerAssetRecord | None,
     reply_to_message_id: str | None,
     *,
+    bot: Bot | None = None,
     context: MessageContext | None = None,
     decision: ParticipationDecision | None = None,
     allow_bubbles: bool = True,
@@ -1700,10 +1783,21 @@ async def _send_group_reply(
         return _ReplySendResult(())
 
     delay_seconds = config.bot.reply_bubble_delay_seconds if allow_bubbles else 0
+    queued = False
+    sent_sticker: StickerAssetRecord | None = None
     if len(parts) > 1:
         for index, part in enumerate(parts[:-1]):
             first_reply_to = reply_to_message_id if index == 0 else None
-            await _send_single_reply(part, None, first_reply_to)
+            result = await _send_single_reply(part, None, first_reply_to, bot=bot, context=context)
+            queued = queued or result.queued
+            if result.queued:
+                queued_sticker = await _queue_remaining_reply_parts(
+                    parts[index + 1 :],
+                    sticker,
+                    bot=bot,
+                    context=context,
+                )
+                return _ReplySendResult(parts, result.sticker or queued_sticker, queued=True)
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
         last_reply_to = None
@@ -1712,21 +1806,27 @@ async def _send_group_reply(
         last_reply_to = reply_to_message_id
         last_part = parts[0] if parts else ""
 
-    sent_sticker = await _send_single_reply(last_part, sticker, last_reply_to)
-    return _ReplySendResult(parts, sent_sticker)
+    result = await _send_single_reply(last_part, sticker, last_reply_to, bot=bot, context=context)
+    sent_sticker = result.sticker
+    queued = queued or result.queued
+    return _ReplySendResult(parts, sent_sticker, queued)
 
 
 async def _send_single_reply(
     reply: str,
     sticker: StickerAssetRecord | None,
     reply_to_message_id: str | None,
-) -> StickerAssetRecord | None:
+    *,
+    bot: Bot | None,
+    context: MessageContext | None,
+) -> _SingleReplySendResult:
     first_error: ActionFailed | None = None
-    for message, attempted_sticker, used_reply in _reply_send_attempts(
+    attempts = _reply_send_attempts(
         reply,
         sticker,
         reply_to_message_id,
-    ):
+    )
+    for index, (message, attempted_sticker, used_reply) in enumerate(attempts):
         sticker_included = _message_contains_image(message)
         try:
             await group_message.send(message)
@@ -1740,10 +1840,77 @@ async def _send_single_reply(
                 reply_to_message_id,
             )
             continue
-        return attempted_sticker if sticker_included else None
+        except Exception as exc:
+            if not _should_queue_send_error(exc):
+                raise
+            queued_sticker = attempted_sticker if sticker_included else None
+            queued = await _queue_reply_attempts(
+                attempts[index:],
+                bot=bot,
+                context=context,
+                source="group reply",
+                reason=_send_error_detail(exc),
+            )
+            if queued:
+                logger.warning(
+                    "Group reply send queued for group {} message {} after transient failure: {}",
+                    context.group_id if context else "",
+                    context.message_id if context else "",
+                    exc,
+                )
+                return _SingleReplySendResult(queued_sticker, queued=True)
+            raise
+        return _SingleReplySendResult(attempted_sticker if sticker_included else None)
     if first_error is not None:
         raise first_error
-    return None
+    return _SingleReplySendResult()
+
+
+async def _queue_remaining_reply_parts(
+    remaining_parts: tuple[str, ...],
+    sticker: StickerAssetRecord | None,
+    *,
+    bot: Bot | None,
+    context: MessageContext | None,
+) -> StickerAssetRecord | None:
+    if not remaining_parts:
+        return None
+    queued_sticker: StickerAssetRecord | None = None
+    for index, part in enumerate(remaining_parts):
+        part_sticker = sticker if index == len(remaining_parts) - 1 else None
+        queued = await _queue_reply_attempts(
+            _reply_send_attempts(part, part_sticker, None),
+            bot=bot,
+            context=context,
+            source="group reply bubble",
+            reason="previous bubble queued",
+        )
+        if queued and part_sticker is not None:
+            queued_sticker = part_sticker
+    return queued_sticker
+
+
+async def _queue_reply_attempts(
+    attempts: list[tuple[Message | str, StickerAssetRecord | None, bool]],
+    *,
+    bot: Bot | None,
+    context: MessageContext | None,
+    source: str,
+    reason: str,
+) -> bool:
+    if bot is None or context is None:
+        return False
+    queued_attempts = tuple(
+        _QueuedSendAttempt(message, attempted_sticker if _message_contains_image(message) else None)
+        for message, attempted_sticker, _ in attempts
+    )
+    return await _queue_outbound_group_attempts(
+        bot,
+        context.group_id,
+        queued_attempts,
+        source=source,
+        reason=reason,
+    )
 
 
 def _prepare_reply_parts(
@@ -1876,6 +2043,248 @@ def _message_contains_image(message: Message | str) -> bool:
 
 def _message_has_reply(message: Message) -> bool:
     return any(segment.type == "reply" for segment in message)
+
+
+def _start_outbound_retry_worker() -> None:
+    global _outbound_retry_worker
+    if not config.bot.send_retry_enabled:
+        return
+    if _outbound_retry_worker is not None and not _outbound_retry_worker.done():
+        return
+    _outbound_retry_worker = asyncio.create_task(_outbound_retry_loop())
+
+
+async def _stop_outbound_retry_worker() -> None:
+    global _outbound_retry_worker
+    task = _outbound_retry_worker
+    _outbound_retry_worker = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _outbound_retry_loop() -> None:
+    while True:
+        await asyncio.sleep(_OUTBOUND_RETRY_WORKER_INTERVAL_SECONDS)
+        for bot in list(driver.bots.values()):
+            if isinstance(bot, Bot):
+                await _flush_outbound_queue(bot, "retry worker")
+
+
+async def _outbound_queue_size(bot_self_id: str | None = None) -> int:
+    async with _outbound_queue_lock:
+        if bot_self_id is None:
+            return len(_outbound_queue)
+        return sum(1 for item in _outbound_queue if item.bot_self_id == str(bot_self_id))
+
+
+async def _queue_outbound_group_attempts(
+    bot: Bot,
+    group_id: str,
+    send_attempts: tuple[_QueuedSendAttempt, ...],
+    *,
+    source: str,
+    reason: str,
+) -> bool:
+    if not config.bot.send_retry_enabled or not send_attempts:
+        return False
+    now = time.time()
+    async with _outbound_queue_lock:
+        _drop_expired_outbound_messages_locked(now)
+        while len(_outbound_queue) >= config.bot.send_retry_queue_limit:
+            dropped = _outbound_queue.pop(0)
+            logger.warning(
+                "Dropping queued outbound message #{} for bot {} group {}: queue limit reached",
+                dropped.id,
+                dropped.bot_self_id,
+                dropped.group_id,
+            )
+        queued = _QueuedOutboundMessage(
+            id=next(_outbound_queue_ids),
+            bot_self_id=str(bot.self_id),
+            group_id=str(group_id),
+            send_attempts=send_attempts,
+            created_at=now,
+            next_attempt_at=now,
+            source=source,
+            reason=reason,
+        )
+        _outbound_queue.append(queued)
+        logger.warning(
+            "Queued outbound message #{} for bot {} group {} from {} after {} (queue_size={})",
+            queued.id,
+            queued.bot_self_id,
+            queued.group_id,
+            source,
+            reason,
+            len(_outbound_queue),
+        )
+    return True
+
+
+async def _flush_outbound_queue(bot: Bot, reason: str) -> None:
+    if not config.bot.send_retry_enabled:
+        return
+    async with _outbound_flush_lock:
+        while True:
+            queued = await _pop_next_due_outbound_message(bot.self_id)
+            if queued is None:
+                return
+            try:
+                status, sticker, error = await _try_send_queued_group_message(bot, queued)
+            except Exception as exc:
+                logger.warning(
+                    "Dropping queued outbound message #{} after unexpected send error: {}",
+                    queued.id,
+                    exc,
+                )
+                continue
+            if status == "sent":
+                logger.info(
+                    "Flushed queued outbound message #{} for bot {} group {} via {}",
+                    queued.id,
+                    queued.bot_self_id,
+                    queued.group_id,
+                    reason,
+                )
+                if sticker is not None:
+                    storage.record_sticker_sent(sticker.id, usage_date=_draw_usage_date())
+                    _maybe_cleanup_unused_stickers()
+                continue
+            if status == "retry":
+                await _requeue_outbound_message(queued, error)
+                return
+
+
+async def _pop_next_due_outbound_message(bot_self_id: str) -> _QueuedOutboundMessage | None:
+    now = time.time()
+    async with _outbound_queue_lock:
+        _drop_expired_outbound_messages_locked(now)
+        for index, queued in enumerate(_outbound_queue):
+            if queued.bot_self_id == str(bot_self_id) and queued.next_attempt_at <= now:
+                return _outbound_queue.pop(index)
+    return None
+
+
+async def _try_send_queued_group_message(
+    bot: Bot,
+    queued: _QueuedOutboundMessage,
+) -> tuple[str, StickerAssetRecord | None, BaseException | None]:
+    group_id = _onebot_group_id(queued.group_id)
+    if group_id is None:
+        logger.warning(
+            "Dropping queued outbound message #{}: invalid group id {}",
+            queued.id,
+            queued.group_id,
+        )
+        return ("drop", None, None)
+
+    first_action_error: ActionFailed | None = None
+    for attempt in queued.send_attempts:
+        try:
+            await bot.send_group_msg(group_id=group_id, message=attempt.message)
+        except ActionFailed as exc:
+            if first_action_error is None:
+                first_action_error = exc
+            logger.warning(
+                "Queued outbound message #{} action attempt failed for group {}: {}",
+                queued.id,
+                queued.group_id,
+                exc,
+            )
+            continue
+        except Exception as exc:
+            if _should_queue_send_error(exc):
+                return ("retry", None, exc)
+            raise
+        return ("sent", attempt.sticker, None)
+
+    logger.warning(
+        "Dropping queued outbound message #{} after all action attempts failed: {}",
+        queued.id,
+        first_action_error,
+    )
+    return ("drop", None, first_action_error)
+
+
+async def _requeue_outbound_message(
+    queued: _QueuedOutboundMessage,
+    error: BaseException | None,
+) -> None:
+    now = time.time()
+    queued.attempts += 1
+    queued.reason = _send_error_detail(error) if error is not None else queued.reason
+    if (
+        queued.attempts >= config.bot.send_retry_max_attempts
+        or now - queued.created_at > config.bot.send_retry_max_age_seconds
+    ):
+        logger.warning(
+            "Dropping queued outbound message #{} for bot {} group {} after {} attempts: {}",
+            queued.id,
+            queued.bot_self_id,
+            queued.group_id,
+            queued.attempts,
+            queued.reason,
+        )
+        return
+    queued.next_attempt_at = now + _outbound_retry_delay(queued.attempts)
+    async with _outbound_queue_lock:
+        _outbound_queue.append(queued)
+    logger.warning(
+        "Queued outbound message #{} retry {}/{} in {:.1f}s: {}",
+        queued.id,
+        queued.attempts,
+        config.bot.send_retry_max_attempts,
+        queued.next_attempt_at - now,
+        queued.reason,
+    )
+
+
+def _drop_expired_outbound_messages_locked(now: float) -> None:
+    kept: list[_QueuedOutboundMessage] = []
+    for queued in _outbound_queue:
+        expired = now - queued.created_at > config.bot.send_retry_max_age_seconds
+        exhausted = queued.attempts >= config.bot.send_retry_max_attempts
+        if expired or exhausted:
+            logger.warning(
+                "Dropping queued outbound message #{} for bot {} group {}: {}",
+                queued.id,
+                queued.bot_self_id,
+                queued.group_id,
+                "expired" if expired else "attempts exhausted",
+            )
+            continue
+        kept.append(queued)
+    _outbound_queue[:] = kept
+
+
+def _outbound_retry_delay(attempts: int) -> float:
+    base = config.bot.send_retry_base_delay_seconds
+    maximum = config.bot.send_retry_max_delay_seconds
+    return min(maximum, base * (2 ** max(0, attempts - 1)))
+
+
+def _onebot_group_id(group_id: str) -> int | None:
+    try:
+        return int(str(group_id).strip())
+    except ValueError:
+        return None
+
+
+def _should_queue_send_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ApiNotAvailable, WebSocketClosed, ConnectionClosed)):
+        return True
+    if isinstance(exc, NetworkError):
+        detail = _send_error_detail(exc).lower()
+        return "timeout" not in detail
+    return isinstance(exc, (ConnectionError, OSError))
+
+
+def _send_error_detail(exc: BaseException) -> str:
+    message = getattr(exc, "msg", None) or str(exc) or repr(exc)
+    return f"{type(exc).__name__}: {message}"
 
 
 def _sticker_file_ref(sticker: StickerAssetRecord) -> str:

@@ -42,6 +42,12 @@ class BotConfig:
     reply_bubble_max_parts: int = 3
     reply_bubble_delay_seconds: float = 0.9
     reply_emoji_cooldown_messages: int = 10
+    send_retry_enabled: bool = True
+    send_retry_max_attempts: int = 6
+    send_retry_max_age_seconds: int = 180
+    send_retry_queue_limit: int = 100
+    send_retry_base_delay_seconds: float = 2.0
+    send_retry_max_delay_seconds: float = 30.0
     final_qa_enabled: bool = True
 
 
@@ -309,6 +315,37 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             "bot.reply_emoji_cooldown_messages",
             0,
             1000,
+        ),
+        send_retry_enabled=_bool_value(bot_raw.get("send_retry_enabled", True)),
+        send_retry_max_attempts=_int_in_range(
+            bot_raw.get("send_retry_max_attempts", 6),
+            "bot.send_retry_max_attempts",
+            1,
+            20,
+        ),
+        send_retry_max_age_seconds=_int_in_range(
+            bot_raw.get("send_retry_max_age_seconds", 180),
+            "bot.send_retry_max_age_seconds",
+            1,
+            3600,
+        ),
+        send_retry_queue_limit=_int_in_range(
+            bot_raw.get("send_retry_queue_limit", 100),
+            "bot.send_retry_queue_limit",
+            1,
+            1000,
+        ),
+        send_retry_base_delay_seconds=_float_in_range(
+            bot_raw.get("send_retry_base_delay_seconds", 2.0),
+            "bot.send_retry_base_delay_seconds",
+            0.1,
+            60,
+        ),
+        send_retry_max_delay_seconds=_float_in_range(
+            bot_raw.get("send_retry_max_delay_seconds", 30.0),
+            "bot.send_retry_max_delay_seconds",
+            0.1,
+            300,
         ),
         final_qa_enabled=_bool_value(bot_raw.get("final_qa_enabled", True)),
     )

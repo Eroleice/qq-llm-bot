@@ -22,6 +22,12 @@ reply_bubble_target_chars = 28
 reply_bubble_max_parts = 3
 reply_bubble_delay_seconds = 0.9
 reply_emoji_cooldown_messages = 10
+send_retry_enabled = true
+send_retry_max_attempts = 6
+send_retry_max_age_seconds = 180
+send_retry_queue_limit = 100
+send_retry_base_delay_seconds = 2.0
+send_retry_max_delay_seconds = 30.0
 final_qa_enabled = true
 
 [persona]
