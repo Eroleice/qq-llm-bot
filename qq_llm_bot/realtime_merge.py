@@ -19,6 +19,7 @@ def merge_realtime_contexts(contexts: Iterable[MessageContext]) -> MessageContex
         plain_text=_merged_plain_text(items),
         raw_message=_merged_raw_message(items),
         is_direct=any(context.is_direct for context in items),
+        bot_mentioned=any(context.bot_mentioned for context in items),
         timestamp=latest.timestamp,
         attachments=[
             attachment

@@ -9,6 +9,7 @@ from typing import Any, Iterable, Protocol
 from loguru import logger
 
 from qq_llm_bot.config import AppConfig, ParticipationMode, VisionConfig
+from qq_llm_bot.directness import text_mentions_bot_name
 from qq_llm_bot.llm import LLMClient
 from qq_llm_bot.models import (
     ConversationSnapshot,
@@ -327,7 +328,7 @@ class PerceptionAgent:
         return PerceptionResult(
             is_question=_as_bool(data.get("is_question"), fallback.is_question),
             is_self_disclosure=_as_bool(data.get("is_self_disclosure"), fallback.is_self_disclosure),
-            mentions_bot=context.is_direct,
+            mentions_bot=_context_mentions_bot(context),
             topics=_clean_list(data.get("topics"))[:5] or fallback.topics,
             emotion_hint=_safe_choice(
                 str(data.get("emotion_hint", fallback.emotion_hint)),
@@ -342,7 +343,7 @@ class PerceptionAgent:
         return PerceptionResult(
             is_question=any(mark in text for mark in ("?", "？", "吗", "怎么", "为什么", "咋")),
             is_self_disclosure=bool(re.search(r"(我叫|我是|我喜欢|我讨厌|我在|我住|我最近)", text)),
-            mentions_bot=context.is_direct,
+            mentions_bot=_context_mentions_bot(context),
             topics=_extract_topics(text),
             emotion_hint=_emotion_hint(text),
             confidence=0.55,
@@ -1376,6 +1377,15 @@ class ParticipationPolicyAgent:
                 self._traffic_level(snapshot),
             )
 
+        addressing_decision = await self._bot_name_addressing_decision(
+            context,
+            perception,
+            mode,
+            snapshot,
+        )
+        if addressing_decision is not None:
+            return addressing_decision
+
         followup_decision = await self._recent_interaction_followup_decision(
             context,
             perception,
@@ -1493,6 +1503,82 @@ class ParticipationPolicyAgent:
         if self._traffic_level(snapshot) == "busy":
             return self.config.bot.proactive_busy_value_threshold
         return self.config.bot.proactive_value_threshold
+
+    async def _bot_name_addressing_decision(
+        self,
+        context: MessageContext,
+        perception: PerceptionResult,
+        mode: ParticipationMode,
+        snapshot: ConversationSnapshot,
+    ) -> ParticipationDecision | None:
+        if not _context_mentions_bot(context, self.config.bot.nicknames):
+            return None
+
+        traffic_level = self._traffic_level(snapshot)
+        default_value_type: ParticipationValueType = "answer" if perception.is_question else "direct_reply"
+        data = await _complete_json(
+            self.llm,
+            "你是 QQ 群机器人发言归属判断器。只输出 JSON，不要解释。",
+            (
+                "当前消息提到了机器人昵称，但不确定是不是在对机器人说话。"
+                "请判断发言人是否真的把机器人当作对话对象。"
+                "分类只能是 addressed_to_bot、discussing_bot、ambiguous、not_relevant。"
+                "addressed_to_bot：发言人在请求、询问、邀请、命令或直接回应机器人。"
+                "discussing_bot：机器人只是句子的宾语/话题，例如“可可的形象”、“让可可...”、"
+                "“给可可...”、“和/跟可可...”、“限制可可...”、“你也好可可这口...”。"
+                "ambiguous：上下文不够明确；不确定时选 ambiguous。"
+                "只有 addressed_to_bot 且置信度足够高时才应该回复；其他情况默认观察。"
+                "输出 JSON："
+                '{"target":"addressed_to_bot|discussing_bot|ambiguous|not_relevant",'
+                '"confidence":0.0,'
+                '"value_type":"answer|direct_reply|clarifying_question|none",'
+                '"reason":"短原因"}\n'
+                f"机器人昵称：{', '.join(self.config.bot.nicknames)}\n"
+                f"最近消息：\n{_format_recent_context(snapshot)}\n"
+                f"感知：question={perception.is_question}, topics={perception.topics}, "
+                f"emotion={perception.emotion_hint}\n"
+                f"当前消息：{context.plain_text}"
+            ),
+            purpose="addressing_gate",
+        )
+        if not data:
+            return ParticipationDecision(
+                "observe",
+                "bot name mentioned but addressing is ambiguous",
+                mode,
+                0.0,
+                "none",
+                0.0,
+                traffic_level,
+            )
+
+        target = str(data.get("target", "ambiguous")).strip().lower()
+        confidence = _clamp_float(data.get("confidence", 0.0))
+        reason = str(data.get("reason", "")).strip()[:140] or target or "bot name addressing gate"
+        value_type = _safe_participation_value_type(str(data.get("value_type", default_value_type)))
+        if value_type == "none":
+            value_type = default_value_type
+
+        if target == "addressed_to_bot" and confidence >= 0.62:
+            return ParticipationDecision(
+                "reply",
+                f"bot name addressing gate: {reason}",
+                mode,
+                confidence,
+                value_type,
+                confidence,
+                traffic_level,
+            )
+
+        return ParticipationDecision(
+            "observe",
+            f"bot name mentioned but not addressed: {reason}",
+            mode,
+            confidence,
+            "none",
+            0.0,
+            traffic_level,
+        )
 
     async def _recent_interaction_followup_decision(
         self,
@@ -3083,6 +3169,14 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("JSON root is not an object")
     return data
+
+
+def _context_mentions_bot(context: MessageContext, nicknames: Iterable[str] = ()) -> bool:
+    return bool(
+        context.is_direct
+        or getattr(context, "bot_mentioned", False)
+        or (nicknames and text_mentions_bot_name(context.plain_text, nicknames))
+    )
 
 
 def _member_mentions(context: MessageContext) -> list[MessageMention]:

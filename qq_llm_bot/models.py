@@ -106,6 +106,7 @@ class MessageContext:
     sender_nickname: str = ""
     sender_role: str = ""
     is_direct: bool = False
+    bot_mentioned: bool = False
     timestamp: int = 0
     attachments: list[MessageAttachment] = field(default_factory=list)
     mentions: list[MessageMention] = field(default_factory=list)

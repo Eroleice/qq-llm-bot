@@ -107,6 +107,19 @@ def test_sticker_reply_gets_short_or_empty_text() -> None:
     assert len(short_text) <= 20
 
 
+def test_regular_reply_text_is_not_shortened_for_separate_sticker() -> None:
+    settings = ReplyStyleSettings()
+    text = (
+        "I can summarize the recent chat for you; "
+        "older context may need checking the logs first."
+    )
+
+    styled = style_reply_text(text, settings, action="reply", value_type="answer")
+
+    assert "older context" in styled
+    assert len(styled) > 20
+
+
 def test_split_does_not_break_mentions_urls_or_cq_segments() -> None:
     settings = ReplyStyleSettings(bubble_trigger_chars=12, bubble_target_chars=18, bubble_max_parts=3)
     text = "可以问 @QQ:123456789 这条 https://example.test/a/b?c=1 先别拆坏。[CQ:face,id=14]"
@@ -200,12 +213,16 @@ def test_plugin_source_keeps_bubble_send_contract() -> None:
     assert "allow_bubbles=not bool(conflict_reply)" in source
     assert "for index, part in enumerate(parts[:-1])" in source
     assert "last_reply_to = None" in source
+    assert "_send_single_reply(last_part, None, last_reply_to" in source
+    assert "_send_reply_sticker(sticker, bot=bot, context=context)" in source
+    assert "has_sticker=sticker is not None" not in source
     assert "storage.record_bot_reply_parts" in source
 
 
-def test_plugin_reply_message_only_adds_newline_before_image() -> None:
+def test_plugin_sends_sticker_as_separate_no_reply_message() -> None:
     source = (Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py").read_text(
         encoding="utf-8"
     )
 
-    assert 'if file_ref:\n            message += MessageSegment.text("\\n")' in source
+    assert 'await _send_single_reply("", sticker, None, bot=bot, context=context)' in source
+    assert '_reply_send_attempts("", sticker, None)' in source

@@ -925,6 +925,7 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
             plain_text="@coco can you explain",
             raw_message="@coco can you explain",
             is_direct=True,
+            bot_mentioned=True,
             timestamp=1,
             attachments=[
                 MessageAttachment(
@@ -954,6 +955,7 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(merged.message_id, "m2")
         self.assertTrue(merged.is_direct)
+        self.assertTrue(merged.bot_mentioned)
         self.assertIn("用户连续发了 2 条", merged.plain_text)
         self.assertIn("1. @coco can you explain", merged.plain_text)
         self.assertIn("2. and estimate token cost?", merged.plain_text)
@@ -2030,6 +2032,75 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.traffic_level, "busy")
         self.assertEqual(decision.value_type, "humor")
 
+    async def test_bot_name_object_mention_is_observed_by_addressing_gate(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM(
+            [
+                '{"target":"discussing_bot","confidence":0.9,"value_type":"none",'
+                '"reason":"机器人只是被当作讨论对象"}',
+                '{"action":"reply","confidence":0.9,"value_type":"answer","reason":"不应走到续聊"}',
+            ]
+        )
+        agent = ParticipationPolicyAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-bot-object",
+            plain_text="顺便一提可可的形象的确是固定的",
+            raw_message="顺便一提可可的形象的确是固定的",
+            bot_mentioned=True,
+        )
+        perception = PerceptionResult(
+            is_question=False,
+            is_self_disclosure=False,
+            mentions_bot=True,
+            topics=["机器人设定"],
+            confidence=0.82,
+        )
+        snapshot = ConversationSnapshot(
+            recent_messages=["bot: 我可以解释一下", "alice: 顺便一提可可的形象的确是固定的"],
+            recent_bot_reply_to_user="我可以解释一下",
+            recent_bot_reply_to_user_seconds=18,
+        )
+
+        decision = await agent.decide(context, perception, "passive", snapshot)
+
+        self.assertEqual(decision.action, "observe")
+        self.assertIn("not addressed", decision.reason)
+        self.assertEqual(llm.text_call_purposes, ["addressing_gate"])
+
+    async def test_bot_name_mention_can_reply_when_addressing_gate_accepts(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM(
+            [
+                '{"target":"addressed_to_bot","confidence":0.86,"value_type":"answer",'
+                '"reason":"用户在请机器人判断"}'
+            ]
+        )
+        agent = ParticipationPolicyAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-bot-addressed",
+            plain_text="这个可可看看有没有问题？",
+            raw_message="这个可可看看有没有问题？",
+            bot_mentioned=True,
+        )
+        perception = PerceptionResult(
+            is_question=True,
+            is_self_disclosure=False,
+            mentions_bot=True,
+            topics=["求助"],
+            confidence=0.82,
+        )
+
+        decision = await agent.decide(context, perception, "passive", ConversationSnapshot())
+
+        self.assertEqual(decision.action, "reply")
+        self.assertEqual(decision.value_type, "answer")
+        self.assertIn("addressing gate", decision.reason)
+        self.assertEqual(llm.text_call_purposes, ["addressing_gate"])
+
     async def test_passive_recent_interaction_followup_can_reply_without_name(self) -> None:
         config = test_config(Path("unused.sqlite3"))
         llm = FakeLLM(
@@ -2747,6 +2818,7 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertIn("_claim_pending_realtime_reply", source)
         self.assertIn("pending.committing = True", source)
         self.assertIn("merge_realtime_contexts(contexts)", source)
+        self.assertIn("if context.bot_mentioned:", source)
 
     def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:
         with _project_temp_directory() as tmp:

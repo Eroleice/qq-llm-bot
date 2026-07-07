@@ -26,6 +26,7 @@ from qq_llm_bot.cognitive_agents import AgentPipeline
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import ParticipationMode, load_config
 from qq_llm_bot.dashboard import register_dashboard_routes
+from qq_llm_bot.directness import looks_like_bot_address, text_mentions_bot_name
 from qq_llm_bot.draw_images import prepare_draw_reference_images
 from qq_llm_bot.draw_reference import DrawIntentPlanner
 from qq_llm_bot.image_generation import GeneratedImageStore
@@ -1067,6 +1068,8 @@ def _should_defer_realtime_pipeline(context: MessageContext, mode: Participation
         return False
     if context.is_direct:
         return False
+    if context.bot_mentioned:
+        return False
     if _has_recent_bot_reply_context(context):
         return False
     if mode == "silent":
@@ -2008,7 +2011,7 @@ async def _send_group_reply(
     decision: ParticipationDecision | None = None,
     allow_bubbles: bool = True,
 ) -> _ReplySendResult:
-    parts = _prepare_reply_parts(reply, sticker, context, decision, allow_bubbles)
+    parts = _prepare_reply_parts(reply, context, decision, allow_bubbles)
     if not parts and sticker is None:
         return _ReplySendResult(())
 
@@ -2036,9 +2039,21 @@ async def _send_group_reply(
         last_reply_to = reply_to_message_id
         last_part = parts[0] if parts else ""
 
-    result = await _send_single_reply(last_part, sticker, last_reply_to, bot=bot, context=context)
-    sent_sticker = result.sticker
+    result = await _send_single_reply(last_part, None, last_reply_to, bot=bot, context=context)
     queued = queued or result.queued
+    if result.queued:
+        queued_sticker = await _queue_reply_sticker(
+            sticker,
+            bot=bot,
+            context=context,
+            source="group reply sticker",
+            reason="previous reply text queued",
+        )
+        return _ReplySendResult(parts, queued_sticker, queued=True)
+
+    sticker_result = await _send_reply_sticker(sticker, bot=bot, context=context)
+    sent_sticker = sticker_result.sticker
+    queued = queued or sticker_result.queued
     return _ReplySendResult(parts, sent_sticker, queued)
 
 
@@ -2119,18 +2134,58 @@ async def _queue_remaining_reply_parts(
     if not remaining_parts:
         return None
     queued_sticker: StickerAssetRecord | None = None
-    for index, part in enumerate(remaining_parts):
-        part_sticker = sticker if index == len(remaining_parts) - 1 else None
-        queued = await _queue_reply_attempts(
-            _reply_send_attempts(part, part_sticker, None),
+    for part in remaining_parts:
+        await _queue_reply_attempts(
+            _reply_send_attempts(part, None, None),
             bot=bot,
             context=context,
             source="group reply bubble",
             reason="previous bubble queued",
         )
-        if queued and part_sticker is not None:
-            queued_sticker = part_sticker
+    if sticker is not None:
+        queued_sticker = await _queue_reply_sticker(
+            sticker,
+            bot=bot,
+            context=context,
+            source="group reply sticker",
+            reason="previous bubble queued",
+        )
     return queued_sticker
+
+
+async def _send_reply_sticker(
+    sticker: StickerAssetRecord | None,
+    *,
+    bot: Bot | None,
+    context: MessageContext | None,
+) -> _SingleReplySendResult:
+    if sticker is None:
+        return _SingleReplySendResult()
+    try:
+        return await _send_single_reply("", sticker, None, bot=bot, context=context)
+    except ActionFailed as exc:
+        _log_reply_send_failure(exc, sticker, False, None)
+        return _SingleReplySendResult()
+
+
+async def _queue_reply_sticker(
+    sticker: StickerAssetRecord | None,
+    *,
+    bot: Bot | None,
+    context: MessageContext | None,
+    source: str,
+    reason: str,
+) -> StickerAssetRecord | None:
+    if sticker is None:
+        return None
+    queued = await _queue_reply_attempts(
+        _reply_send_attempts("", sticker, None),
+        bot=bot,
+        context=context,
+        source=source,
+        reason=reason,
+    )
+    return sticker if queued else None
 
 
 async def _queue_reply_attempts(
@@ -2158,7 +2213,6 @@ async def _queue_reply_attempts(
 
 def _prepare_reply_parts(
     reply: str,
-    sticker: StickerAssetRecord | None,
     context: MessageContext | None,
     decision: ParticipationDecision | None,
     allow_bubbles: bool,
@@ -2181,7 +2235,6 @@ def _prepare_reply_parts(
             action=decision.action,
             value_type=decision.value_type,
             trigger_text=context.plain_text,
-            has_sticker=sticker is not None,
             recent_bot_replies=recent_replies,
         )
     return split_reply_bubbles(text, settings)
@@ -2601,6 +2654,7 @@ async def _build_context(bot: Bot, event: GroupMessageEvent) -> MessageContext:
         sender_nickname=sender_nickname,
         sender_role=sender_role,
         is_direct=_is_direct_message(bot, event, top_level_text),
+        bot_mentioned=_is_bot_mentioned(bot, event, top_level_text),
         timestamp=int(getattr(event, "time", 0) or time.time()),
         attachments=_extract_attachments(event),
         mentions=mentions,
@@ -2662,12 +2716,34 @@ def _event_reply_payload(event: GroupMessageEvent, message_id: str) -> dict[str,
 
 
 def _is_direct_message(bot: Bot, event: GroupMessageEvent, plain_text: str) -> bool:
-    if getattr(event, "to_me", False):
+    if _has_explicit_bot_at(bot, event):
         return True
+    if _is_reply_to_bot(bot, event):
+        return True
+    return looks_like_bot_address(plain_text, config.bot.nicknames)
+
+
+def _is_bot_mentioned(bot: Bot, event: GroupMessageEvent, plain_text: str) -> bool:
+    return (
+        _has_explicit_bot_at(bot, event)
+        or _is_reply_to_bot(bot, event)
+        or text_mentions_bot_name(plain_text, config.bot.nicknames)
+    )
+
+
+def _has_explicit_bot_at(bot: Bot, event: GroupMessageEvent) -> bool:
     for segment in event.message:
         if segment.type == "at" and str(segment.data.get("qq")) == str(bot.self_id):
             return True
-    return any(name and name in plain_text for name in config.bot.nicknames)
+    return False
+
+
+def _is_reply_to_bot(bot: Bot, event: GroupMessageEvent) -> bool:
+    reply = getattr(event, "reply", None)
+    if reply is None:
+        return False
+    sender = getattr(reply, "sender", None)
+    return str(_sender_field(sender, "user_id")) == str(bot.self_id)
 
 
 def _sender_field(sender: Any, field: str) -> str:
