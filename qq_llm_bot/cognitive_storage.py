@@ -398,6 +398,36 @@ class BotStorage:
                     reply TEXT NOT NULL DEFAULT ''
                 );
 
+                CREATE TABLE IF NOT EXISTS final_qa_blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    message_time INTEGER NOT NULL DEFAULT 0,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL DEFAULT '',
+                    sender_role TEXT NOT NULL DEFAULT '',
+                    trigger_text TEXT NOT NULL DEFAULT '',
+                    raw_message TEXT NOT NULL DEFAULT '',
+                    is_direct INTEGER NOT NULL DEFAULT 0,
+                    bot_mentioned INTEGER NOT NULL DEFAULT 0,
+                    mode TEXT NOT NULL DEFAULT '',
+                    action TEXT NOT NULL DEFAULT '',
+                    decision_reason TEXT NOT NULL DEFAULT '',
+                    score REAL NOT NULL DEFAULT 0,
+                    value_type TEXT NOT NULL DEFAULT '',
+                    value_score REAL NOT NULL DEFAULT 0,
+                    traffic_level TEXT NOT NULL DEFAULT 'normal',
+                    candidate_reply TEXT NOT NULL DEFAULT '',
+                    qa_reason TEXT NOT NULL DEFAULT '',
+                    qa_categories TEXT NOT NULL DEFAULT '[]',
+                    qa_confidence REAL NOT NULL DEFAULT 0,
+                    recent_messages TEXT NOT NULL DEFAULT '[]',
+                    speaker_recent_messages TEXT NOT NULL DEFAULT '[]',
+                    other_recent_messages TEXT NOT NULL DEFAULT '[]',
+                    recent_image_descriptions TEXT NOT NULL DEFAULT '[]'
+                );
+
                 CREATE TABLE IF NOT EXISTS image_generation_usage (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     usage_date TEXT NOT NULL,
@@ -462,6 +492,12 @@ class BotStorage:
                 ON llm_usage(created_at);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_purpose_created_at
                 ON llm_usage(purpose, created_at);
+            CREATE INDEX IF NOT EXISTS idx_final_qa_blocks_created_at
+                ON final_qa_blocks(created_at);
+            CREATE INDEX IF NOT EXISTS idx_final_qa_blocks_group_user
+                ON final_qa_blocks(group_id, user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_final_qa_blocks_message
+                ON final_qa_blocks(group_id, message_id);
             CREATE INDEX IF NOT EXISTS idx_sticker_assets_last_sent
                 ON sticker_assets(last_sent_at, created_at);
             CREATE INDEX IF NOT EXISTS idx_sticker_usage_daily_group_date
@@ -2556,6 +2592,90 @@ class BotStorage:
         self._attach_dashboard_mentions(messages)
         return messages
 
+    def list_dashboard_final_qa_blocks(
+        self,
+        group_id: str = "",
+        user_id: str = "",
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, object]]:
+        where = []
+        params: list[object] = []
+        if group_id:
+            where.append("group_id = ?")
+            params.append(str(group_id))
+        if user_id:
+            where.append("user_id = ?")
+            params.append(str(user_id))
+        if start_time is not None:
+            where.append("created_at >= ?")
+            params.append(int(start_time))
+        if end_time is not None:
+            where.append("created_at < ?")
+            params.append(int(end_time))
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, created_at, message_time, group_id, user_id, message_id,
+                       sender_name, sender_role, trigger_text, raw_message,
+                       is_direct, bot_mentioned, mode, action, decision_reason,
+                       score, value_type, value_score, traffic_level,
+                       candidate_reply, qa_reason, qa_categories, qa_confidence,
+                       recent_messages, speaker_recent_messages, other_recent_messages,
+                       recent_image_descriptions
+                FROM final_qa_blocks
+                {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                [*params, int(limit)],
+            ).fetchall()
+
+        return [
+            {
+                "id": int(row["id"]),
+                "created_at": int(row["created_at"]),
+                "message_time": int(row["message_time"] or 0),
+                "group_id": str(row["group_id"]),
+                "user_id": str(row["user_id"]),
+                "message_id": str(row["message_id"]),
+                "sender_name": str(row["sender_name"] or ""),
+                "sender_role": str(row["sender_role"] or ""),
+                "trigger_text": str(row["trigger_text"] or ""),
+                "raw_message": str(row["raw_message"] or ""),
+                "is_direct": bool(row["is_direct"]),
+                "bot_mentioned": bool(row["bot_mentioned"]),
+                "mode": str(row["mode"] or ""),
+                "action": str(row["action"] or ""),
+                "decision_reason": str(row["decision_reason"] or ""),
+                "score": float(row["score"] or 0.0),
+                "value_type": str(row["value_type"] or ""),
+                "value_score": float(row["value_score"] or 0.0),
+                "traffic_level": str(row["traffic_level"] or ""),
+                "candidate_reply": str(row["candidate_reply"] or ""),
+                "qa_reason": str(row["qa_reason"] or ""),
+                "qa_categories": _decode_string_list(str(row["qa_categories"] or "[]"), limit=20),
+                "qa_confidence": float(row["qa_confidence"] or 0.0),
+                "recent_messages": _decode_string_list(str(row["recent_messages"] or "[]"), limit=50),
+                "speaker_recent_messages": _decode_string_list(
+                    str(row["speaker_recent_messages"] or "[]"),
+                    limit=50,
+                ),
+                "other_recent_messages": _decode_string_list(
+                    str(row["other_recent_messages"] or "[]"),
+                    limit=50,
+                ),
+                "recent_image_descriptions": _decode_string_list(
+                    str(row["recent_image_descriptions"] or "[]"),
+                    limit=50,
+                ),
+            }
+            for row in rows
+        ]
+
     def _attach_dashboard_attachments(self, messages: list[dict[str, object]]) -> None:
         if not messages:
             return
@@ -2954,6 +3074,65 @@ class BotStorage:
                     decision.value_score,
                     decision.traffic_level,
                     reply or "",
+                ),
+            )
+
+    def record_final_qa_block(
+        self,
+        context: MessageContext,
+        decision: ParticipationDecision,
+        snapshot: ConversationSnapshot,
+        *,
+        candidate_reply: str,
+        qa_reason: str,
+        qa_categories: Iterable[str] = (),
+        qa_confidence: float = 0.0,
+    ) -> None:
+        candidate = str(candidate_reply or "").strip()
+        if not candidate:
+            return
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO final_qa_blocks (
+                    created_at, message_time, group_id, user_id, message_id,
+                    sender_name, sender_role, trigger_text, raw_message,
+                    is_direct, bot_mentioned, mode, action, decision_reason,
+                    score, value_type, value_score, traffic_level,
+                    candidate_reply, qa_reason, qa_categories, qa_confidence,
+                    recent_messages, speaker_recent_messages, other_recent_messages,
+                    recent_image_descriptions
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    int(context.timestamp or 0),
+                    context.group_id,
+                    context.user_id,
+                    context.message_id,
+                    context.sender_name,
+                    context.sender_role,
+                    context.plain_text,
+                    context.raw_message,
+                    1 if context.is_direct else 0,
+                    1 if context.bot_mentioned else 0,
+                    decision.mode,
+                    decision.action,
+                    decision.reason,
+                    decision.score,
+                    decision.value_type,
+                    decision.value_score,
+                    decision.traffic_level,
+                    candidate,
+                    str(qa_reason or "").strip(),
+                    json.dumps(_compact_string_list(qa_categories, limit=20), ensure_ascii=False),
+                    _clamp_float(float(qa_confidence or 0.0)),
+                    json.dumps(_compact_string_list(snapshot.recent_messages, limit=30), ensure_ascii=False),
+                    json.dumps(_compact_string_list(snapshot.speaker_recent_messages, limit=30), ensure_ascii=False),
+                    json.dumps(_compact_string_list(snapshot.other_recent_messages, limit=30), ensure_ascii=False),
+                    json.dumps(_compact_string_list(snapshot.recent_image_descriptions, limit=30), ensure_ascii=False),
                 ),
             )
 
@@ -4357,14 +4536,14 @@ def _useful_sticker_text_key(value: str) -> bool:
     return len(value) >= 8 and len(set(value)) >= 3
 
 
-def _decode_string_list(value: str) -> list[str]:
+def _decode_string_list(value: str, limit: int = 10) -> list[str]:
     try:
         decoded = json.loads(value)
     except (json.JSONDecodeError, TypeError):
         return []
     if not isinstance(decoded, list):
         return []
-    return _compact_string_list((str(item) for item in decoded), limit=10)
+    return _compact_string_list((str(item) for item in decoded), limit=limit)
 
 
 def _compact_int_list(values: Iterable[int], limit: int = 20) -> list[int]:

@@ -91,6 +91,28 @@ def register_dashboard_routes(
         _ensure_authorized(request, config)
         return {"items": storage.list_dashboard_pending(limit=_clamp_limit(limit, 10, 300))}
 
+    @app.get(f"{api_prefix}/qa-blocks")
+    async def dashboard_qa_blocks(
+        request: Request,
+        group_id: str = "",
+        user_id: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        limit: int = 100,
+    ) -> dict[str, object]:
+        _ensure_authorized(request, config)
+        start_time = _date_to_timestamp(date_from.strip(), end=False)
+        end_time = _date_to_timestamp(date_to.strip(), end=True)
+        return {
+            "items": storage.list_dashboard_final_qa_blocks(
+                group_id=group_id.strip(),
+                user_id=user_id.strip(),
+                start_time=start_time,
+                end_time=end_time,
+                limit=_clamp_limit(limit, 10, 500),
+            )
+        }
+
     @app.get(f"{api_prefix}/llm-usage")
     async def dashboard_llm_usage(
         request: Request,
@@ -639,6 +661,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       <button class="tab" data-tab="messages">群聊记录</button>
       <button class="tab" data-tab="stickers">表情包</button>
       <button class="tab" data-tab="llmUsage">LLM 用量</button>
+      <button class="tab" data-tab="qaBlocks">QA 拦截</button>
       <button class="tab" data-tab="pending">Pending</button>
     </nav>
     <section class="content">
@@ -694,6 +717,19 @@ _DASHBOARD_HTML = r"""<!doctype html>
           <span id="pendingSelectionText" class="muted selection-count">已选 0 条</span>
         </div>
         <div id="pendingList"></div>
+      </div>
+
+      <div id="qaBlocks" class="section">
+        <h2>Final QA 拦截归档</h2>
+        <div class="toolbar">
+          <label>群号<select id="qaBlocksGroup"></select></label>
+          <label>发言人<input id="qaBlocksUser" placeholder="QQ ID，可留空" /></label>
+          <label>开始日期<input id="qaBlocksDateFrom" type="date" /></label>
+          <label>结束日期<input id="qaBlocksDateTo" type="date" /></label>
+          <label>数量<input id="qaBlocksLimit" type="number" value="100" min="10" max="500" /></label>
+          <button class="primary" id="loadQaBlocksBtn">查询</button>
+        </div>
+        <div id="qaBlocksList"></div>
       </div>
 
       <div id="stickers" class="section">
@@ -752,6 +788,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
     document.getElementById("loadMessagesBtn").addEventListener("click", loadMessages);
     document.getElementById("loadStickersBtn").addEventListener("click", loadStickers);
     document.getElementById("loadLlmUsageBtn").addEventListener("click", loadLlmUsage);
+    document.getElementById("loadQaBlocksBtn").addEventListener("click", loadQaBlocks);
     document.getElementById("loadPendingBtn").addEventListener("click", loadPending);
     document.getElementById("selectAllPendingBtn").addEventListener("click", selectAllPending);
     document.getElementById("clearPendingSelectionBtn").addEventListener("click", clearPendingSelection);
@@ -906,6 +943,57 @@ _DASHBOARD_HTML = r"""<!doctype html>
         }).join(" ")
       }</div>`;
     }
+    function contextLinesHtml(title, lines) {
+      if (!lines || !lines.length) return "";
+      return `
+        <div class="memory">
+          <div class="key">${escapeHtml(title)}</div>
+          <div class="message-text">${escapeHtml(lines.join("\n"))}</div>
+        </div>`;
+    }
+    function qaBlockHtml(item) {
+      const categories = item.qa_categories || [];
+      return `
+        <div class="item">
+          <div>
+            <span class="pill">#${escapeHtml(item.id)}</span>
+            <span class="pill">group ${escapeHtml(item.group_id)}</span>
+            <span class="pill">QQ ${escapeHtml(item.user_id)}</span>
+            <span class="pill">${escapeHtml(item.sender_name || item.sender_role || "sender")}</span>
+            <span class="pill danger">QA block</span>
+            ${categories.map((category) => `<span class="pill warn">${escapeHtml(category)}</span>`).join("")}
+          </div>
+          <div class="muted" style="margin-top:6px">
+            ${formatTime(item.created_at)} · message=${escapeHtml(item.message_id)}
+            · conf=${Number(item.qa_confidence || 0).toFixed(2)}
+          </div>
+          <div class="memory">
+            <div class="key">触发消息</div>
+            <div class="message-text">${escapeHtml(item.trigger_text || item.raw_message)}</div>
+          </div>
+          <div class="memory">
+            <div class="key">被拦回复</div>
+            <div class="message-text">${escapeHtml(item.candidate_reply)}</div>
+          </div>
+          <div class="memory">
+            <div class="key">QA 理由</div>
+            <div class="message-text">${escapeHtml(item.qa_reason || "(empty)")}</div>
+          </div>
+          <details class="memory">
+            <summary>上下文与决策</summary>
+            <div class="kv" style="margin-top:10px">
+              <div class="key">模式/动作</div><div>${escapeHtml(item.mode)} / ${escapeHtml(item.action)}</div>
+              <div class="key">价值类型</div><div>${escapeHtml(item.value_type || "-")} ${Number(item.value_score || 0).toFixed(2)}</div>
+              <div class="key">聊天密度</div><div>${escapeHtml(item.traffic_level || "-")}</div>
+              <div class="key">决策理由</div><div>${escapeHtml(item.decision_reason || "(empty)")}</div>
+            </div>
+            ${contextLinesHtml("当前发言人近期主线", item.speaker_recent_messages)}
+            ${contextLinesHtml("其他发言近期话题参考", item.other_recent_messages)}
+            ${contextLinesHtml("最近群聊", item.recent_messages)}
+            ${contextLinesHtml("最近图片", item.recent_image_descriptions)}
+          </details>
+        </div>`;
+    }
     function renderEmpty(target, text) {
       document.getElementById(target).innerHTML = `<div class="empty">${escapeHtml(text)}</div>`;
     }
@@ -922,6 +1010,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       fillGroupSelect("usersGroup");
       fillGroupSelect("messagesGroup");
       fillGroupSelect("stickersGroup");
+      fillGroupSelect("qaBlocksGroup");
     }
     async function loadPersona() {
       const data = await api("/persona");
@@ -1014,6 +1103,25 @@ _DASHBOARD_HTML = r"""<!doctype html>
         showError(error);
       }
     }
+    async function loadQaBlocks() {
+      clearError();
+      setStatus("读取 QA 拦截归档");
+      try {
+        const data = await api("/qa-blocks", {
+          group_id: document.getElementById("qaBlocksGroup").value,
+          user_id: document.getElementById("qaBlocksUser").value,
+          date_from: document.getElementById("qaBlocksDateFrom").value,
+          date_to: document.getElementById("qaBlocksDateTo").value,
+          limit: document.getElementById("qaBlocksLimit").value,
+        });
+        const items = data.items || [];
+        if (!items.length) return renderEmpty("qaBlocksList", "暂无符合条件的 QA 拦截记录。");
+        document.getElementById("qaBlocksList").innerHTML = items.map(qaBlockHtml).join("");
+        setStatus(`QA 拦截 ${items.length} 条`);
+      } catch (error) {
+        showError(error);
+      }
+    }
     async function copyText(text) {
       await navigator.clipboard.writeText(text);
       setStatus("已复制命令");
@@ -1034,6 +1142,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       if (tab === "messages") return loadMessages();
       if (tab === "stickers") return loadStickers();
       if (tab === "llmUsage") return loadLlmUsage();
+      if (tab === "qaBlocks") return loadQaBlocks();
       if (tab === "pending") return loadPending();
     }
     async function runAction(path, options = {}, doneText = "操作已完成") {
@@ -1353,6 +1462,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
           loadMessages(),
           loadStickers(),
           loadLlmUsage(),
+          loadQaBlocks(),
           loadPending(),
         ]);
         setStatus("数据已更新");

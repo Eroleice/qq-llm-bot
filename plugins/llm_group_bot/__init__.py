@@ -656,15 +656,35 @@ async def _process_group_context(
 
     if not final_reply:
         storage.record_decision(context, result.decision, "")
+        if result.final_qa_blocked_reply:
+            storage.record_final_qa_block(
+                context,
+                result.decision,
+                snapshot,
+                candidate_reply=result.final_qa_blocked_reply,
+                qa_reason=result.final_qa_reason,
+                qa_categories=result.final_qa_categories,
+                qa_confidence=result.final_qa_confidence,
+            )
         return False
 
     if conflict_reply:
         qa_result = await pipeline.review_reply(context, result.decision, snapshot, final_reply)
         if not qa_result.allowed:
+            blocked_decision = _final_qa_blocked_decision(result.decision, qa_result.reason)
             storage.record_decision(
                 context,
-                _final_qa_blocked_decision(result.decision, qa_result.reason),
+                blocked_decision,
                 "",
+            )
+            storage.record_final_qa_block(
+                context,
+                blocked_decision,
+                snapshot,
+                candidate_reply=final_reply,
+                qa_reason=qa_result.reason,
+                qa_categories=qa_result.categories,
+                qa_confidence=qa_result.confidence,
             )
             return False
     else:

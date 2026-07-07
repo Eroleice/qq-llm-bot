@@ -2591,6 +2591,10 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.reply)
         self.assertEqual(result.decision.action, "observe")
         self.assertIn("final QA blocked reply", result.decision.reason)
+        self.assertEqual(result.final_qa_blocked_reply, "我支持这个立场，确实应该这样")
+        self.assertEqual(result.final_qa_reason, "涉及政治立场")
+        self.assertEqual(result.final_qa_categories, ("political_stance",))
+        self.assertAlmostEqual(result.final_qa_confidence, 0.94)
         self.assertEqual(result.reply_self_memories, [])
 
     async def test_lexicon_learning_creates_group_memory_without_reply_in_silent(self) -> None:
@@ -4545,6 +4549,93 @@ class MemoryStorageTests(unittest.TestCase):
             summaries = [item["summary"] for item in messages[0]["attachments"]]  # type: ignore[index]
 
             self.assertEqual(summaries, ["第一张", "", "中间张", "", "最后张"])
+
+    def test_storage_archives_final_qa_blocks_for_dashboard(self) -> None:
+        with _project_temp_directory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            context = MessageContext(
+                group_id="100",
+                user_id="42",
+                message_id="m-qa",
+                plain_text="可可你怎么看",
+                raw_message="可可你怎么看",
+                sender_name="alice",
+                is_direct=True,
+                bot_mentioned=True,
+                timestamp=1_725_235_200,
+            )
+            decision = ParticipationDecision(
+                "observe",
+                "message is directed to the bot; final QA blocked reply: 涉及政治立场",
+                "passive",
+                0.49,
+                "answer",
+                1.0,
+            )
+            snapshot = ConversationSnapshot(
+                recent_messages=["alice: 可可你怎么看", "bob: 这个新闻很复杂"],
+                speaker_recent_messages=["alice: 可可你怎么看"],
+                other_recent_messages=["bob: 这个新闻很复杂"],
+                recent_image_descriptions=["一张新闻截图"],
+            )
+
+            storage.record_final_qa_block(
+                context,
+                decision,
+                snapshot,
+                candidate_reply="我支持这个立场。",
+                qa_reason="涉及政治立场",
+                qa_categories=("political_stance",),
+                qa_confidence=0.94,
+            )
+
+            items = storage.list_dashboard_final_qa_blocks(group_id="100", user_id="42")
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["candidate_reply"], "我支持这个立场。")
+            self.assertEqual(items[0]["qa_reason"], "涉及政治立场")
+            self.assertEqual(items[0]["qa_categories"], ["political_stance"])
+            self.assertEqual(items[0]["recent_messages"], ["alice: 可可你怎么看", "bob: 这个新闻很复杂"])
+            self.assertEqual(items[0]["speaker_recent_messages"], ["alice: 可可你怎么看"])
+            self.assertTrue(items[0]["is_direct"])
+
+    def test_dashboard_api_exposes_final_qa_blocks(self) -> None:
+        FastAPI, TestClient, register_dashboard_routes = _dashboard_test_tools()
+        with _project_temp_directory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_final_qa_block(
+                MessageContext(
+                    group_id="100",
+                    user_id="42",
+                    message_id="m-qa-api",
+                    plain_text="可可讲个笑话",
+                    raw_message="可可讲个笑话",
+                    sender_name="alice",
+                    is_direct=True,
+                    timestamp=1_725_235_200,
+                ),
+                ParticipationDecision("observe", "final QA blocked reply: 政治话题", "passive", 0.49),
+                ConversationSnapshot(recent_messages=["alice: 可可讲个笑话"]),
+                candidate_reply="某政治人物笑话",
+                qa_reason="政治话题",
+                qa_categories=("political_stance",),
+                qa_confidence=0.9,
+            )
+            app = FastAPI()
+            register_dashboard_routes(FakeDashboardDriver(app), storage, config)
+
+            with TestClient(app) as client:
+                response = client.get("/api/dashboard/qa-blocks", params={"group_id": "100", "limit": 10})
+
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["items"][0]["message_id"], "m-qa-api")
+            self.assertEqual(data["items"][0]["candidate_reply"], "某政治人物笑话")
+            self.assertEqual(data["items"][0]["qa_categories"], ["political_stance"])
 
     def test_dashboard_pending_generates_group_commands(self) -> None:
         with _project_temp_directory() as tmp:

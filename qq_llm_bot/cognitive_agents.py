@@ -2804,6 +2804,10 @@ class AgentPipeline:
                 self.config.vision.max_images_per_message,
             ),
         )
+        final_qa_blocked_reply: str | None = None
+        final_qa_reason = ""
+        final_qa_categories: tuple[str, ...] = ()
+        final_qa_confidence = 0.0
         if reply_draft.text:
             qa_result = await self.final_qa.review(
                 enriched_context,
@@ -2812,6 +2816,10 @@ class AgentPipeline:
                 reply_draft.text,
             )
             if not qa_result.allowed:
+                final_qa_blocked_reply = reply_draft.text
+                final_qa_reason = qa_result.reason
+                final_qa_categories = qa_result.categories
+                final_qa_confidence = qa_result.confidence
                 final_decision = replace(
                     final_decision,
                     action="observe",
@@ -2844,6 +2852,10 @@ class AgentPipeline:
             image_descriptions=_recordable_image_descriptions(context, vision),
             sticker_candidates=list(vision.sticker_candidates),
             selected_sticker=selected_sticker,
+            final_qa_blocked_reply=final_qa_blocked_reply,
+            final_qa_reason=final_qa_reason,
+            final_qa_categories=final_qa_categories,
+            final_qa_confidence=final_qa_confidence,
         )
 
     async def reflect(
