@@ -5,7 +5,7 @@ import sqlite3
 import re
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Iterator, Iterable
@@ -86,6 +86,14 @@ RELATIONAL_ALIAS_TERMS = {
     "男朋友",
     "女朋友",
 }
+
+
+@dataclass(frozen=True)
+class _NameResolutionMatch:
+    user_id: str
+    reason: str
+    score: float
+    status: str = "resolved"
 
 
 class BotStorage:
@@ -2868,14 +2876,21 @@ class BotStorage:
         ambiguous_refs: dict[str, list[str]] = {}
         with self._connect() as conn:
             for ref in name_refs:
-                matches = self._lookup_alias_users(conn, ref)
+                matches = [
+                    _NameResolutionMatch(user_id, f"alias:{ref}", 1.0)
+                    for user_id in self._lookup_alias_users(conn, ref)
+                ]
+                if not matches:
+                    matches = self._lookup_display_name_users(conn, context.group_id, ref)
                 if not matches:
                     unknown_refs.append(ref)
                     continue
                 if len(matches) > 1:
-                    ambiguous_refs[ref] = matches[: self.target_user_limit]
+                    ambiguous_refs[ref] = [
+                        match.user_id for match in matches[: self.target_user_limit]
+                    ]
                     continue
-                target_reasons.setdefault(matches[0], f"alias:{ref}")
+                target_reasons.setdefault(matches[0].user_id, matches[0].reason)
 
             contexts: list[TargetUserContext] = []
             for user_id, reason in list(target_reasons.items())[: self.target_user_limit]:
@@ -2888,7 +2903,13 @@ class BotStorage:
                 contexts.append(
                     TargetUserContext(
                         user_id=user_id,
-                        resolution_status="resolved",
+                        resolution_status=(
+                            "guessed"
+                            if str(reason).startswith(
+                                ("display_name_guess:", "nickname_guess:", "profile_name_guess:")
+                            )
+                            else "resolved"
+                        ),
                         match_reason=reason,
                         aliases=aliases,
                         facts=facts,
@@ -2915,6 +2936,113 @@ class BotStorage:
             (alias, self.target_user_limit + 1),
         ).fetchall()
         return [str(row["user_id"]) for row in rows if str(row["user_id"] or "").strip()]
+
+    def _lookup_display_name_users(
+        self,
+        conn: sqlite3.Connection,
+        group_id: str,
+        name: str,
+    ) -> list[_NameResolutionMatch]:
+        ref = _clean_alias(name)
+        if not ref or not _is_reasonable_member_alias(ref):
+            return []
+
+        group_matches = self._rank_name_candidates(
+            ref,
+            self._recent_group_display_name_candidates(conn, group_id),
+            reason_prefix="display_name_guess",
+            source_bonus=0.03,
+        )
+        selected = _select_name_resolution_matches(group_matches, self.target_user_limit)
+        if selected:
+            return selected
+
+        profile_matches = self._rank_name_candidates(
+            ref,
+            self._latest_profile_name_candidates(conn),
+            reason_prefix="profile_name_guess",
+            source_bonus=0.0,
+        )
+        return _select_name_resolution_matches(profile_matches, self.target_user_limit)
+
+    def _recent_group_display_name_candidates(
+        self,
+        conn: sqlite3.Connection,
+        group_id: str,
+    ) -> list[tuple[str, str, str]]:
+        rows = conn.execute(
+            """
+            SELECT user_id, sender_name, MAX(time) AS last_seen
+            FROM messages
+            WHERE group_id = ?
+              AND sender_name != ''
+              AND sender_role != 'bot'
+            GROUP BY user_id, sender_name
+            ORDER BY last_seen DESC
+            LIMIT 80
+            """,
+            (str(group_id),),
+        ).fetchall()
+        candidates: list[tuple[str, str, str]] = []
+        for row in rows:
+            user_id = _dashboard_user_id(str(row["user_id"] or ""))
+            display_name = str(row["sender_name"] or "")
+            if user_id and display_name:
+                candidates.append((user_id, display_name, "display_name"))
+        return candidates
+
+    def _latest_profile_name_candidates(
+        self,
+        conn: sqlite3.Connection,
+    ) -> list[tuple[str, str, str]]:
+        rows = conn.execute(
+            """
+            SELECT user_id, nickname, display_name
+            FROM user_profiles
+            WHERE nickname != '' OR display_name != ''
+            ORDER BY last_seen_at DESC
+            LIMIT 120
+            """
+        ).fetchall()
+        candidates: list[tuple[str, str, str]] = []
+        for row in rows:
+            user_id = _dashboard_user_id(str(row["user_id"] or ""))
+            if not user_id:
+                continue
+            display_name = str(row["display_name"] or "")
+            nickname = str(row["nickname"] or "")
+            if display_name:
+                candidates.append((user_id, display_name, "display_name"))
+            if nickname and nickname != display_name:
+                candidates.append((user_id, nickname, "nickname"))
+        return candidates
+
+    def _rank_name_candidates(
+        self,
+        ref: str,
+        candidates: list[tuple[str, str, str]],
+        *,
+        reason_prefix: str,
+        source_bonus: float,
+    ) -> list[_NameResolutionMatch]:
+        ranked: dict[str, _NameResolutionMatch] = {}
+        for user_id, candidate_name, name_type in candidates:
+            score = _display_name_match_score(ref, candidate_name)
+            if score < 0.78:
+                continue
+            score = min(1.0, score + source_bonus)
+            reason = f"{reason_prefix}:{ref}->{candidate_name}"
+            if name_type == "nickname":
+                reason = f"nickname_guess:{ref}->{candidate_name}"
+            existing = ranked.get(user_id)
+            if existing is None or score > existing.score:
+                ranked[user_id] = _NameResolutionMatch(
+                    user_id=user_id,
+                    reason=reason,
+                    score=score,
+                    status="guessed",
+                )
+        return sorted(ranked.values(), key=lambda item: item.score, reverse=True)
 
     def _list_active_aliases(
         self,
@@ -4449,6 +4577,45 @@ def _is_reasonable_member_alias(value: str) -> bool:
     if re.fullmatch(r"(?:第?[一二三四五六七八九十\d]+)?(?:管理员|管理|群主|版主)", compact):
         return False
     return True
+
+
+def _display_name_match_score(ref: str, candidate: str) -> float:
+    left = _normalize_display_name(ref)
+    right = _normalize_display_name(candidate)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if len(left) < 2 or len(right) < 2:
+        return 0.0
+    if left.startswith(right) or right.startswith(left):
+        return 0.88
+    if left in right or right in left:
+        return 0.82
+    common = len(set(left) & set(right))
+    coverage = common / max(len(set(left)), 1)
+    if len(left) >= 3 and coverage >= 0.75:
+        return 0.78
+    return 0.0
+
+
+def _select_name_resolution_matches(
+    matches: list[_NameResolutionMatch],
+    limit: int,
+) -> list[_NameResolutionMatch]:
+    if not matches:
+        return []
+    top_score = matches[0].score
+    if top_score < 0.78:
+        return []
+    close = [match for match in matches if top_score - match.score <= 0.04]
+    if len(close) > 1:
+        return close[: max(1, int(limit))]
+    return matches[:1]
+
+
+def _normalize_display_name(value: str) -> str:
+    return re.sub(r"\s+", "", _clean_alias(value)).casefold()
 
 
 def _extract_denied_aliases(*texts: str) -> list[str]:

@@ -236,6 +236,16 @@ class TargetUserContext:
 
 
 @dataclass(frozen=True)
+class SemanticContext:
+    current_intent: str = ""
+    relevant_messages: list[str] = field(default_factory=list)
+    resolved_references: list[str] = field(default_factory=list)
+    member_context: list[str] = field(default_factory=list)
+    uncertain_references: list[str] = field(default_factory=list)
+    ignored_noise: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class UserProfileDraft:
     summary: str
     traits: dict[str, object] = field(default_factory=dict)
@@ -285,6 +295,7 @@ class ConversationSnapshot:
     other_recent_messages: list[str] = field(default_factory=list)
     recent_bot_reply_to_user: str = ""
     recent_bot_reply_to_user_seconds: int = 0
+    semantic_context: SemanticContext | None = None
 
 
 @dataclass(frozen=True)

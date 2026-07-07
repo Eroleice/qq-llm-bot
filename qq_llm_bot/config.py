@@ -53,6 +53,7 @@ class BotConfig:
     send_retry_base_delay_seconds: float = 2.0
     send_retry_max_delay_seconds: float = 30.0
     final_qa_enabled: bool = True
+    context_understanding_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -371,6 +372,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             300,
         ),
         final_qa_enabled=_bool_value(bot_raw.get("final_qa_enabled", True)),
+        context_understanding_enabled=_bool_value(
+            bot_raw.get("context_understanding_enabled", True)
+        ),
     )
 
     return AppConfig(

@@ -17,6 +17,7 @@ from nonebot.adapters.onebot.v11 import Message
 from qq_llm_bot.cognitive_agents import (
     AgentPipeline,
     BatchObservationAgent,
+    ContextUnderstandingAgent,
     FactExtractorAgent,
     FinalQAAgent,
     MemoryCuratorAgent,
@@ -2372,6 +2373,79 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("短回复也必须语义完整", user_prompt)
         self.assertIn("不要以逗号、顿号、冒号、分号", user_prompt)
 
+    async def test_context_understanding_agent_structures_semantic_context(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"current_intent":"确认是否先别抽",'
+                '"relevant_messages":["QQ:42 之前说预算不多"],'
+                '"resolved_references":["我 -> QQ:42"],'
+                '"member_context":["QQ:42 关心预算"],'
+                '"uncertain_references":["那个池子指代不确定"],'
+                '"ignored_noise":["表情和跑题闲聊"]}'
+            ]
+        )
+        agent = ContextUnderstandingAgent(test_config(Path("unused.sqlite3")), llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-semantic",
+            plain_text="那我是不是先别抽",
+            raw_message="那我是不是先别抽",
+        )
+
+        semantic = await agent.analyze(
+            context,
+            PerceptionResult(True, False, False, ["游戏"], "neutral", 0.9),
+            ParticipationDecision("reply", "direct follow-up", "passive", 1.0, "answer", 1.0),
+            ConversationSnapshot(recent_messages=["alice: 我预算不多", "bob: 想抽就抽"]),
+        )
+
+        self.assertEqual(llm.text_call_purposes, ["context_understanding"])
+        self.assertEqual(semantic.current_intent, "确认是否先别抽")
+        self.assertIn("我 -> QQ:42", semantic.resolved_references)
+        self.assertIn("QQ:42 关心预算", semantic.member_context)
+
+    async def test_pipeline_passes_semantic_context_to_response_prompt(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        config = replace(config, bot=replace(config.bot, final_qa_enabled=False))
+        llm = FakeLLM(
+            [
+                '{"is_question":true,"is_self_disclosure":false,"topics":["购物"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
+                '"summary_patch":"","reason":"direct"}',
+                '{"current_intent":"结合预算判断是否购买",'
+                '"relevant_messages":["alice(QQ:42): 我预算不太够"],'
+                '"resolved_references":["我 -> QQ:42"],'
+                '"member_context":["QQ:42 当前话题相关认知：预算紧"],'
+                '"uncertain_references":[],"ignored_noise":["无关闲聊"]}',
+                "先别急着买，预算卡的话先拆需求。",
+            ]
+        )
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-semantic-pipeline",
+            plain_text="可可那我是不是该买？",
+            raw_message="可可那我是不是该买？",
+            is_direct=True,
+        )
+
+        result = await pipeline.run(
+            context,
+            "passive",
+            ConversationSnapshot(recent_messages=["alice: 我预算不太够"]),
+        )
+
+        self.assertEqual(result.reply, "先别急着买，预算卡的话先拆需求")
+        self.assertIn("context_understanding", llm.text_call_purposes)
+        response_prompt = llm.text_calls[4][1]
+        self.assertIn("第一阶段语义上下文", response_prompt)
+        self.assertIn("我 -> QQ:42", response_prompt)
+        self.assertIn("QQ:42 当前话题相关认知：预算紧", response_prompt)
+
     async def test_response_sanitize_trims_hard_cap_at_complete_boundary(self) -> None:
         text = "5.4mini要是够稳就挺香，先拿它当便宜眼睛用挺不错，不过还得看图文细节。"
 
@@ -2602,6 +2676,10 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
                 '"summary_patch":"","reason":"direct"}',
                 '{"needs_self_narrative":false,"purpose":"answer_question",'
                 '"allowed_kinds":[],"should_invent":false,"reason":"不需要自我叙事"}',
+                '{"current_intent":"询问刚才话题看法",'
+                '"relevant_messages":["alice: 这个政治新闻到底谁对？"],'
+                '"resolved_references":["刚才那个话题 -> 最近政治新闻讨论"],'
+                '"member_context":[],"uncertain_references":[],"ignored_noise":[]}',
                 "我支持这个立场，确实应该这样。",
                 '{"verdict":"block","reason":"涉及政治立场",'
                 '"categories":["political_stance"],"confidence":0.94}',
@@ -2640,6 +2718,10 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
                 '{"facts":[]}',
                 '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
                 '"summary_patch":"","reason":"direct"}',
+                '{"current_intent":"结合预算判断是否购买",'
+                '"relevant_messages":["alice: 我预算不太够","alice: 这个东西有点超预算"],'
+                '"resolved_references":["我 -> 当前发言人"],'
+                '"member_context":[],"uncertain_references":[],"ignored_noise":[]}',
                 "直接买，别纠结了。",
                 '{"verdict":"block","reason":"误解了预算语境",'
                 '"categories":["context_mismatch"],"confidence":0.9}',
@@ -2678,6 +2760,10 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
                 '{"facts":[]}',
                 '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
                 '"summary_patch":"","reason":"direct"}',
+                '{"current_intent":"结合预算判断是否购买",'
+                '"relevant_messages":["alice: 我预算不太够","alice: 这个东西有点超预算"],'
+                '"resolved_references":["我 -> 当前发言人"],'
+                '"member_context":[],"uncertain_references":[],"ignored_noise":[]}',
                 "直接买，别纠结了。",
                 '{"verdict":"block","reason":"误解了预算语境",'
                 '"categories":["context_mismatch"],"confidence":0.9}',
@@ -3748,6 +3834,78 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(by_second.target_users[0].user_id, "123")
             self.assertIn("牛宝宝", by_first.target_users[0].aliases)
             self.assertIn("牛牛", by_first.target_users[0].aliases)
+
+    def test_display_name_snapshot_guesses_target_when_alias_missing(self) -> None:
+        with _project_temp_directory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_message(
+                MessageContext(
+                    group_id="100",
+                    user_id="123",
+                    message_id="m-name",
+                    plain_text="我来了",
+                    raw_message="我来了",
+                    sender_name="牛宝宝",
+                    sender_nickname="牛牛",
+                    timestamp=10,
+                )
+            )
+
+            snapshot = storage.build_snapshot(
+                MessageContext("100", "42", "q-name", "谁是牛宝", "谁是牛宝")
+            )
+
+            self.assertEqual(snapshot.unknown_name_refs, [])
+            self.assertEqual(snapshot.target_users[0].user_id, "123")
+            self.assertEqual(snapshot.target_users[0].resolution_status, "guessed")
+            self.assertIn("display_name_guess:牛宝->牛宝宝", snapshot.target_users[0].match_reason)
+
+    def test_latest_profile_nickname_guesses_target_when_group_snapshot_missing(self) -> None:
+        with _project_temp_directory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_message(
+                MessageContext(
+                    group_id="200",
+                    user_id="456",
+                    message_id="m-profile-name",
+                    plain_text="跨群更新昵称",
+                    raw_message="跨群更新昵称",
+                    sender_name="旧名片",
+                    sender_nickname="阿牛",
+                    timestamp=10,
+                )
+            )
+
+            snapshot = storage.build_snapshot(
+                MessageContext("100", "42", "q-profile-name", "阿牛是谁", "阿牛是谁")
+            )
+
+            self.assertEqual(snapshot.target_users[0].user_id, "456")
+            self.assertEqual(snapshot.target_users[0].resolution_status, "guessed")
+            self.assertIn("nickname_guess:阿牛->阿牛", snapshot.target_users[0].match_reason)
+
+    def test_display_name_guess_marks_ambiguous_close_matches(self) -> None:
+        with _project_temp_directory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            storage.record_message(
+                MessageContext("100", "123", "m-a", "a", "a", sender_name="阿牛", timestamp=10)
+            )
+            storage.record_message(
+                MessageContext("100", "456", "m-b", "b", "b", sender_name="阿牛", timestamp=11)
+            )
+
+            snapshot = storage.build_snapshot(
+                MessageContext("100", "42", "q-ambiguous", "阿牛是谁", "阿牛是谁")
+            )
+
+            self.assertEqual(snapshot.target_users, [])
+            self.assertEqual(set(snapshot.ambiguous_name_refs["阿牛"]), {"123", "456"})
 
     def test_relationship_titles_are_rejected_as_member_aliases(self) -> None:
         with _project_temp_directory() as tmp:
