@@ -87,6 +87,7 @@ observation_last_flush_at: dict[str, int] = {}
 class _PendingVision:
     future: asyncio.Future[list[str]]
     created_at: float
+    context: MessageContext
     worker: asyncio.Task[list[str]] | None = None
 
 
@@ -136,10 +137,8 @@ class _QueuedOutboundMessage:
 
 
 pending_vision_tasks: dict[tuple[str, str], _PendingVision] = {}
-_PENDING_VISION_WAIT_SECONDS = 8.0
 _PENDING_VISION_MAX_MESSAGES = 3
 _PENDING_VISION_MAX_AGE_SECONDS = 120.0
-_PENDING_VISION_WAIT_REPLY = "我还在看图，等图片内容出来再说，先不硬猜。"
 _OUTBOUND_RETRY_WORKER_INTERVAL_SECONDS = 3.0
 _outbound_queue_ids = count(1)
 _outbound_queue: list[_QueuedOutboundMessage] = []
@@ -148,6 +147,7 @@ _outbound_flush_lock = asyncio.Lock()
 _outbound_retry_worker: asyncio.Task[None] | None = None
 _pending_realtime_replies: dict[tuple[str, str], _PendingRealtimeReply] = {}
 _pending_realtime_lock = asyncio.Lock()
+_deferred_vision_lock: asyncio.Lock | None = None
 
 if config.dashboard.enabled:
     register_dashboard_routes(
@@ -602,6 +602,7 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
     _maybe_cleanup_unused_stickers()
     _register_pending_vision(context)
+    _ensure_deferred_vision_task(context)
 
     mode = storage.get_group_mode(group_id, config.bot.default_group_mode)
     if await _maybe_enqueue_realtime_reply(bot, context, mode):
@@ -624,17 +625,16 @@ async def _process_group_context(
     commit_guard: Any | None = None,
 ) -> bool:
     contexts = tuple(source_contexts or (context,))
-    if not await _wait_for_relevant_pending_vision(context):
-        return await _handle_pending_vision_timeout(bot, context, mode)
+    await _wait_for_relevant_pending_vision(context)
+    context = _context_with_relevant_pending_images(context)
 
     await _flush_observation_batch(context.group_id)
     snapshot = storage.build_snapshot(context)
     try:
-        result = await pipeline.run(context, mode, snapshot)
+        result = await pipeline.run(context, mode, snapshot, analyze_images=False)
     except asyncio.CancelledError:
         raise
     except Exception:
-        _finish_pending_vision_contexts(contexts, [])
         raise
 
     if commit_guard is not None and not await commit_guard():
@@ -642,10 +642,7 @@ async def _process_group_context(
 
     fact_write = storage.record_fact_candidates(result.facts)
     memory_write = storage.record_memory_candidates(result.memories)
-    try:
-        _record_image_descriptions(contexts, result.image_descriptions)
-    finally:
-        _finish_pending_vision_contexts(contexts, result.image_descriptions)
+    _record_image_descriptions(contexts, result.image_descriptions)
     await _record_sticker_candidates(context, result.sticker_candidates)
     await _maybe_update_profiles(
         [fact.subject_user_id for fact in fact_write.accepted],
@@ -771,9 +768,6 @@ async def _run_pending_realtime_reply(
         raise
     except Exception as exc:  # pragma: no cover - realtime task must not break the matcher loop
         logger.exception("Realtime reply task failed for {}: {}", key, exc)
-        pending = await _get_pending_realtime_reply(key, generation)
-        if pending is not None:
-            _finish_pending_vision_contexts(tuple(pending.contexts), [])
     finally:
         await _discard_pending_realtime_reply(key, generation)
 
@@ -871,14 +865,6 @@ def _record_image_descriptions(
         )
 
 
-def _finish_pending_vision_contexts(
-    contexts: Iterable[MessageContext],
-    descriptions: list[str],
-) -> None:
-    for context, context_descriptions in split_image_descriptions_by_context(contexts, descriptions):
-        _finish_pending_vision(context, context_descriptions)
-
-
 def _register_pending_vision(context: MessageContext) -> _PendingVision | None:
     if not _has_image_attachments(context):
         return None
@@ -888,7 +874,7 @@ def _register_pending_vision(context: MessageContext) -> _PendingVision | None:
     if existing is not None:
         return existing
     future: asyncio.Future[list[str]] = asyncio.get_running_loop().create_future()
-    pending = _PendingVision(future=future, created_at=time.time())
+    pending = _PendingVision(future=future, created_at=time.time(), context=context)
     pending_vision_tasks[key] = pending
     return pending
 
@@ -905,7 +891,9 @@ def _ensure_deferred_vision_task(context: MessageContext) -> asyncio.Task[list[s
 async def _run_pending_deferred_vision(context: MessageContext) -> list[str]:
     descriptions: list[str] = []
     try:
-        descriptions = await _record_deferred_vision(context)
+        async with _get_deferred_vision_lock():
+            descriptions = await _record_deferred_vision(context)
+        _refresh_observation_buffer_image_descriptions(context, descriptions)
     except Exception as exc:  # pragma: no cover - pending vision must never block the group
         logger.warning(
             "Pending deferred image observation failed for group {} message {}: {}",
@@ -918,12 +906,63 @@ async def _run_pending_deferred_vision(context: MessageContext) -> list[str]:
     return descriptions
 
 
+def _get_deferred_vision_lock() -> asyncio.Lock:
+    global _deferred_vision_lock
+    if _deferred_vision_lock is None:
+        _deferred_vision_lock = asyncio.Lock()
+    return _deferred_vision_lock
+
+
 def _finish_pending_vision(context: MessageContext, descriptions: list[str]) -> None:
     key = _pending_vision_key(context)
     pending = pending_vision_tasks.pop(key, None)
     if pending is None or pending.future.done():
         return
     pending.future.set_result(list(descriptions))
+
+
+def _context_with_relevant_pending_images(context: MessageContext) -> MessageContext:
+    if _has_image_attachments(context) or not _looks_like_image_context_followup(context):
+        return context
+    attachments: list[MessageAttachment] = []
+    seen_urls = {
+        attachment.url
+        for attachment in context.attachments
+        if attachment.attachment_type == "image" and attachment.url
+    }
+    for pending in _recent_pending_vision_tasks(context):
+        for attachment in pending.context.attachments:
+            if attachment.attachment_type != "image" or not attachment.url:
+                continue
+            if attachment.url in seen_urls:
+                continue
+            seen_urls.add(attachment.url)
+            attachments.append(attachment)
+            if len(attachments) >= config.vision.max_images_per_message:
+                break
+        if len(attachments) >= config.vision.max_images_per_message:
+            break
+    if not attachments:
+        return context
+    note = f"[相关未解析图片 x{len(attachments)}：来自最近群聊，当前消息可能在询问这些图片]"
+    plain_text = "\n".join(part for part in (context.plain_text, note) if part).strip()
+    return replace(context, plain_text=plain_text, attachments=[*context.attachments, *attachments])
+
+
+def _refresh_observation_buffer_image_descriptions(
+    context: MessageContext,
+    descriptions: list[str],
+) -> None:
+    if not descriptions:
+        return
+    buffer = observation_buffers.get(context.group_id)
+    if not buffer:
+        return
+    for index, buffered in enumerate(buffer):
+        if buffered.message_id != context.message_id:
+            continue
+        buffer[index] = _context_with_deferred_image_descriptions(buffered, descriptions)
+        return
 
 
 async def _wait_for_relevant_pending_vision(context: MessageContext) -> bool:
@@ -936,59 +975,11 @@ async def _wait_for_relevant_pending_vision(context: MessageContext) -> bool:
         return True
 
     logger.info(
-        "Waiting for {} pending image analyses before handling group {} message {}",
+        "Using {} pending image analyses as inline multimodal context for group {} message {}",
         len(pending),
         context.group_id,
         context.message_id,
     )
-    _, still_pending = await asyncio.wait(
-        [item.future for item in pending],
-        timeout=_PENDING_VISION_WAIT_SECONDS,
-    )
-    if not still_pending:
-        return True
-
-    logger.info(
-        "Pending image analysis wait timed out before group {} message {}",
-        context.group_id,
-        context.message_id,
-    )
-    return False
-
-
-async def _handle_pending_vision_timeout(
-    bot: Bot,
-    context: MessageContext,
-    mode: ParticipationMode,
-) -> bool:
-    reason = "pending image vision not ready for image-context follow-up"
-    if not context.is_direct:
-        storage.record_decision(
-            context,
-            ParticipationDecision("observe", reason, mode, 0.0),
-            "",
-        )
-        return False
-
-    decision = ParticipationDecision(
-        "reply",
-        reason,
-        mode,
-        0.55,
-        value_type="clarifying_question",
-        value_score=0.55,
-    )
-    send_result = await _send_group_reply(
-        _PENDING_VISION_WAIT_REPLY,
-        None,
-        context.message_id,
-        bot=bot,
-        context=context,
-        allow_bubbles=False,
-    )
-    decision_reply = _reply_record_text(send_result.parts, send_result.sticker)
-    storage.record_decision(context, decision, decision_reply)
-    storage.record_bot_reply_parts(context.group_id, str(bot.self_id), send_result.parts)
     return True
 
 
@@ -1000,7 +991,13 @@ def _recent_pending_vision_tasks(context: MessageContext) -> list[_PendingVision
         for key, pending in pending_vision_tasks.items()
         if key != current_key and key[0] == context.group_id and not pending.future.done()
     ]
-    candidates.sort(key=lambda item: item.created_at, reverse=True)
+    candidates.sort(
+        key=lambda item: (
+            item.context.user_id == context.user_id,
+            item.created_at,
+        ),
+        reverse=True,
+    )
     return candidates[:_PENDING_VISION_MAX_MESSAGES]
 
 
@@ -1125,8 +1122,12 @@ def _looks_like_active_realtime_candidate(context: MessageContext) -> bool:
 
 
 async def _defer_observation(context: MessageContext, mode: ParticipationMode) -> None:
-    vision_task = _ensure_deferred_vision_task(context)
-    image_descriptions = await asyncio.shield(vision_task) if vision_task is not None else []
+    _ensure_deferred_vision_task(context)
+    image_descriptions = [
+        attachment.summary
+        for attachment in context.attachments
+        if attachment.attachment_type == "image" and attachment.summary
+    ]
     buffer = observation_buffers.setdefault(context.group_id, [])
     if context.group_id not in observation_last_flush_at:
         observation_last_flush_at[context.group_id] = int(time.time())

@@ -96,16 +96,22 @@ class FakeLLM:
         self,
         replies: list[str] | None = None,
         vision_replies: list[str] | None = None,
+        multimodal_replies: list[str] | None = None,
         image_replies: list[GeneratedImage | None] | None = None,
     ) -> None:
         self.replies = replies or []
         self.vision_replies = vision_replies or []
+        self.multimodal_replies = multimodal_replies or []
         self.image_replies = image_replies or []
         self.text_calls: list[tuple[str, str]] = []
         self.text_call_purposes: list[str] = []
         self.text_call_tiers: list[str] = []
         self.vision_calls: list[list[str]] = []
         self.vision_call_tiers: list[str] = []
+        self.multimodal_calls: list[list[str]] = []
+        self.multimodal_text_calls: list[tuple[str, str]] = []
+        self.multimodal_call_purposes: list[str] = []
+        self.multimodal_call_tiers: list[str] = []
         self.image_calls: list[str] = []
         self.image_url_calls: list[list[str]] = []
         self.last_image_generation_error = ""
@@ -137,6 +143,25 @@ class FakeLLM:
         self.vision_call_tiers.append(model_tier)
         if self.vision_replies:
             return self.vision_replies.pop(0)
+        return None
+
+    async def complete_multimodal(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_urls: list[str],
+        vision_config: VisionConfig,
+        purpose: str = "response",
+        model_tier: str = "",
+    ) -> str | None:
+        self.multimodal_calls.append(list(image_urls))
+        self.multimodal_text_calls.append((system_prompt, user_prompt))
+        self.multimodal_call_purposes.append(purpose)
+        self.multimodal_call_tiers.append(model_tier)
+        if self.multimodal_replies:
+            return self.multimodal_replies.pop(0)
+        if self.replies:
+            return self.replies.pop(0)
         return None
 
     async def generate_image(
@@ -2311,6 +2336,79 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("max_reply_chars 只是硬上限，不是目标长度", user_prompt)
         self.assertIn("direct_reply 目标 6-25 字", user_prompt)
         self.assertIn("proactive_reply 目标 8-30 字", user_prompt)
+
+    async def test_response_with_unresolved_image_uses_multimodal_call(self) -> None:
+        config = replace(test_config(Path("unused.sqlite3")), vision=VisionConfig(enabled=True))
+        llm = FakeLLM(multimodal_replies=["图里像是一张财务截图，文字在说收入同比上涨"])
+        agent = ResponseAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-image-response",
+            plain_text="可可看看这图",
+            raw_message="[CQ:image,url=https://example.test/report.png]",
+            is_direct=True,
+        )
+        perception = PerceptionResult(True, False, True, ["截图"], "neutral", 0.9)
+        decision = ParticipationDecision("reply", "direct request", "passive", 1.0, "answer", 1.0)
+
+        draft = await agent.generate(
+            context,
+            perception,
+            decision,
+            ConversationSnapshot(),
+            image_urls=["https://example.test/report.png"],
+        )
+        system_prompt, user_prompt = llm.multimodal_text_calls[0]
+
+        self.assertEqual(draft.text, "图里像是一张财务截图，文字在说收入同比上涨")
+        self.assertEqual(llm.text_calls, [])
+        self.assertEqual(llm.multimodal_calls, [["https://example.test/report.png"]])
+        self.assertEqual(llm.multimodal_call_purposes, ["response"])
+        self.assertEqual(llm.multimodal_call_tiers, ["flagship"])
+        self.assertIn("图片内容大意和图中文字", system_prompt)
+        self.assertIn("本轮额外附带未解析图片：1 张", user_prompt)
+
+    async def test_pipeline_cache_only_vision_passes_unresolved_image_to_response(self) -> None:
+        base_config = test_config(Path("unused.sqlite3"))
+        config = replace(
+            base_config,
+            bot=replace(base_config.bot, final_qa_enabled=False),
+            vision=VisionConfig(enabled=True),
+        )
+        llm = FakeLLM(
+            replies=[
+                '{"is_question":true,"is_self_disclosure":false,"topics":["截图"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":1,"trust":0,"familiarity":2,"tension":0,'
+                '"summary_patch":"","reason":"direct image question"}',
+            ],
+            multimodal_replies=["像是报表截图，重点是收入同比上涨"],
+        )
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-cache-only-image",
+            plain_text="可可看看这张图",
+            raw_message="[CQ:image,url=https://example.test/report.png]",
+            is_direct=True,
+            attachments=[
+                MessageAttachment(
+                    attachment_type="image",
+                    url="https://example.test/report.png",
+                    file="report.png",
+                )
+            ],
+        )
+
+        result = await pipeline.run(context, "passive", ConversationSnapshot(), analyze_images=False)
+
+        self.assertEqual(llm.vision_calls, [])
+        self.assertEqual(llm.multimodal_calls, [["https://example.test/report.png"]])
+        self.assertEqual(result.image_descriptions, [""])
+        self.assertEqual(result.reply, "像是报表截图，重点是收入同比上涨")
 
     async def test_final_qa_reviews_recent_chat_with_candidate_reply(self) -> None:
         config = test_config(Path("unused.sqlite3"))

@@ -85,6 +85,17 @@ class LLMClient(Protocol):
     ) -> str | None:
         ...
 
+    async def complete_multimodal(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_urls: list[str],
+        vision_config: VisionConfig,
+        purpose: str = "response",
+        model_tier: str = "",
+    ) -> str | None:
+        ...
+
     async def generate_image(
         self,
         prompt: str,
@@ -113,6 +124,17 @@ class DisabledLLMClient:
         image_urls: list[str],
         vision_config: VisionConfig,
         purpose: str = "vision",
+        model_tier: str = "",
+    ) -> str | None:
+        return None
+
+    async def complete_multimodal(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_urls: list[str],
+        vision_config: VisionConfig,
+        purpose: str = "response",
         model_tier: str = "",
     ) -> str | None:
         return None
@@ -239,6 +261,54 @@ class OpenAICompatibleLLMClient:
                 len(system_prompt) + len(user_prompt),
             )
         return text
+
+    async def complete_multimodal(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_urls: list[str],
+        vision_config: VisionConfig,
+        purpose: str = "response",
+        model_tier: str = "",
+    ) -> str | None:
+        missing = self._missing_config_items()
+        if missing:
+            logger.warning("LLM multimodal response is not configured; missing: {}", ", ".join(missing))
+            return None
+        clean_urls = [url.strip() for url in image_urls if url.strip()]
+        if not clean_urls:
+            return await self.complete_text(system_prompt, user_prompt, purpose, model_tier)
+
+        content = [{"type": "text", "text": user_prompt}]
+        content.extend(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": url,
+                    "detail": vision_config.detail,
+                },
+            }
+            for url in clean_urls[: vision_config.max_images_per_message]
+        )
+        model = self._vision_model_for_tier(
+            vision_config,
+            model_tier or ("flagship" if (purpose or "").strip().lower() == "response" else ""),
+        )
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+            "temperature": self.config.temperature,
+            "max_tokens": self._max_tokens_for_text_purpose(purpose or "response"),
+        }
+        return await self._post_chat_completion(
+            payload,
+            max(self.config.timeout_seconds, vision_config.timeout_seconds),
+            purpose or "response",
+            len(system_prompt) + len(user_prompt),
+        )
 
     async def generate_image(
         self,

@@ -59,6 +59,7 @@ class VisionAnalysis:
     fact_candidates: tuple[FactCandidate, ...] = ()
     sticker_candidates: tuple[StickerCandidate, ...] = ()
     attachment_descriptions: tuple[str, ...] = ()
+    resolved_image_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,7 @@ FOLLOWUP_CUE_PATTERN = re.compile(
     r"^(那|所以|然后|还有|这个|这呢|那我|那你|为啥|为什么|咋|怎么|能不能|"
     r"可以吗|要不要|是不是|所以呢|细说|展开|继续|刚才|前面|上面|你说)"
 )
+UNRESOLVED_IMAGE_DESCRIPTION = "收到一张图片，但当前没有可用的视觉解读结果"
 BACKGROUND_KIND_SET = {
     "self_background",
     "self_hobby",
@@ -942,7 +944,7 @@ class VisionAgent:
         self.llm = llm
         self.vision_cache = vision_cache
 
-    async def analyze(self, context: MessageContext) -> VisionAnalysis:
+    async def analyze(self, context: MessageContext, *, allow_remote: bool = True) -> VisionAnalysis:
         if not self.config.vision.enabled:
             return VisionAnalysis([])
         image_attachments = _select_image_attachments(
@@ -956,7 +958,7 @@ class VisionAgent:
         fallback = self._fallback_analysis(context)
         cached_results, missing_urls = self._load_cached_results(image_urls)
         fresh_results: dict[str, VisionImageResult] = {}
-        if missing_urls:
+        if missing_urls and allow_remote:
             sticker_prompt = self._sticker_prompt()
             direct_image_hint = _vision_direct_image_hint(context, missing_urls)
             data = await _complete_vision_json(
@@ -966,6 +968,8 @@ class VisionAgent:
                 (
                     "请解读群聊图片，输出结构化 JSON。"
                     "不要识别或猜测真实人物身份，不要推断敏感个人信息。"
+                    "每张图都尽量给出两个核心结果：description 写图片内容大致描述，ocr_text 提取图片内可见文字；"
+                    "如果图里没有清晰文字，ocr_text 留空。"
                     "如果是截图，可做简短 OCR；如果是表情包/梗图，可描述梗点。"
                     "长期记忆只记录非隐私、对群聊上下文有帮助的图片观察。"
                     "内容型截图、新闻或网传图片只能记成“群里分享/图片中显示了什么”，"
@@ -1203,6 +1207,12 @@ class VisionAgent:
             fact_candidates=tuple(facts),
             sticker_candidates=tuple(stickers),
             attachment_descriptions=_attachment_descriptions(context, results_by_url),
+            resolved_image_urls=tuple(
+                url
+                for url in image_urls
+                if (result := results_by_url.get(url)) is not None
+                and (result.description or result.ocr_text)
+            ),
         )
 
     def _memory_candidate_from_image(
@@ -1288,7 +1298,7 @@ class VisionAgent:
             if attachment.summary:
                 summary = attachment.summary
             elif attachment.url in selected_urls or (not attachment.url and attachment.file):
-                summary = "收到一张图片，但当前没有可用的视觉解读结果"
+                summary = UNRESOLVED_IMAGE_DESCRIPTION
             attachment_descriptions.append(summary)
             if summary and (not attachment.url or attachment.url in selected_urls):
                 descriptions.append(summary)
@@ -2002,6 +2012,7 @@ class ResponseAgent:
         snapshot: ConversationSnapshot,
         approved_self_memories: list[MemoryCandidate] | None = None,
         self_background_caution: str = "",
+        image_urls: list[str] | None = None,
     ) -> ReplyDraft:
         if decision.action == "observe":
             return ReplyDraft()
@@ -2017,6 +2028,14 @@ class ResponseAgent:
         )
         if self_background_caution:
             background_rule = f"自我背景门禁：{self_background_caution}"
+        image_urls = image_urls or []
+        image_rule = (
+            f"本轮随上下文额外附带了 {len(image_urls)} 张还没有结构化识图结果的图片。"
+            "这些图片就是当前对话上下文的一部分：先看图片内容大意和图中文字，再结合群聊回答。"
+            "如果图片实际不可见或文字看不清，不要编造，直接说明看不准。"
+            if image_urls
+            else ""
+        )
         system_prompt = (
             "你是一个自然参与 QQ 群聊天的拟人角色。"
             "回复要短、口语化、有一点自己的性格，但不要像客服或助手。"
@@ -2037,6 +2056,7 @@ class ResponseAgent:
             "如果你提到自己的身份或经历，只能引用稳定人设、已知 self_memory 或本轮已批准自我记忆。"
             "不要临时新增未批准的具体经历。"
             f"{background_rule}"
+            f"{image_rule}"
         )
         user_prompt = (
             f"昵称：{', '.join(self.config.bot.nicknames)}\n"
@@ -2053,6 +2073,7 @@ class ResponseAgent:
             f"与发言人关系：{_format_relationship(snapshot)}\n"
             f"群复盘：\n{_format_memories(snapshot.group_reflections)}\n"
             f"群内词条：\n{_format_memories(snapshot.group_lexicon)}\n"
+            f"本轮额外附带未解析图片：{len(image_urls)} 张\n"
             f"对方消息：{context.plain_text}\n"
             f"参与决策：{decision.action}，原因：{decision.reason}\n"
             f"主动价值：{decision.value_type}:{decision.value_score:.2f}，聊天密度：{decision.traffic_level}\n"
@@ -2061,7 +2082,9 @@ class ResponseAgent:
             "长度规则：max_reply_chars 只是硬上限，不是目标长度；不要为了接近上限而展开。\n"
             f"请直接给出要发送到群里的中文回复，最多 {self.config.bot.max_reply_chars} 个字。"
         )
-        llm_reply = await self.llm.complete_text(system_prompt, user_prompt, purpose="response")
+        llm_reply = await self._complete_response(system_prompt, user_prompt, image_urls)
+        if image_urls and not llm_reply and decision.action == "reply":
+            return ReplyDraft(text=self._style_reply("这张图我这边还没读出来，先不硬猜", context, decision))
         if llm_reply:
             reply = _sanitize_reply(llm_reply, self.config.bot.max_reply_chars)
             guarded_reply = await self._guard_unapproved_self_claims(
@@ -2111,6 +2134,23 @@ class ResponseAgent:
             value_type=decision.value_type,
             trigger_text=context.plain_text,
         )
+
+    async def _complete_response(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_urls: list[str],
+    ) -> str | None:
+        if image_urls:
+            return await self.llm.complete_multimodal(
+                system_prompt,
+                user_prompt,
+                image_urls,
+                self.config.vision,
+                purpose="response",
+                model_tier="flagship",
+            )
+        return await self.llm.complete_text(system_prompt, user_prompt, purpose="response")
 
     async def _guard_unapproved_self_claims(
         self,
@@ -2690,6 +2730,7 @@ class AgentPipeline:
         web_search: WebSearchClient | None = None,
         vision_cache: VisionCacheStore | None = None,
     ) -> None:
+        self.config = config
         self.perception = PerceptionAgent(llm)
         self.vision = VisionAgent(config, llm, vision_cache)
         self.fact_extractor = FactExtractorAgent(llm)
@@ -2709,8 +2750,10 @@ class AgentPipeline:
         context: MessageContext,
         mode: ParticipationMode,
         snapshot: ConversationSnapshot,
+        *,
+        analyze_images: bool = True,
     ) -> PipelineResult:
-        vision = await self.vision.analyze(context)
+        vision = await self.vision.analyze(context, allow_remote=analyze_images)
         enriched_context = _context_with_vision(context, vision)
         perception = await self.perception.analyze(enriched_context, snapshot)
         facts = await self.fact_extractor.extract(enriched_context, perception, snapshot)
@@ -2747,6 +2790,11 @@ class AgentPipeline:
             self_preparation.fallback_caution
             if self_preparation.requires_background and not self_preparation.background_available
             else "",
+            image_urls=_unresolved_context_image_urls(
+                context,
+                vision,
+                self.config.vision.max_images_per_message,
+            ),
         )
         if reply_draft.text:
             qa_result = await self.final_qa.review(
@@ -2785,7 +2833,7 @@ class AgentPipeline:
             decision=final_decision,
             reply=reply_draft.text,
             reply_self_memories=reply_draft.self_memory_candidates,
-            image_descriptions=list(vision.attachment_descriptions or tuple(vision.descriptions)),
+            image_descriptions=_recordable_image_descriptions(context, vision),
             sticker_candidates=list(vision.sticker_candidates),
             selected_sticker=selected_sticker,
         )
@@ -3429,6 +3477,53 @@ def _context_with_vision(context: MessageContext, vision: VisionAnalysis) -> Mes
     if vision.ocr_text:
         lines.append(f"[图片文字] {vision.ocr_text}")
     return replace(context, plain_text="\n".join(lines))
+
+
+def _unresolved_context_image_urls(
+    context: MessageContext,
+    vision: VisionAnalysis,
+    limit: int,
+) -> list[str]:
+    if not context.attachments:
+        return []
+    resolved_urls = set(vision.resolved_image_urls)
+    urls = [
+        attachment.url
+        for attachment in _select_image_attachments(context.attachments, limit)
+        if attachment.url and attachment.url not in resolved_urls
+    ]
+    return _dedupe_strings(urls)
+
+
+def _recordable_image_descriptions(
+    context: MessageContext,
+    vision: VisionAnalysis,
+) -> list[str]:
+    if not context.attachments:
+        return list(vision.descriptions)
+    resolved_urls = set(vision.resolved_image_urls)
+    attachment_descriptions = list(vision.attachment_descriptions)
+    descriptions: list[str] = []
+    image_index = 0
+    for attachment in context.attachments:
+        if attachment.attachment_type != "image":
+            continue
+        description = (
+            attachment_descriptions[image_index]
+            if image_index < len(attachment_descriptions)
+            else ""
+        )
+        image_index += 1
+        if (
+            attachment.url
+            and attachment.url in resolved_urls
+            and description
+            and description != UNRESOLVED_IMAGE_DESCRIPTION
+        ):
+            descriptions.append(description)
+        else:
+            descriptions.append("")
+    return descriptions
 
 
 def _select_image_attachments(
