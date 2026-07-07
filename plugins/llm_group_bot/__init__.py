@@ -59,7 +59,7 @@ from qq_llm_bot.realtime_merge import (
     split_image_descriptions_by_context,
 )
 from qq_llm_bot.reply_style import settings_from_bot_config, split_reply_bubbles, style_reply_text
-from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
+from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref, sticker_file_refs
 
 __plugin_meta__ = PluginMetadata(
     name="llm-group-bot",
@@ -2193,30 +2193,39 @@ def _reply_send_attempts(
     reply_to_message_id: str | None,
 ) -> list[tuple[Message | str, StickerAssetRecord | None, bool]]:
     reply_to = str(reply_to_message_id or "").strip() or None
-    requested: list[tuple[str | None, StickerAssetRecord | None]] = []
+    sticker_refs = _sticker_file_refs(sticker) if sticker is not None else ()
+    requested: list[tuple[str | None, StickerAssetRecord | None, str]] = []
     if reply_to:
-        requested.append((reply_to, sticker))
         if sticker is not None:
-            requested.append((reply_to, None))
-            requested.append((None, sticker))
-        requested.append((None, None))
+            requested.extend((reply_to, sticker, file_ref) for file_ref in sticker_refs)
+            requested.append((reply_to, None, ""))
+            requested.extend((None, sticker, file_ref) for file_ref in sticker_refs)
+        else:
+            requested.append((reply_to, None, ""))
+        requested.append((None, None, ""))
     else:
-        requested.append((None, sticker))
         if sticker is not None:
-            requested.append((None, None))
+            requested.extend((None, sticker, file_ref) for file_ref in sticker_refs)
+            requested.append((None, None, ""))
+        else:
+            requested.append((None, None, ""))
 
     attempts: list[tuple[Message | str, StickerAssetRecord | None, bool]] = []
-    seen: set[tuple[bool, int | None]] = set()
-    for attempt_reply_to, attempt_sticker in requested:
+    seen: set[tuple[bool, int | None, str]] = set()
+    for attempt_reply_to, attempt_sticker, attempt_file_ref in requested:
         if not reply and attempt_sticker is None:
             continue
-        key = (bool(attempt_reply_to), attempt_sticker.id if attempt_sticker is not None else None)
+        key = (
+            bool(attempt_reply_to),
+            attempt_sticker.id if attempt_sticker is not None else None,
+            attempt_file_ref if attempt_sticker is not None else "",
+        )
         if key in seen:
             continue
         seen.add(key)
         attempts.append(
             (
-                _reply_message(reply, attempt_sticker, attempt_reply_to),
+                _reply_message(reply, attempt_sticker, attempt_reply_to, attempt_file_ref),
                 attempt_sticker,
                 bool(attempt_reply_to),
             )
@@ -2228,9 +2237,11 @@ def _reply_message(
     reply: str,
     sticker: StickerAssetRecord | None,
     reply_to_message_id: str | None = None,
+    file_ref: str = "",
 ) -> Message | str:
     text_message = _reply_text_message(reply)
-    file_ref = _sticker_file_ref(sticker) if sticker is not None else ""
+    if sticker is not None and not file_ref:
+        file_ref = _sticker_file_ref(sticker)
     reply_to = str(reply_to_message_id or "").strip()
     if not file_ref and not reply_to:
         return text_message
@@ -2259,7 +2270,7 @@ def _log_reply_send_failure(
         logger.warning(
             "Group reply send failed for asset #{} ({}) reply_to={}: {}",
             sticker.id,
-            sticker.local_path or sticker.url,
+            sticker.url or sticker.local_path,
             reply_to_message_id if used_reply else "",
             exc,
         )
@@ -2533,6 +2544,10 @@ def _send_error_detail(exc: BaseException) -> str:
 
 def _sticker_file_ref(sticker: StickerAssetRecord) -> str:
     return sticker_file_ref(sticker)
+
+
+def _sticker_file_refs(sticker: StickerAssetRecord) -> tuple[str, ...]:
+    return sticker_file_refs(sticker)
 
 
 def _same_local_path(left: str, right: str) -> bool:

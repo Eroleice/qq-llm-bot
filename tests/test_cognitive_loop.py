@@ -87,7 +87,7 @@ from qq_llm_bot.realtime_merge import (
     merge_realtime_contexts,
     split_image_descriptions_by_context,
 )
-from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref
+from qq_llm_bot.stickers import StickerLocalStore, sticker_file_ref, sticker_file_refs
 from qq_llm_bot.web_search import SearchResult, default_slang_query
 
 
@@ -2939,7 +2939,7 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(active[0].url, "https://example.test/b.jpg")
             self.assertEqual(active[0].hit_count, 2)
 
-    def test_sticker_file_ref_uses_absolute_local_path(self) -> None:
+    def test_sticker_file_refs_prefer_url_with_local_fallbacks(self) -> None:
         with _project_temp_directory() as tmp:
             sticker_path = Path(tmp) / "meme.gif"
             sticker_path.write_bytes(b"fake image")
@@ -2964,10 +2964,17 @@ class MemoryStorageTests(unittest.TestCase):
                 last_seen_at=1,
             )
 
+            refs = sticker_file_refs(asset)
             file_ref = sticker_file_ref(asset)
 
-            self.assertEqual(file_ref, str(sticker_path.resolve()))
-            self.assertFalse(file_ref.startswith("file:"))
+            self.assertEqual(file_ref, "https://example.test/meme.gif")
+            self.assertEqual(refs[0], "https://example.test/meme.gif")
+            self.assertEqual(
+                refs[1],
+                "base64://" + base64.b64encode(b"fake image").decode("ascii"),
+            )
+            self.assertEqual(refs[2], str(sticker_path.resolve()))
+            self.assertFalse(refs[2].startswith("file:"))
 
     def test_dashboard_stickers_include_delete_command(self) -> None:
         with _project_temp_directory() as tmp:

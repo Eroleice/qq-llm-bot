@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,15 +111,41 @@ class StickerLocalStore:
 
 
 def sticker_file_ref(sticker: StickerAssetRecord) -> str:
-    local_path = sticker.local_path.strip()
-    if local_path:
-        try:
-            path = Path(local_path)
-            if path.exists():
-                return str(path.resolve())
-        except OSError as exc:
-            logger.warning("Sticker path resolve failed for {}: {}", local_path, exc)
-    return sticker.url.strip()
+    refs = sticker_file_refs(sticker)
+    return refs[0] if refs else ""
+
+
+def sticker_file_refs(sticker: StickerAssetRecord) -> tuple[str, ...]:
+    refs: list[str] = []
+    _append_ref(refs, sticker.url)
+    base64_ref, local_ref = _local_sticker_refs(sticker.local_path)
+    _append_ref(refs, base64_ref)
+    _append_ref(refs, local_ref)
+    return tuple(refs)
+
+
+def _append_ref(refs: list[str], ref: str) -> None:
+    cleaned = str(ref or "").strip()
+    if cleaned and cleaned not in refs:
+        refs.append(cleaned)
+
+
+def _local_sticker_refs(local_path: str) -> tuple[str, str]:
+    local_path = str(local_path or "").strip()
+    if not local_path:
+        return ("", "")
+    try:
+        path = Path(local_path)
+        if not path.exists() or not path.is_file():
+            return ("", "")
+        resolved_path = str(path.resolve())
+        data = path.read_bytes()
+    except OSError as exc:
+        logger.warning("Sticker path read failed for {}: {}", local_path, exc)
+        return ("", "")
+    if not data:
+        return ("", resolved_path)
+    return ("base64://" + base64.b64encode(data).decode("ascii"), resolved_path)
 
 
 def _image_suffix(content_type: str, url: str) -> str:
