@@ -234,6 +234,12 @@ LIVE_EVENT_LIMITATION_PATTERN = re.compile(
     r"(没有实时|看不到实时|没法实时|不能实时|无法实时|没有最新|不知道当前|不清楚当前|"
     r"按你们刚才|按群里|你们刚才|群里刚才|补一下比分|发下比分|不编|别编)"
 )
+REPLY_HARD_TRIM_BOUNDARY_RE = re.compile(r"[。！？!?；;]")
+REPLY_SOFT_TRIM_BOUNDARY_RE = re.compile(r"[，,、]")
+INCOMPLETE_REPLY_END_RE = re.compile(
+    r"(?:[，,、：:；;\s]+|"
+    r"(?:挺|很|更|先|把|被|在|里|但|不过|然后|而且|因为|所以|如果|虽然|或者|和|跟|与|用|当|靠|像))$"
+)
 TECHNICAL_BACKGROUND_PATTERN = re.compile(
     r"(UE5|Unreal|虚幻|Unity|Godot|Blender|C\+\+|Python|JavaScript|TypeScript|"
     r"React|Vue|Docker|Kubernetes|Linux|Git|SQL|API|LLM|AI|模型|提示词|"
@@ -2077,7 +2083,9 @@ class ResponseAgent:
             f"对方消息：{context.plain_text}\n"
             f"参与决策：{decision.action}，原因：{decision.reason}\n"
             f"主动价值：{decision.value_type}:{decision.value_score:.2f}，聊天密度：{decision.traffic_level}\n"
-            "默认长度：direct_reply 目标 6-25 字，proactive_reply 目标 8-30 字；能一句说清就一句。\n"
+            "默认倾向：优先一句 10-35 字的完整短句；能一句说清就一句。\n"
+            "短回复也必须语义完整，不要为了短而半截停住。\n"
+            "不要以逗号、顿号、冒号、分号，或“挺/很/先/把/在/里/但/不过/然后”等未完成结构结尾。\n"
             "不要为了自然感补废话；不要固定换行；不要用空行；短回复多数不需要句号。\n"
             "长度规则：max_reply_chars 只是硬上限，不是目标长度；不要为了接近上限而展开。\n"
             f"请直接给出要发送到群里的中文回复，最多 {self.config.bot.max_reply_chars} 个字。"
@@ -4483,7 +4491,41 @@ def _sanitize_reply(reply: str, max_chars: int) -> str:
     text = reply.strip()
     text = re.sub(r"^回复[:：]\s*", "", text)
     text = text.replace("作为AI", "").replace("作为一个AI", "")
-    return text[:max_chars].strip()
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return _trim_reply_to_max_chars(text, max_chars)
+
+
+def _trim_reply_to_max_chars(text: str, max_chars: int) -> str:
+    clipped = text[:max_chars].strip()
+    min_reasonable_length = min(12, max(1, max_chars // 3))
+    terminal = _last_boundary_match(clipped, REPLY_HARD_TRIM_BOUNDARY_RE)
+    if terminal is not None and terminal.end() >= min_reasonable_length:
+        return clipped[: terminal.end()].strip()
+
+    soft = _last_boundary_match(clipped, REPLY_SOFT_TRIM_BOUNDARY_RE)
+    if soft is not None and soft.start() >= min_reasonable_length:
+        return _strip_incomplete_reply_tail(clipped[: soft.start()])
+
+    trimmed = _strip_incomplete_reply_tail(clipped)
+    return trimmed or clipped
+
+
+def _last_boundary_match(text: str, pattern: re.Pattern[str]) -> re.Match[str] | None:
+    matches = list(pattern.finditer(text))
+    return matches[-1] if matches else None
+
+
+def _strip_incomplete_reply_tail(text: str) -> str:
+    cleaned = text.strip()
+    while cleaned:
+        next_cleaned = INCOMPLETE_REPLY_END_RE.sub("", cleaned).strip()
+        if next_cleaned == cleaned:
+            break
+        cleaned = next_cleaned
+    return cleaned
 
 
 def _reply_has_incremental_value(reply: str | None, decision: ParticipationDecision) -> bool:

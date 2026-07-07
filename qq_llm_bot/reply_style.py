@@ -10,12 +10,8 @@ NONBREAKABLE_RE = re.compile(
     r"https?://\S+|www\.\S+|\[CQ:[^\]]+\]|@[^\s@()]{1,32}\(QQ:\d{5,20}\)|@?QQ:\d{5,20}",
     re.I,
 )
-EXPLANATION_QUERY_RE = re.compile(
-    r"怎么做|为什么|为啥|方案|解释|步骤|怎么实现|如何实现|怎么弄|怎么改|怎么写|原因|思路|讲讲|展开|细说"
-)
-HIGH_VALUE_TYPES = {"answer", "useful_context", "synthesis"}
 TERMINAL_PERIODS = "。."
-TERMINAL_KEEP = "？?!！~～…"
+CONTINUATION_ENDINGS = "，,、：:；;"
 
 
 @dataclass(frozen=True)
@@ -52,6 +48,7 @@ def style_reply_text(
     has_sticker: bool = False,
     recent_bot_replies: Iterable[str] = (),
 ) -> str:
+    del action, value_type, trigger_text
     reply = _normalize_layout(text or "")
     if not reply or not settings.enabled:
         return reply
@@ -63,20 +60,11 @@ def style_reply_text(
     )
     reply = _normalize_layout(reply)
 
-    allow_long = _allows_long_reply(trigger_text, value_type)
-    target = _target_chars(action, value_type, has_sticker)
-
     if len(reply) <= 60:
         reply = _collapse_lines(reply)
-    elif not allow_long:
-        reply = _compact_to_target(reply, target)
 
-    if has_sticker:
-        reply = _compact_to_target(reply, 20)
-        if _sticker_can_replace_text(reply):
-            return ""
-    elif len(reply) > target and not allow_long:
-        reply = _compact_to_target(reply, target)
+    if has_sticker and _sticker_can_replace_text(reply):
+        return ""
 
     return _strip_short_period(_normalize_layout(reply))
 
@@ -110,7 +98,7 @@ def split_reply_bubbles(text: str | None, settings: ReplyStyleSettings) -> tuple
         for part in parts
         if _restore_nonbreakable(part, tokens).strip()
     ]
-    restored = [part for part in restored if part]
+    restored = _merge_incomplete_bubble_parts([part for part in restored if part])
     if not restored:
         return ()
     if len(restored) <= settings.bubble_max_parts:
@@ -133,40 +121,6 @@ def _collapse_lines(text: str) -> str:
     return " ".join(line.strip() for line in text.splitlines() if line.strip()).strip()
 
 
-def _target_chars(action: str, value_type: str, has_sticker: bool) -> int:
-    if has_sticker:
-        return 20
-    if action == "proactive_reply":
-        return 30
-    if value_type == "direct_reply":
-        return 25
-    return 40
-
-
-def _allows_long_reply(trigger_text: str, value_type: str) -> bool:
-    return value_type in HIGH_VALUE_TYPES or bool(EXPLANATION_QUERY_RE.search(trigger_text or ""))
-
-
-def _compact_to_target(text: str, target: int) -> str:
-    text = _collapse_lines(text)
-    if len(text) <= target:
-        return text
-    clauses = _split_clauses(text)
-    if not clauses:
-        return _hard_cut(text, target)
-
-    selected: list[str] = []
-    for clause in clauses:
-        candidate = "".join([*selected, clause]).strip()
-        if len(candidate) <= target:
-            selected.append(clause)
-            continue
-        if not selected:
-            return _hard_cut(clause, target)
-        break
-    return "".join(selected).strip() or _hard_cut(text, target)
-
-
 def _split_clauses(text: str) -> list[str]:
     clauses = re.findall(r"[^。！？!?；;\n]+[。！？!?；;]?", text)
     result: list[str] = []
@@ -174,21 +128,25 @@ def _split_clauses(text: str) -> list[str]:
         clause = clause.strip()
         if not clause:
             continue
-        if len(clause) <= 34:
-            result.append(clause)
-            continue
-        result.extend(item for item in re.split(r"(?<=[，,、])", clause) if item.strip())
+        result.append(clause)
     return result
 
 
-def _hard_cut(text: str, target: int) -> str:
-    text = text.strip()
-    if len(text) <= target:
-        return text
-    for index in range(min(len(text), target), max(0, target - 10), -1):
-        if text[index - 1] in "，,、；; ":
-            return text[:index].rstrip("，,、；; ")
-    return text[:target].rstrip()
+def _merge_incomplete_bubble_parts(parts: Iterable[str]) -> list[str]:
+    merged: list[str] = []
+    for part in parts:
+        clean = part.strip()
+        if not clean:
+            continue
+        if merged and _looks_like_incomplete_bubble(merged[-1]):
+            merged[-1] = f"{merged[-1]}{clean}"
+            continue
+        merged.append(clean)
+    return merged
+
+
+def _looks_like_incomplete_bubble(text: str) -> bool:
+    return bool(text.strip().endswith(tuple(CONTINUATION_ENDINGS)))
 
 
 def _strip_short_period(text: str) -> str:

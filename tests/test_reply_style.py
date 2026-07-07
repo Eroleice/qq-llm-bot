@@ -38,7 +38,7 @@ def test_disabled_style_keeps_single_reply_shape() -> None:
     assert split_reply_bubbles("懂了。", settings) == ("懂了。",)
 
 
-def test_direct_reply_compacts_when_not_explanation() -> None:
+def test_direct_reply_style_does_not_hard_cut_non_explanation() -> None:
     settings = ReplyStyleSettings()
 
     text = style_reply_text(
@@ -49,15 +49,15 @@ def test_direct_reply_compacts_when_not_explanation() -> None:
         trigger_text="看看你跟我的好感度",
     )
 
-    assert len(text) <= 25
     assert text.startswith("别急别急")
     assert "trust" in text
+    assert "慢慢就涨了" in text
 
 
 def test_explanation_reply_can_split_into_multiple_bubbles() -> None:
     settings = ReplyStyleSettings(bubble_trigger_chars=45, bubble_target_chars=28, bubble_max_parts=3)
     text = style_reply_text(
-        "可以做成画图前置链路：先判断需不需要搜，需要就搜关键词和风格参考，再压成一小段 prompt，最后丢给 image2.0。",
+        "可以做成画图前置链路。先判断需不需要搜，需要就搜关键词和风格参考。再压成一小段 prompt，最后丢给 image2.0。",
         settings,
         action="proactive_reply",
         value_type="useful_context",
@@ -67,11 +67,15 @@ def test_explanation_reply_can_split_into_multiple_bubbles() -> None:
     parts = split_reply_bubbles(text, settings)
 
     assert 2 <= len(parts) <= 3
-    assert "".join(parts).replace(" ", "") == text.rstrip("。").replace(" ", "")
+    joined = "".join(parts).replace(" ", "")
+    assert "画图前置链路" in joined
+    assert "关键词和风格参考" in joined
+    assert "image2.0" in joined
+    assert not any(part.endswith(("，", ",", "、", "：", ":")) for part in parts)
     assert not parts[-1].endswith("。")
 
 
-def test_proactive_reply_compacts_to_short_interjection() -> None:
+def test_proactive_reply_style_keeps_complete_sentence() -> None:
     settings = ReplyStyleSettings()
 
     text = style_reply_text(
@@ -82,7 +86,8 @@ def test_proactive_reply_compacts_to_short_interjection() -> None:
         trigger_text="有啥成名作",
     )
 
-    assert len(text) <= 30
+    assert text.endswith("各聊各的")
+    assert "主语补上" in text
 
 
 def test_emoji_cooldown_removes_recent_emoji_and_extra_emoji() -> None:
@@ -97,14 +102,14 @@ def test_emoji_cooldown_removes_recent_emoji_and_extra_emoji() -> None:
     assert text == "这个可以😼"
 
 
-def test_sticker_reply_gets_short_or_empty_text() -> None:
+def test_sticker_reply_can_replace_reaction_but_does_not_shorten_text() -> None:
     settings = ReplyStyleSettings()
 
     empty_text = style_reply_text("哈哈哈😌", settings, has_sticker=True)
-    short_text = style_reply_text("这个方案真的挺靠谱，可以先这么走。", settings, has_sticker=True)
+    regular_text = style_reply_text("这个方案真的挺靠谱，可以先这么走。", settings, has_sticker=True)
 
     assert empty_text == ""
-    assert len(short_text) <= 20
+    assert regular_text == "这个方案真的挺靠谱，可以先这么走"
 
 
 def test_regular_reply_text_is_not_shortened_for_separate_sticker() -> None:
@@ -130,6 +135,16 @@ def test_split_does_not_break_mentions_urls_or_cq_segments() -> None:
     assert "@QQ:123456789" in joined
     assert "https://example.test/a/b?c=1" in joined
     assert "[CQ:face,id=14]" in joined
+
+
+def test_split_merges_comma_ended_incomplete_bubble() -> None:
+    settings = ReplyStyleSettings(bubble_trigger_chars=12, bubble_target_chars=18, bubble_max_parts=3)
+    text = "主要是三个人脸和手的色温不统一：男的偏灰黄，女的偏粉白，\n宝宝又有点发红"
+
+    parts = split_reply_bubbles(text, settings)
+
+    assert not any(part.endswith(("，", ",", "、", "：", ":")) for part in parts)
+    assert "女的偏粉白，宝宝又有点发红" in parts[-1]
 
 
 def test_reply_style_config_defaults_and_validation(tmp_path: Path) -> None:

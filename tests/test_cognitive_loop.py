@@ -27,6 +27,7 @@ from qq_llm_bot.cognitive_agents import (
     VisionAgent,
     _complete_json,
     _complete_vision_json,
+    _sanitize_reply,
 )
 from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import (
@@ -2334,8 +2335,16 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("共享内容默认信任", system_prompt)
         self.assertIn("实时事件克制", system_prompt)
         self.assertIn("max_reply_chars 只是硬上限，不是目标长度", user_prompt)
-        self.assertIn("direct_reply 目标 6-25 字", user_prompt)
-        self.assertIn("proactive_reply 目标 8-30 字", user_prompt)
+        self.assertIn("优先一句 10-35 字的完整短句", user_prompt)
+        self.assertIn("短回复也必须语义完整", user_prompt)
+        self.assertIn("不要以逗号、顿号、冒号、分号", user_prompt)
+
+    async def test_response_sanitize_trims_hard_cap_at_complete_boundary(self) -> None:
+        text = "5.4mini要是够稳就挺香，先拿它当便宜眼睛用挺不错，不过还得看图文细节。"
+
+        sanitized = _sanitize_reply(text, 25)
+
+        self.assertEqual(sanitized, "5.4mini要是够稳就挺香")
 
     async def test_response_with_unresolved_image_uses_multimodal_call(self) -> None:
         config = replace(test_config(Path("unused.sqlite3")), vision=VisionConfig(enabled=True))
