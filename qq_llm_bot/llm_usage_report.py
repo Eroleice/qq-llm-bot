@@ -10,6 +10,7 @@ LLM_PURPOSE_LABELS = {
     "draw_prompt": "生图提示词整理",
     "fact_extract": "成员事实提取",
     "final_qa": "最终质检",
+    "final_qa_repair": "最终质检修复",
     "followup_gate": "追聊判断",
     "lexicon_detect": "群词识别",
     "lexicon_summarize": "群词总结",

@@ -2209,6 +2209,50 @@ class FinalQAAgent:
         self.config = config
         self.llm = llm
 
+    async def repair(
+        self,
+        context: MessageContext,
+        decision: ParticipationDecision,
+        snapshot: ConversationSnapshot,
+        reply: str | None,
+        qa_result: FinalQAResult,
+    ) -> str | None:
+        cleaned_reply = _sanitize_reply(reply or "", self.config.bot.max_reply_chars)
+        if not cleaned_reply:
+            return None
+
+        text = await self.llm.complete_text(
+            "你是 QQ 群机器人回复修复器。只输出修复后的群聊回复，不要解释。",
+            (
+                "下面这条机器人拟回复被最终 QA 拦截了。请只做必要的轻量修复，"
+                "把它改成更安全、贴合上下文、适合 QQ 群发送的一两句短回复。"
+                "优先修复 QA 指出的问题，不要扩写，不要新增事实、实时信息、政治立场、"
+                "隐私信息、系统设定或未经批准的自我经历。"
+                "如果无法在不改变语义太多的情况下安全回复，请输出空字符串。\n"
+                f"最近群聊：\n{_format_recent_context(snapshot)}\n"
+                f"最近图片：\n{_join_lines(snapshot.recent_image_descriptions)}\n"
+                f"当前触发消息：{context.plain_text}\n"
+                f"参与决策：{decision.action}，原因：{decision.reason}\n"
+                f"主动价值：{decision.value_type}:{decision.value_score:.2f}，聊天密度：{decision.traffic_level}\n"
+                f"原拟回复：{cleaned_reply}\n"
+                f"QA 拦截原因：{qa_result.reason}\n"
+                f"QA 分类：{', '.join(qa_result.categories) or '(none)'}\n"
+                f"QA 置信度：{qa_result.confidence:.2f}\n"
+                f"最多 {self.config.bot.max_reply_chars} 个字。只输出修复后的回复文本。"
+            ),
+            purpose="final_qa_repair",
+        )
+        cleaned = _sanitize_reply(text or "", self.config.bot.max_reply_chars)
+        if not cleaned or cleaned == cleaned_reply:
+            return None
+        return style_reply_text(
+            cleaned,
+            settings_from_bot_config(self.config.bot),
+            action=decision.action,
+            value_type=decision.value_type,
+            trigger_text=context.plain_text,
+        )
+
     async def review(
         self,
         context: MessageContext,
@@ -2819,17 +2863,50 @@ class AgentPipeline:
                 reply_draft.text,
             )
             if not qa_result.allowed:
-                final_qa_blocked_reply = reply_draft.text
-                final_qa_reason = qa_result.reason
-                final_qa_categories = qa_result.categories
-                final_qa_confidence = qa_result.confidence
-                final_decision = replace(
+                blocked_reply = reply_draft.text
+                repaired_reply = await self.final_qa.repair(
+                    enriched_context,
                     final_decision,
-                    action="observe",
-                    reason=f"{final_decision.reason}; final QA blocked reply: {qa_result.reason}",
-                    score=min(final_decision.score, 0.49),
+                    snapshot,
+                    blocked_reply,
+                    qa_result,
                 )
-                reply_draft = ReplyDraft()
+                if repaired_reply:
+                    repair_qa_result = await self.final_qa.review(
+                        enriched_context,
+                        final_decision,
+                        snapshot,
+                        repaired_reply,
+                    )
+                    if repair_qa_result.allowed:
+                        reply_draft = replace(reply_draft, text=repaired_reply)
+                    else:
+                        final_qa_blocked_reply = repaired_reply
+                        final_qa_reason = repair_qa_result.reason
+                        final_qa_categories = repair_qa_result.categories
+                        final_qa_confidence = repair_qa_result.confidence
+                        final_decision = replace(
+                            final_decision,
+                            action="observe",
+                            reason=(
+                                f"{final_decision.reason}; final QA blocked reply: "
+                                f"{qa_result.reason}; repair blocked: {repair_qa_result.reason}"
+                            ),
+                            score=min(final_decision.score, 0.49),
+                        )
+                        reply_draft = ReplyDraft()
+                else:
+                    final_qa_blocked_reply = blocked_reply
+                    final_qa_reason = qa_result.reason
+                    final_qa_categories = qa_result.categories
+                    final_qa_confidence = qa_result.confidence
+                    final_decision = replace(
+                        final_decision,
+                        action="observe",
+                        reason=f"{final_decision.reason}; final QA blocked reply: {qa_result.reason}",
+                        score=min(final_decision.score, 0.49),
+                    )
+                    reply_draft = ReplyDraft()
         if decision.action == "proactive_reply" and not reply_draft.text:
             if final_decision.action != "observe":
                 final_decision = replace(

@@ -849,6 +849,7 @@ class LLMRoutingTests(unittest.TestCase):
         asyncio.run(client.complete_text("s", "u", purpose="draw_prompt"))
         asyncio.run(client.complete_text("s", "u", purpose="response"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa"))
+        asyncio.run(client.complete_text("s", "u", purpose="final_qa_repair"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa", model_tier="flagship"))
 
         self.assertEqual(
@@ -859,6 +860,7 @@ class LLMRoutingTests(unittest.TestCase):
                 ("draw_prompt", "gpt-5.4-mini", 4096),
                 ("response", "gpt-5.5", 4096),
                 ("final_qa", "gpt-5.4-mini", 4096),
+                ("final_qa_repair", "gpt-5.4-mini", 4096),
                 ("final_qa", "gpt-5.5", 4096),
             ],
         )
@@ -2627,6 +2629,89 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.final_qa_categories, ("political_stance",))
         self.assertAlmostEqual(result.final_qa_confidence, 0.94)
         self.assertEqual(result.reply_self_memories, [])
+        self.assertEqual(llm.text_call_purposes.count("final_qa"), 1)
+        self.assertIn("final_qa_repair", llm.text_call_purposes)
+
+    async def test_pipeline_repairs_reply_blocked_by_final_qa(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"is_question":true,"is_self_disclosure":false,"topics":["购物"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
+                '"summary_patch":"","reason":"direct"}',
+                "直接买，别纠结了。",
+                '{"verdict":"block","reason":"误解了预算语境",'
+                '"categories":["context_mismatch"],"confidence":0.9}',
+                "先把预算和需求拆一下，再决定买不买。",
+                '{"verdict":"allow","reason":"修复后贴合上下文","categories":[],"confidence":0.86}',
+            ]
+        )
+        config = test_config(Path("unused.sqlite3"))
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-final-qa-repair-ok",
+            plain_text="可可那我是不是该直接买？",
+            raw_message="可可那我是不是该直接买？",
+            is_direct=True,
+        )
+        snapshot = ConversationSnapshot(
+            recent_messages=["alice: 我预算不太够", "alice: 这个东西有点超预算"]
+        )
+
+        result = await pipeline.run(context, "passive", snapshot)
+
+        self.assertEqual(result.reply, "先把预算和需求拆一下，再决定买不买")
+        self.assertEqual(result.decision.action, "reply")
+        self.assertIsNone(result.final_qa_blocked_reply)
+        self.assertEqual(result.final_qa_reason, "")
+        self.assertEqual(llm.text_call_purposes.count("final_qa"), 2)
+        self.assertIn("final_qa_repair", llm.text_call_purposes)
+
+    async def test_pipeline_suppresses_reply_when_final_qa_repair_is_blocked(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"is_question":true,"is_self_disclosure":false,"topics":["购物"],'
+                '"emotion_hint":"neutral","confidence":0.9}',
+                '{"facts":[]}',
+                '{"closeness":0,"trust":0,"familiarity":1,"tension":0,'
+                '"summary_patch":"","reason":"direct"}',
+                "直接买，别纠结了。",
+                '{"verdict":"block","reason":"误解了预算语境",'
+                '"categories":["context_mismatch"],"confidence":0.9}',
+                "那就先买吧。",
+                '{"verdict":"block","reason":"修复后仍然低价值",'
+                '"categories":["low_value"],"confidence":0.83}',
+            ]
+        )
+        config = test_config(Path("unused.sqlite3"))
+        pipeline = AgentPipeline(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-final-qa-repair-block",
+            plain_text="可可那我是不是该直接买？",
+            raw_message="可可那我是不是该直接买？",
+            is_direct=True,
+        )
+        snapshot = ConversationSnapshot(
+            recent_messages=["alice: 我预算不太够", "alice: 这个东西有点超预算"]
+        )
+
+        result = await pipeline.run(context, "passive", snapshot)
+
+        self.assertIsNone(result.reply)
+        self.assertEqual(result.decision.action, "observe")
+        self.assertIn("final QA blocked reply", result.decision.reason)
+        self.assertIn("repair blocked", result.decision.reason)
+        self.assertEqual(result.final_qa_blocked_reply, "那就先买吧")
+        self.assertEqual(result.final_qa_reason, "修复后仍然低价值")
+        self.assertEqual(result.final_qa_categories, ("low_value",))
+        self.assertAlmostEqual(result.final_qa_confidence, 0.83)
+        self.assertEqual(llm.text_call_purposes.count("final_qa"), 2)
+        self.assertIn("final_qa_repair", llm.text_call_purposes)
 
     async def test_lexicon_learning_creates_group_memory_without_reply_in_silent(self) -> None:
         config = replace(

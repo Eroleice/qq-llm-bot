@@ -17,6 +17,7 @@ BASE_TEXT_PURPOSES = {
     "batch_observation",
     "draw_intent",
     "fact_extract",
+    "final_qa_repair",
     "followup_gate",
     "lexicon_detect",
     "lexicon_summarize",
