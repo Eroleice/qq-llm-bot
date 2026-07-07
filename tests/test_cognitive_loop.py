@@ -2058,13 +2058,12 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.traffic_level, "busy")
         self.assertEqual(decision.value_type, "humor")
 
-    async def test_bot_name_object_mention_is_observed_by_addressing_gate(self) -> None:
+    async def test_bot_name_object_mention_can_reply_when_referring_to_bot(self) -> None:
         config = test_config(Path("unused.sqlite3"))
         llm = FakeLLM(
             [
-                '{"target":"discussing_bot","confidence":0.9,"value_type":"none",'
-                '"reason":"机器人只是被当作讨论对象"}',
-                '{"action":"reply","confidence":0.9,"value_type":"answer","reason":"不应走到续聊"}',
+                '{"target":"discussing_bot","confidence":0.9,"value_type":"direct_reply",'
+                '"reason":"讨论的是本群机器人可可的形象"}',
             ]
         )
         agent = ParticipationPolicyAgent(config, llm)
@@ -2090,6 +2089,38 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         )
 
         decision = await agent.decide(context, perception, "passive", snapshot)
+
+        self.assertEqual(decision.action, "reply")
+        self.assertEqual(decision.value_type, "direct_reply")
+        self.assertIn("addressing gate", decision.reason)
+        self.assertEqual(llm.text_call_purposes, ["addressing_gate"])
+
+    async def test_bot_name_mention_observes_when_llm_says_referent_is_not_bot(self) -> None:
+        config = test_config(Path("unused.sqlite3"))
+        llm = FakeLLM(
+            [
+                '{"target":"other_referent","confidence":0.88,"value_type":"none",'
+                '"reason":"这里的可可是转发记录里的另一个机器人"}',
+            ]
+        )
+        agent = ParticipationPolicyAgent(config, llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-other-coco",
+            plain_text="转发里那个可可想下班",
+            raw_message="转发里那个可可想下班",
+            bot_mentioned=True,
+        )
+        perception = PerceptionResult(
+            is_question=False,
+            is_self_disclosure=False,
+            mentions_bot=True,
+            topics=["转发记录"],
+            confidence=0.82,
+        )
+
+        decision = await agent.decide(context, perception, "passive", ConversationSnapshot())
 
         self.assertEqual(decision.action, "observe")
         self.assertIn("not addressed", decision.reason)

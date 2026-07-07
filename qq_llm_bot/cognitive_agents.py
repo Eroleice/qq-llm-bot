@@ -1536,16 +1536,19 @@ class ParticipationPolicyAgent:
             self.llm,
             "你是 QQ 群机器人发言归属判断器。只输出 JSON，不要解释。",
             (
-                "当前消息提到了机器人昵称，但不确定是不是在对机器人说话。"
-                "请判断发言人是否真的把机器人当作对话对象。"
-                "分类只能是 addressed_to_bot、discussing_bot、ambiguous、not_relevant。"
+                "当前消息提到了机器人昵称。请判断消息里的昵称实际指代是不是本群机器人。"
+                "除非你判断这个名字实际指代的不是本群机器人，否则允许机器人尝试参与。"
+                "分类只能是 addressed_to_bot、discussing_bot、ambiguous、other_referent、not_relevant。"
                 "addressed_to_bot：发言人在请求、询问、邀请、命令或直接回应机器人。"
-                "discussing_bot：机器人只是句子的宾语/话题，例如“可可的形象”、“让可可...”、"
-                "“给可可...”、“和/跟可可...”、“限制可可...”、“你也好可可这口...”。"
-                "ambiguous：上下文不够明确；不确定时选 ambiguous。"
-                "只有 addressed_to_bot 且置信度足够高时才应该回复；其他情况默认观察。"
+                "discussing_bot：机器人是句子的宾语/话题，例如“可可的形象”、“让可可...”、"
+                "“给可可...”、“和/跟可可...”、“限制可可...”、“可可的 trust”。"
+                "ambiguous：上下文不够明确，但不能排除是在说本群机器人。"
+                "other_referent：这个名字明显指向其他群员、别的机器人、角色、作品人物或转发记录中的人。"
+                "not_relevant：只是同名词或无关内容。"
+                "addressed_to_bot、discussing_bot、ambiguous 都可以回复；"
+                "只有 other_referent/not_relevant 才默认观察。"
                 "输出 JSON："
-                '{"target":"addressed_to_bot|discussing_bot|ambiguous|not_relevant",'
+                '{"target":"addressed_to_bot|discussing_bot|ambiguous|other_referent|not_relevant",'
                 '"confidence":0.0,'
                 '"value_type":"answer|direct_reply|clarifying_question|none",'
                 '"reason":"短原因"}\n'
@@ -1575,7 +1578,7 @@ class ParticipationPolicyAgent:
         if value_type == "none":
             value_type = default_value_type
 
-        if target == "addressed_to_bot" and confidence >= 0.62:
+        if target in {"addressed_to_bot", "discussing_bot", "ambiguous"} and confidence >= 0.62:
             return ParticipationDecision(
                 "reply",
                 f"bot name addressing gate: {reason}",
