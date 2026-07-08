@@ -50,6 +50,7 @@ from qq_llm_bot.onebot_messages import (
     strip_forwarded_records,
     strip_quoted_messages,
 )
+from qq_llm_bot.onebot_context import image_attachments_from_message_with_replies
 from qq_llm_bot.realtime_merge import (
     merge_realtime_contexts,
     split_image_descriptions_by_context,
@@ -192,6 +193,35 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(QUOTED_MESSAGE_END, plain_text)
         self.assertTrue(plain_text.endswith("这句怎么回"))
         self.assertEqual(mentions, [])
+
+    async def test_onebot_reply_segment_image_is_collected_as_attachment(self) -> None:
+        message = Message("[CQ:reply,id=reply-1]这句怎么回")
+
+        async def fetch_reply(message_id: str) -> dict[str, object]:
+            self.assertEqual(message_id, "reply-1")
+            return {
+                "sender": {"user_id": 123, "nickname": "Alice"},
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {
+                            "url": "https://example.test/chart.png",
+                            "file": "chart.png",
+                            "summary": "chart",
+                        },
+                    }
+                ],
+            }
+
+        attachments = await image_attachments_from_message_with_replies(
+            message,
+            reply_fetcher=fetch_reply,
+        )
+
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].url, "https://example.test/chart.png")
+        self.assertEqual(attachments[0].file, "chart.png")
+        self.assertEqual(attachments[0].summary, "chart")
 
     def test_strip_forwarded_records_keeps_direct_text_only(self) -> None:
         text = (

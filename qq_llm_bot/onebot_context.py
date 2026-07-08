@@ -8,12 +8,15 @@ from loguru import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
 from qq_llm_bot.directness import looks_like_bot_address, text_mentions_bot_name
-from qq_llm_bot.models import MessageContext
+from qq_llm_bot.models import MessageAttachment, MessageContext
 from qq_llm_bot.onebot_messages import (
+    image_attachments_from_payload,
     image_attachments_from_message,
     render_message_text_and_mentions,
     render_message_text_and_mentions_with_forwards,
+    reply_segment_ids,
 )
+from qq_llm_bot.onebot_message_types import ReplyFetcher
 
 
 async def build_message_context(
@@ -23,11 +26,17 @@ async def build_message_context(
     bot_names: Iterable[str],
 ) -> MessageContext:
     top_level_text, _ = render_message_text_and_mentions(event.message, str(bot.self_id))
+    reply_fetcher = reply_message_fetcher(bot, event)
     plain_text, mentions = await render_message_text_and_mentions_with_forwards(
         event.message,
         str(bot.self_id),
         forward_message_fetcher(bot),
-        reply_fetcher=reply_message_fetcher(bot, event),
+        reply_fetcher=reply_fetcher,
+    )
+    attachments = await image_attachments_from_message_with_replies(
+        event.message,
+        reply_fetcher=reply_fetcher,
+        event=event,
     )
     sender = getattr(event, "sender", None)
     sender_nickname = _sender_field(sender, "nickname")
@@ -46,7 +55,7 @@ async def build_message_context(
         is_direct=_is_direct_message(bot, event, top_level_text, bot_names),
         bot_mentioned=_is_bot_mentioned(bot, event, top_level_text, bot_names),
         timestamp=int(getattr(event, "time", 0) or time.time()),
-        attachments=image_attachments_from_message(event.message),
+        attachments=attachments,
         mentions=mentions,
     )
 
@@ -63,20 +72,61 @@ def forward_message_fetcher(bot: Bot):
 
 
 def reply_message_fetcher(bot: Bot, event: GroupMessageEvent):
+    cache: dict[str, Any] = {}
+
     async def _fetch(message_id: str) -> Any:
+        cache_key = str(message_id)
+        if cache_key in cache:
+            return cache[cache_key]
         event_reply = event_reply_payload(event, message_id)
         if event_reply is not None:
+            cache[cache_key] = event_reply
             return event_reply
         target_message_id = onebot_message_id(message_id)
         if target_message_id is None:
+            cache[cache_key] = None
             return None
         try:
-            return await bot.get_msg(message_id=target_message_id)
+            payload = await bot.get_msg(message_id=target_message_id)
         except Exception as exc:
             logger.warning("Failed to fetch quoted message {}: {}", message_id, exc)
-            return None
+            payload = None
+        cache[cache_key] = payload
+        return payload
 
     return _fetch
+
+
+async def image_attachments_from_message_with_replies(
+    message: Any,
+    *,
+    reply_fetcher: ReplyFetcher | None = None,
+    event: GroupMessageEvent | None = None,
+) -> list[MessageAttachment]:
+    attachments = list(image_attachments_from_message(message))
+    if reply_fetcher is None:
+        return attachments
+
+    reply_ids = reply_segment_ids(message)
+    if reply_ids:
+        for reply_id in reply_ids:
+            payload = await reply_fetcher(reply_id)
+            attachments.extend(image_attachments_from_payload(payload))
+    elif event is not None:
+        attachments.extend(image_attachments_from_payload(event_reply_payload(event, "")))
+    return _dedupe_image_attachments(attachments)
+
+
+def _dedupe_image_attachments(attachments: list[MessageAttachment]) -> list[MessageAttachment]:
+    deduped: list[MessageAttachment] = []
+    seen: set[tuple[str, str, str]] = set()
+    for attachment in attachments:
+        key = (attachment.url, attachment.file, attachment.raw_data)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(attachment)
+    return deduped
 
 
 def event_reply_payload(event: GroupMessageEvent, message_id: str) -> dict[str, Any] | None:
