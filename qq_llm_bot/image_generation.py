@@ -10,6 +10,7 @@ from loguru import logger
 from qq_llm_bot.config import AppConfig
 from qq_llm_bot.llm import GeneratedImage
 from qq_llm_bot.models import MessageContext
+from qq_llm_bot.text_utils import safe_path_part as _safe_path_part
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,7 @@ class GeneratedImageStore:
         )
         digest = hashlib.sha256(image_data).hexdigest()
         suffix = _image_suffix(mime_type)
-        target_dir = self.root / _safe_path_part(context.group_id)
+        target_dir = self.root / _safe_path_part(context.group_id, limit=64)
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / f"{int(time.time())}-{digest[:16]}{suffix}"
         if not target.exists():
@@ -126,7 +127,3 @@ def _mime_type_for_output_format(output_format: str) -> str:
         return "image/webp"
     return "image/png"
 
-
-def _safe_path_part(value: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value))
-    return cleaned[:64] or "unknown"

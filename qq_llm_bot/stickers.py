@@ -11,6 +11,7 @@ from loguru import logger
 
 from qq_llm_bot.config import AppConfig
 from qq_llm_bot.models import MessageContext, StickerAssetRecord, StickerCandidate
+from qq_llm_bot.text_utils import safe_path_part as _safe_path_part
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,3 @@ def _image_suffix(content_type: str, url: str) -> str:
     return ".img"
 
 
-def _safe_path_part(value: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value))
-    return cleaned[:80] or "unknown"

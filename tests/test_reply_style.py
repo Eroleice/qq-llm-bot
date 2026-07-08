@@ -221,23 +221,27 @@ def test_storage_records_bot_reply_parts_and_recent_texts(tmp_path: Path) -> Non
 
 
 def test_plugin_source_keeps_bubble_send_contract() -> None:
-    source = (Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py").read_text(
+    root = Path(__file__).resolve().parents[1]
+    plugin_source = (root / "plugins" / "llm_group_bot" / "__init__.py").read_text(
         encoding="utf-8"
     )
+    source = (root / "plugins" / "llm_group_bot" / "reply_sending.py").read_text(encoding="utf-8")
 
-    assert "allow_bubbles=not bool(conflict_reply)" in source
+    assert "allow_bubbles=not bool(conflict_reply)" in plugin_source
     assert "for index, part in enumerate(parts[:-1])" in source
     assert "last_reply_to = None" in source
     assert "_send_single_reply(last_part, None, last_reply_to" in source
     assert "_send_reply_sticker(sticker, bot=bot, context=context)" in source
     assert "has_sticker=sticker is not None" not in source
-    assert "storage.record_bot_reply_parts" in source
+    assert "storage.record_bot_reply_parts" in plugin_source
 
 
 def test_plugin_sends_sticker_as_separate_no_reply_message() -> None:
-    source = (Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "__init__.py").read_text(
+    source = (
+        Path(__file__).resolve().parents[1] / "plugins" / "llm_group_bot" / "reply_sending.py"
+    ).read_text(
         encoding="utf-8"
     )
 
-    assert 'await _send_single_reply("", sticker, None, bot=bot, context=context)' in source
+    assert 'await self._send_single_reply("", sticker, None, bot=bot, context=context)' in source
     assert '_reply_send_attempts("", sticker, None)' in source

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from typing import Protocol
+
+from qq_llm_bot.json_utils import extract_json_object as _extract_json_object
 
 
 @dataclass(frozen=True)
@@ -80,25 +81,6 @@ class DrawIntentPlanner:
             include_bot_appearance=_as_bool(data.get("include_bot_appearance"), False),
             reference_notes=_clean_draw_request_text(str(data.get("reference_notes", "") or "")),
         )
-
-
-def _extract_json_object(text: str | None) -> dict[str, object] | None:
-    if not text:
-        return None
-    raw = text.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`").strip()
-        if raw.lower().startswith("json"):
-            raw = raw[4:].strip()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start >= 0 and end > start:
-        raw = raw[start : end + 1]
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _safe_bot_mention_role(value: str) -> str:
