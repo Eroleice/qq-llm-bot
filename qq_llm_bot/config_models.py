@@ -159,6 +159,7 @@ class StickerConfig:
     storage_dir: str = "data/stickers"
     min_confidence: float = 0.72
     selection_threshold: float = 0.68
+    send_probability: float = 0.10
     max_context_stickers: int = 24
     download_timeout_seconds: float = 20.0
     max_download_bytes: int = 8 * 1024 * 1024

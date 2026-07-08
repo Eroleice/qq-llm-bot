@@ -134,6 +134,12 @@ def sticker_config(raw: dict[str, Any]) -> StickerConfig:
             0,
             1,
         ),
+        send_probability=_float_in_range(
+            raw.get("send_probability", 0.10),
+            "stickers.send_probability",
+            0,
+            1,
+        ),
         max_context_stickers=_positive_int(
             raw.get("max_context_stickers", 24),
             "stickers.max_context_stickers",

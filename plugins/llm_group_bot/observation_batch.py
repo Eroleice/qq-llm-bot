@@ -147,7 +147,7 @@ class ObservationBatchCoordinator:
             )
         await self.maintenance.update_profiles(
             [fact.subject_user_id for fact in fact_write.accepted],
-            force=bool(fact_write.accepted),
+            force=False,
         )
         return image_descriptions
 
@@ -232,5 +232,5 @@ class ObservationBatchCoordinator:
             )
         await self.maintenance.update_profiles(
             [fact.subject_user_id for fact in fact_write.accepted],
-            force=bool(fact_write.accepted),
+            force=False,
         )

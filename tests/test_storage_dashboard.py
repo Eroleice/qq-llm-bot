@@ -187,6 +187,88 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertIn("observation_batch.should_defer_realtime_pipeline", plugin_source)
         self.assertIn("if context.bot_mentioned:", observation_source)
 
+    def test_group_handler_schedules_slow_maintenance_off_send_path(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        plugin_source = (root / "plugins" / "llm_group_bot" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        observation_source = (
+            root / "plugins" / "llm_group_bot" / "observation_batch.py"
+        ).read_text(encoding="utf-8")
+        module = ast.parse(plugin_source)
+        process_handler = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_group_context"
+        )
+        process_source = ast.get_source_segment(plugin_source, process_handler) or ""
+
+        self.assertNotIn("await _maintenance.update_profiles", process_source)
+        self.assertNotIn("await _maintenance.reflect_group", process_source)
+        self.assertIn("_schedule_post_pipeline_maintenance", process_source)
+        self.assertIn("force=False", plugin_source)
+        self.assertNotIn("force=bool(fact_write.accepted)", plugin_source)
+        self.assertIn("force=False", observation_source)
+        self.assertNotIn("force=bool(fact_write.accepted)", observation_source)
+
+        send_line = first_attribute_call_line(process_handler, "send_group_reply")
+        maintenance_schedule_lines = [
+            node.lineno
+            for node in ast.walk(process_handler)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_schedule_post_pipeline_maintenance"
+        ]
+        self.assertTrue(any(line > send_line for line in maintenance_schedule_lines))
+
+    def test_sticker_selection_runs_after_text_reply_probability_gate(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        plugin_source = (root / "plugins" / "llm_group_bot" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        pipeline_source = (root / "qq_llm_bot" / "cognitive_agents.py").read_text(
+            encoding="utf-8"
+        )
+        config_source = (root / "qq_llm_bot" / "config_media_sections.py").read_text(
+            encoding="utf-8"
+        )
+        plugin_module = ast.parse(plugin_source)
+        pipeline_module = ast.parse(pipeline_source)
+        process_handler = next(
+            node
+            for node in plugin_module.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_group_context"
+        )
+        agent_class = next(
+            node
+            for node in pipeline_module.body
+            if isinstance(node, ast.ClassDef) and node.name == "AgentPipeline"
+        )
+        run_method = next(
+            node
+            for node in agent_class.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "run"
+        )
+        run_source = ast.get_source_segment(pipeline_source, run_method) or ""
+
+        self.assertNotIn("await self.stickers.select", run_source)
+        self.assertIn("async def select_sticker", pipeline_source)
+        self.assertIn("_schedule_post_reply_sticker", plugin_source)
+        self.assertIn("send_was_queued=send_result.queued", plugin_source)
+        self.assertIn("random.random() < probability", plugin_source)
+        self.assertIn('raw.get("send_probability", 0.10)', config_source)
+        self.assertNotIn("result.selected_sticker", plugin_source)
+
+        send_line = first_attribute_call_line(process_handler, "send_group_reply")
+        sticker_schedule_lines = [
+            node.lineno
+            for node in ast.walk(process_handler)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_schedule_post_reply_sticker"
+        ]
+        self.assertTrue(any(line > send_line for line in sticker_schedule_lines))
+
     def test_snapshot_groups_current_speaker_context_for_llm(self) -> None:
         with project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")

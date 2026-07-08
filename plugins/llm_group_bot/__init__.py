@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any, Iterable
@@ -63,6 +64,10 @@ outbound_queue = OutboundGroupSendQueue(
     config.bot,
     on_sticker_sent=_maintenance.record_outbound_sticker_sent,
 )
+_post_pipeline_maintenance_tasks: set[asyncio.Task[None]] = set()
+_post_pipeline_maintenance_lock = asyncio.Lock()
+_post_reply_sticker_tasks: set[asyncio.Task[None]] = set()
+_post_reply_sticker_lock = asyncio.Lock()
 
 if config.dashboard.enabled:
     register_dashboard_routes(
@@ -83,6 +88,8 @@ async def _startup() -> None:
 @driver.on_shutdown
 async def _shutdown() -> None:
     await _realtime_reply.stop_realtime_reply_workers()
+    await _stop_post_reply_stickers()
+    await _stop_post_pipeline_maintenance()
     await outbound_queue.stop_retry_worker()
 
 
@@ -360,16 +367,10 @@ async def _process_group_context(
     fact_write = storage.record_fact_candidates(result.facts)
     memory_write = storage.record_memory_candidates(result.memories)
     _record_image_descriptions(contexts, result.image_descriptions)
-    await _maintenance.record_sticker_candidates(context, result.sticker_candidates)
-    await _maintenance.update_profiles(
-        [fact.subject_user_id for fact in fact_write.accepted],
-        force=bool(fact_write.accepted),
-    )
+    accepted_profile_user_ids = [fact.subject_user_id for fact in fact_write.accepted]
     storage.apply_relationship_delta(context.group_id, context.user_id, result.relationship_delta)
-    await _maintenance.reflect_group(context.group_id)
     conflict_reply = storage.build_conflict_confirmation(memory_write.conflicts, context, mode)
     final_reply = conflict_reply or result.reply
-    selected_sticker = None if conflict_reply else result.selected_sticker
 
     if not final_reply:
         storage.record_decision(context, result.decision, "")
@@ -383,6 +384,11 @@ async def _process_group_context(
                 qa_categories=result.final_qa_categories,
                 qa_confidence=result.final_qa_confidence,
             )
+        _schedule_post_pipeline_maintenance(
+            context,
+            result.sticker_candidates,
+            accepted_profile_user_ids,
+        )
         return False
 
     if conflict_reply:
@@ -403,13 +409,18 @@ async def _process_group_context(
                 qa_categories=qa_result.categories,
                 qa_confidence=qa_result.confidence,
             )
+            _schedule_post_pipeline_maintenance(
+                context,
+                result.sticker_candidates,
+                accepted_profile_user_ids,
+            )
             return False
     else:
         storage.record_memory_candidates(result.reply_self_memories)
 
     send_result = await reply_sender.send_group_reply(
         final_reply,
-        selected_sticker,
+        None,
         context.message_id,
         bot=bot,
         context=context,
@@ -426,6 +437,20 @@ async def _process_group_context(
     if send_result.sticker and not send_result.queued:
         storage.record_sticker_sent(send_result.sticker.id, usage_date=_maintenance.usage_date())
         _maintenance.cleanup_unused_stickers()
+    if not conflict_reply:
+        _schedule_post_reply_sticker(
+            bot,
+            context,
+            result.decision,
+            _sticker_selection_snapshot(snapshot, result),
+            final_reply,
+            send_was_queued=send_result.queued,
+        )
+    _schedule_post_pipeline_maintenance(
+        context,
+        result.sticker_candidates,
+        accepted_profile_user_ids,
+    )
     return True
 
 
@@ -439,6 +464,141 @@ def _record_image_descriptions(
             context.message_id,
             context_descriptions,
         )
+
+
+def _sticker_selection_snapshot(snapshot: Any, result: Any) -> Any:
+    semantic_context = getattr(result, "semantic_context", None)
+    if semantic_context is None:
+        return snapshot
+    return replace(snapshot, semantic_context=semantic_context)
+
+
+def _schedule_post_reply_sticker(
+    bot: Bot,
+    context: MessageContext,
+    decision: Any,
+    snapshot: Any,
+    reply: str,
+    *,
+    send_was_queued: bool,
+) -> None:
+    if not _should_try_post_reply_sticker(snapshot, reply, send_was_queued):
+        return
+    task = asyncio.create_task(
+        _run_post_reply_sticker(bot, context, decision, snapshot, reply)
+    )
+    _post_reply_sticker_tasks.add(task)
+    task.add_done_callback(_post_reply_sticker_tasks.discard)
+
+
+def _should_try_post_reply_sticker(snapshot: Any, reply: str, send_was_queued: bool) -> bool:
+    if send_was_queued:
+        return False
+    if not config.stickers.enabled:
+        return False
+    if not str(reply or "").strip():
+        return False
+    if not getattr(snapshot, "sticker_assets", None):
+        return False
+    probability = max(0.0, min(1.0, float(config.stickers.send_probability)))
+    return probability > 0 and random.random() < probability
+
+
+async def _run_post_reply_sticker(
+    bot: Bot,
+    context: MessageContext,
+    decision: Any,
+    snapshot: Any,
+    reply: str,
+) -> None:
+    try:
+        async with _post_reply_sticker_lock:
+            selected = await pipeline.select_sticker(context, decision, snapshot, reply)
+            if selected is None:
+                return
+            send_result = await reply_sender.send_group_reply(
+                "",
+                selected,
+                None,
+                bot=bot,
+                context=context,
+                decision=decision,
+                allow_bubbles=False,
+            )
+            if send_result.sticker and not send_result.queued:
+                storage.record_sticker_sent(
+                    send_result.sticker.id,
+                    usage_date=_maintenance.usage_date(),
+                )
+                _maintenance.cleanup_unused_stickers()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - sticker flourish must not affect chat handling
+        logger.exception(
+            "Post-reply sticker failed for group {} message {}: {}",
+            context.group_id,
+            context.message_id,
+            exc,
+        )
+
+
+async def _stop_post_reply_stickers() -> None:
+    tasks = tuple(_post_reply_sticker_tasks)
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _post_reply_sticker_tasks.clear()
+
+
+def _schedule_post_pipeline_maintenance(
+    context: MessageContext,
+    sticker_candidates: list[Any],
+    profile_user_ids: list[str],
+) -> None:
+    if not sticker_candidates and not profile_user_ids and not config.reflection.enabled:
+        return
+    task = asyncio.create_task(
+        _run_post_pipeline_maintenance(
+            context,
+            tuple(sticker_candidates),
+            tuple(profile_user_ids),
+        )
+    )
+    _post_pipeline_maintenance_tasks.add(task)
+    task.add_done_callback(_post_pipeline_maintenance_tasks.discard)
+
+
+async def _run_post_pipeline_maintenance(
+    context: MessageContext,
+    sticker_candidates: tuple[Any, ...],
+    profile_user_ids: tuple[str, ...],
+) -> None:
+    try:
+        async with _post_pipeline_maintenance_lock:
+            await _maintenance.record_sticker_candidates(context, list(sticker_candidates))
+            await _maintenance.update_profiles(list(profile_user_ids), force=False)
+            await _maintenance.reflect_group(context.group_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - maintenance must not affect chat handling
+        logger.exception(
+            "Post-pipeline maintenance failed for group {} message {}: {}",
+            context.group_id,
+            context.message_id,
+            exc,
+        )
+
+
+async def _stop_post_pipeline_maintenance() -> None:
+    tasks = tuple(_post_pipeline_maintenance_tasks)
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _post_pipeline_maintenance_tasks.clear()
 
 
 _realtime_reply.configure(

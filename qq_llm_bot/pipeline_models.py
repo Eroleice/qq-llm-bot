@@ -92,6 +92,7 @@ class PipelineResult:
     image_descriptions: list[str] = field(default_factory=list)
     sticker_candidates: list[StickerCandidate] = field(default_factory=list)
     selected_sticker: StickerAssetRecord | None = None
+    semantic_context: SemanticContext | None = None
     final_qa_blocked_reply: str | None = None
     final_qa_reason: str = ""
     final_qa_categories: tuple[str, ...] = ()

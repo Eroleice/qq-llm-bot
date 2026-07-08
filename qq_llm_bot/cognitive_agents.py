@@ -71,6 +71,7 @@ from qq_llm_bot.models import (
     ParticipationDecision,
     PipelineResult,
     ReplyDraft,
+    StickerAssetRecord,
     UserProfileDraft,
     UserProfileRecord,
 )
@@ -234,12 +235,6 @@ class AgentPipeline:
                     reason=f"{decision.reason}; proactive reply suppressed by value guard",
                     score=min(decision.score, 0.49),
                 )
-        selected_sticker = await self.stickers.select(
-            enriched_context,
-            final_decision,
-            response_snapshot,
-            reply_draft.text,
-        )
         return PipelineResult(
             perception=perception,
             memories=[*lexicon_memories, *vision.memory_candidates],
@@ -250,7 +245,7 @@ class AgentPipeline:
             reply_self_memories=reply_draft.self_memory_candidates,
             image_descriptions=_recordable_image_descriptions(context, vision),
             sticker_candidates=list(vision.sticker_candidates),
-            selected_sticker=selected_sticker,
+            semantic_context=semantic_context if _semantic_context_has_content(semantic_context) else None,
             final_qa_blocked_reply=final_qa_blocked_reply,
             final_qa_reason=final_qa_reason,
             final_qa_categories=final_qa_categories,
@@ -281,6 +276,15 @@ class AgentPipeline:
         reply: str | None,
     ) -> FinalQAResult:
         return await self.final_qa.review(context, decision, snapshot, reply)
+
+    async def select_sticker(
+        self,
+        context: MessageContext,
+        decision: ParticipationDecision,
+        snapshot: ConversationSnapshot,
+        reply: str | None,
+    ) -> StickerAssetRecord | None:
+        return await self.stickers.select(context, decision, snapshot, reply)
 
     async def observe_vision(self, context: MessageContext) -> VisionAnalysis:
         return await self.vision.analyze(context)

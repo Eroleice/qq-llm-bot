@@ -133,6 +133,7 @@ enabled = false
 storage_dir = "data/stickers"
 min_confidence = 0.72
 selection_threshold = 0.68
+send_probability = 0.10
 max_context_stickers = 24
 download_timeout_seconds = 20.0
 max_download_bytes = 8388608
