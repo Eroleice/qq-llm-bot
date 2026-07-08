@@ -247,7 +247,11 @@ class VisionAgent:
                 memory=result.memory,
                 confidence=result.confidence,
                 importance=result.importance,
-                model=self.config.vision.model or self.config.llm.model,
+                model=(
+                    self.config.llm.routing.detailed_vision_model
+                    or self.config.llm.routing.simple_vision_model
+                    or self.config.llm.model
+                ),
             )
         except Exception as exc:  # pragma: no cover - cache must never break replies
             logger.warning("Image vision cache write failed for {}: {}", result.url, exc)

@@ -5,6 +5,7 @@ from typing import Any
 from qq_llm_bot.config_models import (
     DashboardConfig,
     LLMConfig,
+    LLMProviderConfig,
     LLMRoutingConfig,
     StorageConfig,
 )
@@ -33,10 +34,18 @@ def storage_config(raw: dict[str, Any]) -> StorageConfig:
     )
 
 
-def llm_config(raw: dict[str, Any], routing_raw: dict[str, Any]) -> LLMConfig:
+def llm_config(
+    raw: dict[str, Any],
+    routing_raw: dict[str, Any],
+    providers: dict[str, LLMProviderConfig] | None = None,
+) -> LLMConfig:
+    chat_generation_model = str(routing_raw.get("chat_generation_model", "")).strip()
+    clean_provider = str(raw.get("provider", "")).strip()
+    if not clean_provider:
+        clean_provider = "provider-json" if providers and chat_generation_model else "disabled"
     return LLMConfig(
-        provider=str(raw.get("provider", "disabled")).strip() or "disabled",
-        model=str(raw.get("model", "")).strip(),
+        provider=clean_provider,
+        model=chat_generation_model,
         base_url=str(raw.get("base_url", "")).strip(),
         api_key=str(raw.get("api_key", "")).strip(),
         api_key_env=str(raw.get("api_key_env", "OPENAI_API_KEY")).strip() or "OPENAI_API_KEY",
@@ -50,8 +59,14 @@ def llm_config(raw: dict[str, Any], routing_raw: dict[str, Any]) -> LLMConfig:
         ),
         routing=LLMRoutingConfig(
             enabled=_bool_value(routing_raw.get("enabled", False)),
-            base_model=str(routing_raw.get("base_model", "")).strip(),
-            flagship_model=str(routing_raw.get("flagship_model", "")).strip(),
-            vision_base_model=str(routing_raw.get("vision_base_model", "")).strip(),
+            chat_preprocess_model=str(routing_raw.get("chat_preprocess_model", "")).strip(),
+            chat_generation_model=chat_generation_model,
+            qa_model=str(routing_raw.get("qa_model", "")).strip(),
+            fact_extraction_model=str(routing_raw.get("fact_extraction_model", "")).strip(),
+            cognition_model=str(routing_raw.get("cognition_model", "")).strip(),
+            simple_vision_model=str(routing_raw.get("simple_vision_model", "")).strip(),
+            detailed_vision_model=str(routing_raw.get("detailed_vision_model", "")).strip(),
+            image_generation_model=str(routing_raw.get("image_generation_model", "")).strip(),
         ),
+        providers=dict(providers or {}),
     )

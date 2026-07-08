@@ -5,6 +5,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +14,7 @@ from qq_llm_bot.cognitive_agents import _complete_json, _complete_vision_json
 from qq_llm_bot.config import (
     ImageGenerationConfig,
     LLMConfig,
+    LLMProviderConfig,
     LLMRoutingConfig,
     VisionConfig,
     load_config,
@@ -25,8 +27,10 @@ from qq_llm_bot.llm import (
     OpenAICompatibleLLMClient,
     _image_generation_input,
     extract_generated_image,
+    is_llm_configured,
     normalize_responses_url,
 )
+from qq_llm_bot.llm_config_helpers import resolve_model_config
 from qq_llm_bot.models import MessageAttachment, MessageContext
 from qq_llm_bot.web_search import default_slang_query
 from tests.helpers import FakeLLM, RetryCapableFakeLLM, project_temp_directory, test_config
@@ -195,9 +199,10 @@ class ImageGenerationTests(unittest.TestCase):
         client = OpenAICompatibleLLMClient(
             LLMConfig(
                 provider="openai-compatible",
-                model="gpt-image-test",
+                model="gpt-5.5",
                 base_url="https://example.test/v1",
                 api_key="test-key",
+                routing=LLMRoutingConfig(image_generation_model="gpt-image-test"),
             )
         )
         calls = 0
@@ -218,9 +223,7 @@ class ImageGenerationTests(unittest.TestCase):
 
         client._post_image_generation_response = fake_post_image_generation_response  # type: ignore[method-assign]
 
-        image = asyncio.run(
-            client.generate_image("cat", ImageGenerationConfig(model="gpt-image-test"))
-        )
+        image = asyncio.run(client.generate_image("cat", ImageGenerationConfig()))
 
         self.assertIsNotNone(image)
         self.assertEqual(image.data, b"fake-png")  # type: ignore[union-attr]
@@ -255,9 +258,10 @@ class ImageGenerationTests(unittest.TestCase):
         client = OpenAICompatibleLLMClient(
             LLMConfig(
                 provider="openai-compatible",
-                model="gpt-image-test",
+                model="gpt-5.5",
                 base_url="https://example.test/v1",
                 api_key="test-key",
+                routing=LLMRoutingConfig(image_generation_model="gpt-image-test"),
             )
         )
         captured_payload: dict = {}
@@ -274,7 +278,7 @@ class ImageGenerationTests(unittest.TestCase):
         image = asyncio.run(
             client.generate_image(
                 "cat",
-                ImageGenerationConfig(model="gpt-image-test"),
+                ImageGenerationConfig(),
                 image_urls=["data:image/png;base64,ZmFrZQ=="],
             )
         )
@@ -523,7 +527,7 @@ class ImageGenerationTests(unittest.TestCase):
 
 
 class LLMRoutingTests(unittest.TestCase):
-    def test_llm_routing_config_is_loaded_from_nested_table(self) -> None:
+    def test_provider_json_models_are_loaded_and_selected_by_prefix(self) -> None:
         with project_temp_directory() as tmp:
             config_path = Path(tmp) / "config.toml"
             config_path.write_text(
@@ -533,15 +537,383 @@ class LLMRoutingTests(unittest.TestCase):
                         'ws_url = "ws://example.test"',
                         "",
                         "[llm]",
-                        'provider = "openai-compatible"',
-                        'model = "gpt-5.5"',
-                        'base_url = "https://example.test/v1"',
                         "",
-                        "[llm.routing]",
+                        "[llm.router]",
                         "enabled = true",
-                        'base_model = "gpt-5.4-mini"',
-                        'flagship_model = "gpt-5.5"',
-                        'vision_base_model = "gpt-5.4-mini"',
+                        'chat_preprocess_model = "pro:gpt-5.4-mini"',
+                        'chat_generation_model = "pro:gpt-5.5"',
+                        'qa_model = "pro:gpt-5.5"',
+                        'fact_extraction_model = "pro:gpt-5.4-mini"',
+                        'cognition_model = "pro:gpt-5.4-mini"',
+                        'simple_vision_model = "pro:gpt-5.4-mini"',
+                        'detailed_vision_model = "pro:gpt-5.5"',
+                        'image_generation_model = "pro:gpt-image-test"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (Path(tmp) / "provider.json").write_text(
+                json.dumps(
+                    {
+                        "providers": [
+                            {
+                                "id": "pro",
+                                "url": "https://example.test/v1",
+                                "type": "openai",
+                                "key_env": "TEST_PROVIDER_API_KEY",
+                                "model": ["gpt-5.5", "gpt-5.4-mini", "gpt-image-test"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_key = os.environ.get("TEST_PROVIDER_API_KEY")
+            os.environ["TEST_PROVIDER_API_KEY"] = "test-key"
+            try:
+                config = load_config(config_path)
+                self.assertEqual(config.llm.provider, "provider-json")
+                self.assertIn("pro", config.llm.providers)
+                self.assertTrue(is_llm_configured(config.llm))
+                self.assertEqual(config.llm.model, "pro:gpt-5.5")
+                self.assertEqual(config.llm.routing.chat_generation_model, "pro:gpt-5.5")
+                self.assertEqual(config.llm.routing.image_generation_model, "pro:gpt-image-test")
+                resolved = resolve_model_config(
+                    config.llm,
+                    config.llm.routing.chat_preprocess_model,
+                    require_openai_compatible=True,
+                )
+            finally:
+                if old_key is None:
+                    os.environ.pop("TEST_PROVIDER_API_KEY", None)
+                else:
+                    os.environ["TEST_PROVIDER_API_KEY"] = old_key
+
+            self.assertEqual(resolved.provider_id, "pro")
+            self.assertEqual(resolved.model, "gpt-5.4-mini")
+            self.assertEqual(resolved.base_url, "https://example.test/v1")
+
+    def test_openai_client_strips_provider_prefix_before_http_request(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="provider-json",
+                model="pro:gpt-5.5",
+                providers={
+                    "pro": LLMProviderConfig(
+                        id="pro",
+                        url="https://example.test/v1",
+                        type="openai",
+                        key_string="test-key",
+                        models=["gpt-5.5"],
+                    )
+                },
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+
+        class FakeAsyncClient:
+            def __init__(self, timeout: float) -> None:
+                captured["timeout"] = timeout
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def post(
+                self,
+                url: str,
+                headers: dict[str, str],
+                json: dict[str, object],
+            ) -> FakeResponse:
+                captured["url"] = url
+                captured["headers"] = headers
+                captured["json"] = json
+                return FakeResponse()
+
+        from qq_llm_bot import llm_transport
+
+        original_client = llm_transport.httpx.AsyncClient
+        llm_transport.httpx.AsyncClient = FakeAsyncClient  # type: ignore[assignment]
+        try:
+            reply = asyncio.run(client.complete_text("s", "u", purpose="response"))
+        finally:
+            llm_transport.httpx.AsyncClient = original_client  # type: ignore[assignment]
+
+        self.assertEqual(reply, "ok")
+        self.assertEqual(captured["url"], "https://example.test/v1/chat/completions")
+        self.assertEqual(captured["json"]["model"], "gpt-5.5")  # type: ignore[index]
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer test-key")  # type: ignore[index]
+
+    def test_gemini_provider_uses_generate_content_transport(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="provider-json",
+                model="gem:gemini-2.5-flash",
+                routing=LLMRoutingConfig(
+                    image_generation_model="gem:gemini-2.5-flash",
+                ),
+                providers={
+                    "gem": LLMProviderConfig(
+                        id="gem",
+                        url="https://generativelanguage.googleapis.com/v1beta",
+                        type="gemini",
+                        key_string="test-key",
+                        models=["gemini-2.5-flash"],
+                    )
+                },
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 2,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 3,
+                    },
+                }
+
+        class FakeAsyncClient:
+            def __init__(self, timeout: float) -> None:
+                captured["timeout"] = timeout
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def post(
+                self,
+                url: str,
+                headers: dict[str, str],
+                json: dict[str, object],
+            ) -> FakeResponse:
+                captured["url"] = url
+                captured["headers"] = headers
+                captured["json"] = json
+                return FakeResponse()
+
+        from qq_llm_bot import llm_transport
+
+        original_client = llm_transport.httpx.AsyncClient
+        llm_transport.httpx.AsyncClient = FakeAsyncClient  # type: ignore[assignment]
+        try:
+            reply = asyncio.run(client.complete_text("system", "hello", purpose="response"))
+        finally:
+            llm_transport.httpx.AsyncClient = original_client  # type: ignore[assignment]
+
+        self.assertEqual(reply, "ok")
+        self.assertEqual(
+            captured["url"],
+            "https://generativelanguage.googleapis.com/v1beta/"
+            "models/gemini-2.5-flash:generateContent",
+        )
+        self.assertEqual(captured["headers"]["x-goog-api-key"], "test-key")  # type: ignore[index]
+        body = captured["json"]
+        self.assertEqual(body["systemInstruction"]["parts"], [{"text": "system"}])  # type: ignore[index]
+        self.assertEqual(body["contents"][0]["parts"], [{"text": "hello"}])  # type: ignore[index]
+        self.assertEqual(body["generationConfig"]["maxOutputTokens"], 4096)  # type: ignore[index]
+
+    def test_gemini_vision_converts_data_url_to_inline_data(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="provider-json",
+                model="gem:gemini-2.5-flash",
+                routing=LLMRoutingConfig(
+                    image_generation_model="gem:gemini-2.5-flash",
+                ),
+                providers={
+                    "gem": LLMProviderConfig(
+                        id="gem",
+                        url="https://example.test/v1beta",
+                        type="gemini",
+                        key_string="test-key",
+                        models=["gemini-2.5-flash"],
+                    )
+                },
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+
+        class FakeAsyncClient:
+            def __init__(self, timeout: float) -> None:
+                captured["timeout"] = timeout
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def post(
+                self,
+                url: str,
+                headers: dict[str, str],
+                json: dict[str, object],
+            ) -> FakeResponse:
+                captured["json"] = json
+                return FakeResponse()
+
+        from qq_llm_bot import llm_transport
+
+        original_client = llm_transport.httpx.AsyncClient
+        llm_transport.httpx.AsyncClient = FakeAsyncClient  # type: ignore[assignment]
+        try:
+            reply = asyncio.run(
+                client.complete_vision(
+                    "system",
+                    "look",
+                    ["data:image/png;base64,ZmFrZQ=="],
+                    VisionConfig(),
+                )
+            )
+        finally:
+            llm_transport.httpx.AsyncClient = original_client  # type: ignore[assignment]
+
+        self.assertEqual(reply, "{}")
+        parts = captured["json"]["contents"][0]["parts"]  # type: ignore[index]
+        self.assertEqual(parts[0], {"text": "look"})
+        self.assertEqual(
+            parts[1],
+            {"inlineData": {"mimeType": "image/png", "data": "ZmFrZQ=="}},
+        )
+
+    def test_gemini_image_generation_reads_inline_data_result(self) -> None:
+        client = OpenAICompatibleLLMClient(
+            LLMConfig(
+                provider="provider-json",
+                model="gem:gemini-2.5-flash",
+                routing=LLMRoutingConfig(
+                    image_generation_model="gem:gemini-2.5-flash",
+                ),
+                providers={
+                    "gem": LLMProviderConfig(
+                        id="gem",
+                        url="https://example.test/v1beta",
+                        type="gemini",
+                        key_string="test-key",
+                        models=["gemini-2.5-flash"],
+                    )
+                },
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/png",
+                                            "data": base64.b64encode(b"fake-png").decode("ascii"),
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+
+        class FakeAsyncClient:
+            def __init__(self, timeout: float) -> None:
+                captured["timeout"] = timeout
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def post(
+                self,
+                url: str,
+                headers: dict[str, str],
+                json: dict[str, object],
+            ) -> FakeResponse:
+                captured["json"] = json
+                return FakeResponse()
+
+        from qq_llm_bot import llm_transport
+
+        original_client = llm_transport.httpx.AsyncClient
+        llm_transport.httpx.AsyncClient = FakeAsyncClient  # type: ignore[assignment]
+        try:
+            image = asyncio.run(
+                client.generate_image(
+                    "cat",
+                    ImageGenerationConfig(size="1024x512"),
+                )
+            )
+        finally:
+            llm_transport.httpx.AsyncClient = original_client  # type: ignore[assignment]
+
+        self.assertIsNotNone(image)
+        self.assertEqual(image.data, b"fake-png")  # type: ignore[union-attr]
+        self.assertEqual(
+            captured["json"]["generationConfig"]["responseModalities"],  # type: ignore[index]
+            ["TEXT", "IMAGE"],
+        )
+        self.assertEqual(
+            captured["json"]["generationConfig"]["imageConfig"],  # type: ignore[index]
+            {"aspectRatio": "2:1"},
+        )
+
+    def test_llm_router_config_is_loaded_from_nested_table(self) -> None:
+        with project_temp_directory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "[napcat]",
+                        'ws_url = "ws://example.test"',
+                        "",
+                        "[llm]",
+                        "provider = \"openai-compatible\"",
+                        "base_url = \"https://example.test/v1\"",
+                        "",
+                        "[llm.router]",
+                        "enabled = true",
+                        'chat_preprocess_model = "gpt-5.4-mini"',
+                        'chat_generation_model = "gpt-5.5"',
+                        'qa_model = "gpt-5.5-qa"',
+                        'fact_extraction_model = "gpt-5.4-fact"',
+                        'cognition_model = "gpt-5.4-cognition"',
+                        'simple_vision_model = "gpt-5.4-vision"',
+                        'detailed_vision_model = "gpt-5.5-vision"',
+                        'image_generation_model = "gpt-image-test"',
                     ]
                 ),
                 encoding="utf-8",
@@ -550,9 +922,15 @@ class LLMRoutingTests(unittest.TestCase):
             config = load_config(config_path)
 
             self.assertTrue(config.llm.routing.enabled)
-            self.assertEqual(config.llm.routing.base_model, "gpt-5.4-mini")
-            self.assertEqual(config.llm.routing.flagship_model, "gpt-5.5")
-            self.assertEqual(config.llm.routing.vision_base_model, "gpt-5.4-mini")
+            self.assertEqual(config.llm.model, "gpt-5.5")
+            self.assertEqual(config.llm.routing.chat_preprocess_model, "gpt-5.4-mini")
+            self.assertEqual(config.llm.routing.chat_generation_model, "gpt-5.5")
+            self.assertEqual(config.llm.routing.qa_model, "gpt-5.5-qa")
+            self.assertEqual(config.llm.routing.fact_extraction_model, "gpt-5.4-fact")
+            self.assertEqual(config.llm.routing.cognition_model, "gpt-5.4-cognition")
+            self.assertEqual(config.llm.routing.simple_vision_model, "gpt-5.4-vision")
+            self.assertEqual(config.llm.routing.detailed_vision_model, "gpt-5.5-vision")
+            self.assertEqual(config.llm.routing.image_generation_model, "gpt-image-test")
 
     def test_openai_client_routes_text_purposes_to_expected_models(self) -> None:
         client = OpenAICompatibleLLMClient(
@@ -563,9 +941,11 @@ class LLMRoutingTests(unittest.TestCase):
                 api_key="test-key",
                 routing=LLMRoutingConfig(
                     enabled=True,
-                    base_model="gpt-5.4-mini",
-                    flagship_model="gpt-5.5",
-                    vision_base_model="gpt-5.4-mini",
+                    chat_preprocess_model="gpt-5.4-mini",
+                    chat_generation_model="gpt-5.5",
+                    qa_model="gpt-5.5-qa",
+                    fact_extraction_model="gpt-5.4-fact",
+                    cognition_model="gpt-5.4-cognition",
                 ),
             )
         )
@@ -588,7 +968,10 @@ class LLMRoutingTests(unittest.TestCase):
         asyncio.run(client.complete_text("s", "u", purpose="response"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa_repair"))
+        asyncio.run(client.complete_text("s", "u", purpose="fact_extract"))
+        asyncio.run(client.complete_text("s", "u", purpose="profile_aggregate"))
         asyncio.run(client.complete_text("s", "u", purpose="final_qa", model_tier="flagship"))
+        asyncio.run(client.complete_text("s", "u", purpose="draw_prompt", model_tier="flagship"))
 
         self.assertEqual(
             captured,
@@ -597,13 +980,16 @@ class LLMRoutingTests(unittest.TestCase):
                 ("draw_intent", "gpt-5.4-mini", 4096),
                 ("draw_prompt", "gpt-5.4-mini", 4096),
                 ("response", "gpt-5.5", 4096),
-                ("final_qa", "gpt-5.4-mini", 4096),
-                ("final_qa_repair", "gpt-5.4-mini", 4096),
-                ("final_qa", "gpt-5.5", 4096),
+                ("final_qa", "gpt-5.5-qa", 4096),
+                ("final_qa_repair", "gpt-5.5-qa", 4096),
+                ("fact_extract", "gpt-5.4-fact", 4096),
+                ("profile_aggregate", "gpt-5.4-cognition", 4096),
+                ("final_qa", "gpt-5.5-qa", 4096),
+                ("draw_prompt", "gpt-5.5", 4096),
             ],
         )
 
-    def test_openai_client_routes_vision_to_base_and_flagship_models(self) -> None:
+    def test_openai_client_routes_vision_to_simple_and_detailed_models(self) -> None:
         client = OpenAICompatibleLLMClient(
             LLMConfig(
                 provider="openai-compatible",
@@ -612,9 +998,9 @@ class LLMRoutingTests(unittest.TestCase):
                 api_key="test-key",
                 routing=LLMRoutingConfig(
                     enabled=True,
-                    base_model="gpt-5.4-mini",
-                    flagship_model="gpt-5.5",
-                    vision_base_model="gpt-5.4-mini",
+                    chat_generation_model="gpt-5.5",
+                    simple_vision_model="gpt-5.4-vision",
+                    detailed_vision_model="gpt-5.5-vision",
                 ),
             )
         )
@@ -636,7 +1022,7 @@ class LLMRoutingTests(unittest.TestCase):
                 "s",
                 "u",
                 ["https://example.test/a.png"],
-                VisionConfig(model="gpt-5.5"),
+                VisionConfig(),
             )
         )
         asyncio.run(
@@ -644,12 +1030,12 @@ class LLMRoutingTests(unittest.TestCase):
                 "s",
                 "u",
                 ["https://example.test/a.png"],
-                VisionConfig(model="gpt-5.5"),
+                VisionConfig(),
                 model_tier="flagship",
             )
         )
 
-        self.assertEqual(captured, ["gpt-5.4-mini", "gpt-5.5"])
+        self.assertEqual(captured, ["gpt-5.4-vision", "gpt-5.5-vision"])
 
     def test_structured_json_retries_once_with_flagship_on_parse_failure(self) -> None:
         llm = RetryCapableFakeLLM(["not json", '{"facts":[]}'])

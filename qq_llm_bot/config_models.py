@@ -128,7 +128,6 @@ class DashboardConfig:
 @dataclass(frozen=True)
 class VisionConfig:
     enabled: bool = False
-    model: str = ""
     max_images_per_message: int = 3
     detail: str = "low"
     timeout_seconds: float = 45.0
@@ -138,7 +137,6 @@ class VisionConfig:
 @dataclass(frozen=True)
 class ImageGenerationConfig:
     enabled: bool = False
-    model: str = ""
     storage_dir: str = "data/generated_images"
     size: str = "512x512"
     quality: str = "low"
@@ -177,9 +175,24 @@ class StorageConfig:
 @dataclass(frozen=True)
 class LLMRoutingConfig:
     enabled: bool = False
-    base_model: str = ""
-    flagship_model: str = ""
-    vision_base_model: str = ""
+    chat_preprocess_model: str = ""
+    chat_generation_model: str = ""
+    qa_model: str = ""
+    fact_extraction_model: str = ""
+    cognition_model: str = ""
+    simple_vision_model: str = ""
+    detailed_vision_model: str = ""
+    image_generation_model: str = ""
+
+
+@dataclass(frozen=True)
+class LLMProviderConfig:
+    id: str
+    url: str
+    type: str = "openai"
+    key_string: str = ""
+    key_env: str = ""
+    models: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -193,6 +206,7 @@ class LLMConfig:
     max_tokens: int = 4096
     timeout_seconds: float = 30.0
     routing: LLMRoutingConfig = field(default_factory=LLMRoutingConfig)
+    providers: dict[str, LLMProviderConfig] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

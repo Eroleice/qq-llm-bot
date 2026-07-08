@@ -16,7 +16,6 @@ from qq_llm_bot.text_utils import safe_choice as _safe_choice
 def vision_config(raw: dict[str, Any]) -> VisionConfig:
     return VisionConfig(
         enabled=_bool_value(raw.get("enabled", False)),
-        model=str(raw.get("model", "")).strip(),
         max_images_per_message=_positive_int(
             raw.get("max_images_per_message", 3),
             "vision.max_images_per_message",
@@ -44,7 +43,6 @@ def vision_config(raw: dict[str, Any]) -> VisionConfig:
 def image_generation_config(raw: dict[str, Any]) -> ImageGenerationConfig:
     return ImageGenerationConfig(
         enabled=_bool_value(raw.get("enabled", False)),
-        model=str(raw.get("model", "")).strip(),
         storage_dir=str(raw.get("storage_dir", "data/generated_images")).strip()
         or "data/generated_images",
         size=_image_generation_size(

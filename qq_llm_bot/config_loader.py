@@ -28,6 +28,7 @@ from qq_llm_bot.config_values import (
     section as _section,
     string_list as _string_list,
 )
+from qq_llm_bot.provider_config import load_provider_config
 
 try:
     import tomllib
@@ -56,7 +57,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     stickers_raw = _section(raw, "stickers")
     storage_raw = _section(raw, "storage")
     llm_raw = _section(raw, "llm")
-    llm_routing_raw = _section(llm_raw, "routing")
+    llm_routing_raw = _section(llm_raw, "router")
 
     mode = str(bot_raw.get("default_group_mode", "passive")).strip().lower()
     if mode not in {"silent", "passive", "active"}:
@@ -68,6 +69,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
 
     project_root = config_path.parent
     load_dotenv(project_root / ".env")
+    providers = load_provider_config(project_root)
     nicknames = _string_list(bot_raw.get("nicknames", ["小祈"]))
     bot = bot_config(
         bot_raw,
@@ -125,7 +127,11 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         image_generation=image_generation_config(image_generation_raw),
         stickers=sticker_config(stickers_raw),
         storage=storage_config(storage_raw),
-        llm=llm_config(llm_raw, llm_routing_raw),
+        llm=llm_config(
+            llm_raw,
+            llm_routing_raw,
+            providers,
+        ),
         config_path=config_path,
         project_root=project_root,
     )

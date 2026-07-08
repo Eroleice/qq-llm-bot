@@ -21,6 +21,7 @@ data/
 config.toml
 config.local.toml
 *.local.toml
+provider.json
 *.egg-info/
 build/
 dist/

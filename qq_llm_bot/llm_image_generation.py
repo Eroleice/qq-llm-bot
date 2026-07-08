@@ -16,17 +16,24 @@ class LLMImageGenerationMixin:
     ) -> GeneratedImage | None:
         self.last_image_generation_error = ""
         self._last_image_generation_failure_kind = ""
-        missing = self._missing_config_items()
+        clean_prompt = prompt.strip()
+        if not clean_prompt:
+            self.last_image_generation_error = "empty prompt"
+            return None
+
+        image_model = self.config.routing.image_generation_model.strip()
+        if not image_model:
+            self.last_image_generation_error = "missing: llm.router.image_generation_model"
+            logger.warning("LLM image generation requires llm.router.image_generation_model")
+            return None
+
+        missing = self._missing_config_items(image_model)
         if missing:
             self.last_image_generation_error = "missing: " + ", ".join(missing)
             logger.warning(
                 "LLM image generation is not configured; missing: {}",
                 ", ".join(missing),
             )
-            return None
-        clean_prompt = prompt.strip()
-        if not clean_prompt:
-            self.last_image_generation_error = "empty prompt"
             return None
 
         tool: dict[str, object] = {"type": "image_generation"}
@@ -38,11 +45,6 @@ class LLMImageGenerationMixin:
             tool["output_format"] = image_config.output_format
         if image_config.output_compression:
             tool["output_compression"] = image_config.output_compression
-        image_model = image_config.model.strip()
-        if not image_model:
-            self.last_image_generation_error = "missing: image_generation.model"
-            logger.warning("LLM image generation requires explicit image_generation.model")
-            return None
 
         payload = {
             "model": image_model,

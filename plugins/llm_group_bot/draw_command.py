@@ -89,8 +89,8 @@ async def handle_draw_command(
     if not is_llm_configured(config.llm):
         await _finish_command("生图模型未配置，请检查 provider/base_url/model/key。")
 
-    if not config.image_generation.model.strip():
-        await _finish_command("image_generation.model is required for #draw.")
+    if not config.llm.routing.image_generation_model.strip():
+        await _finish_command("llm.router.image_generation_model is required for #draw.")
 
     prompt = args.extract_plain_text().strip()
     if not prompt:

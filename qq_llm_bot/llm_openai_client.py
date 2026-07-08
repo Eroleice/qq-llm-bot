@@ -3,7 +3,7 @@ from __future__ import annotations
 from loguru import logger
 
 from qq_llm_bot.config import LLMConfig, VisionConfig
-from qq_llm_bot.llm_config_helpers import resolve_api_key
+from qq_llm_bot.llm_config_helpers import resolve_api_key, resolve_model_config
 from qq_llm_bot.llm_image_generation import LLMImageGenerationMixin
 from qq_llm_bot.llm_models import LLMUsageRecorder
 from qq_llm_bot.llm_response_helpers import normalize_chat_completions_url, normalize_responses_url
@@ -38,12 +38,12 @@ class OpenAICompatibleLLMClient(LLMImageGenerationMixin, LLMRoutingMixin, LLMTra
         purpose: str = "",
         model_tier: str = "",
     ) -> str | None:
-        missing = self._missing_config_items()
+        model = self._text_model_for_purpose(purpose or "text", model_tier)
+        missing = self._missing_config_items(model)
         if missing:
             logger.warning("LLM is not configured; missing: {}", ", ".join(missing))
             return None
 
-        model = self._text_model_for_purpose(purpose or "text", model_tier)
         payload = {
             "model": model,
             "messages": [
@@ -69,7 +69,8 @@ class OpenAICompatibleLLMClient(LLMImageGenerationMixin, LLMRoutingMixin, LLMTra
         purpose: str = "vision",
         model_tier: str = "",
     ) -> str | None:
-        missing = self._missing_config_items()
+        model = self._vision_model_for_tier(vision_config, model_tier)
+        missing = self._missing_config_items(model)
         if missing:
             logger.warning("LLM vision is not configured; missing: {}", ", ".join(missing))
             return None
@@ -88,7 +89,6 @@ class OpenAICompatibleLLMClient(LLMImageGenerationMixin, LLMRoutingMixin, LLMTra
             }
             for url in clean_urls[: vision_config.max_images_per_message]
         )
-        model = self._vision_model_for_tier(vision_config, model_tier)
         payload = {
             "model": model,
             "messages": [
@@ -110,9 +110,16 @@ class OpenAICompatibleLLMClient(LLMImageGenerationMixin, LLMRoutingMixin, LLMTra
             and self._should_retry_vision_failure_with_flagship(model, vision_config)
         ):
             payload["model"] = self._vision_model_for_tier(vision_config, "flagship")
+            missing = self._missing_config_items(str(payload["model"]))
+            if missing:
+                logger.warning(
+                    "LLM flagship vision retry is not configured; missing: {}",
+                    ", ".join(missing),
+                )
+                return None
             logger.info(
-                "Retrying LLM vision with flagship model after base-model failure: "
-                "purpose={} base_model={} flagship_model={}",
+                "Retrying LLM vision with detailed model after simple-model failure: "
+                "purpose={} simple_model={} detailed_model={}",
                 purpose or "vision",
                 model,
                 payload["model"],
@@ -134,13 +141,18 @@ class OpenAICompatibleLLMClient(LLMImageGenerationMixin, LLMRoutingMixin, LLMTra
         purpose: str = "response",
         model_tier: str = "",
     ) -> str | None:
-        missing = self._missing_config_items()
-        if missing:
-            logger.warning("LLM multimodal response is not configured; missing: {}", ", ".join(missing))
-            return None
         clean_urls = [url.strip() for url in image_urls if url.strip()]
         if not clean_urls:
             return await self.complete_text(system_prompt, user_prompt, purpose, model_tier)
+
+        model = self._vision_model_for_tier(
+            vision_config,
+            model_tier or ("flagship" if (purpose or "").strip().lower() == "response" else ""),
+        )
+        missing = self._missing_config_items(model)
+        if missing:
+            logger.warning("LLM multimodal response is not configured; missing: {}", ", ".join(missing))
+            return None
 
         content = [{"type": "text", "text": user_prompt}]
         content.extend(
@@ -152,10 +164,6 @@ class OpenAICompatibleLLMClient(LLMImageGenerationMixin, LLMRoutingMixin, LLMTra
                 },
             }
             for url in clean_urls[: vision_config.max_images_per_message]
-        )
-        model = self._vision_model_for_tier(
-            vision_config,
-            model_tier or ("flagship" if (purpose or "").strip().lower() == "response" else ""),
         )
         payload = {
             "model": model,
@@ -173,12 +181,27 @@ class OpenAICompatibleLLMClient(LLMImageGenerationMixin, LLMRoutingMixin, LLMTra
             len(system_prompt) + len(user_prompt),
         )
 
-    def _missing_config_items(self) -> list[str]:
+    def _missing_config_items(self, model_ref: str = "") -> list[str]:
         missing = []
-        if not self.config.model:
-            missing.append("llm.model")
-        if not self.config.base_url:
-            missing.append("llm.base_url")
-        if not self.api_key:
-            missing.append(f"{self.config.api_key_env}/llm.api_key")
+        clean_model = (model_ref or self.config.model).strip()
+        if not clean_model:
+            missing.append("llm.router.chat_generation_model")
+            return missing
+        try:
+            resolved = resolve_model_config(
+                self.config,
+                clean_model,
+                require_supported_transport=True,
+            )
+        except ValueError as exc:
+            return [str(exc)]
+        if not resolved.base_url:
+            missing.append(f"provider.{resolved.provider_id}.url" if resolved.provider_id else "llm.base_url")
+        if not resolved.api_key:
+            if resolved.provider_id and resolved.api_key_env:
+                missing.append(f"{resolved.api_key_env}/provider.{resolved.provider_id}.key_env")
+            elif resolved.api_key_env:
+                missing.append(f"{resolved.api_key_env}/llm.api_key")
+            else:
+                missing.append("llm.api_key")
         return missing

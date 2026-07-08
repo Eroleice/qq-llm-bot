@@ -40,9 +40,9 @@ def build_llm_client(
     provider = config.provider.lower().replace("_", "-")
     if provider == "disabled":
         return DisabledLLMClient()
-    if provider in {"openai-compatible", "openai"}:
+    if provider in {"openai-compatible", "openai", "gemini", "provider-json", "registry"}:
         return OpenAICompatibleLLMClient(config, usage_recorder=usage_recorder)
     raise ValueError(
         f"Unsupported llm.provider={config.provider!r}. "
-        "Supported providers: disabled, openai-compatible."
+        "Supported providers: disabled, openai-compatible, gemini, provider-json."
     )
