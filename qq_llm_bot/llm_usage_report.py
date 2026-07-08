@@ -112,7 +112,11 @@ def _purpose_label(purpose: str) -> str:
 
 
 def _model_label(model: str) -> str:
-    return model.strip() or "未指定模型"
+    clean_model = model.strip()
+    if not clean_model:
+        return "未指定模型"
+    _, separator, model_name = clean_model.partition(":")
+    return model_name if separator else clean_model
 
 
 def _format_integer(value: int) -> str:
