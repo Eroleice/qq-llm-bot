@@ -25,16 +25,17 @@ async def build_message_context(
     *,
     bot_names: Iterable[str],
 ) -> MessageContext:
-    top_level_text, _ = render_message_text_and_mentions(event.message, str(bot.self_id))
+    source_message = _source_message(event)
+    top_level_text, _ = render_message_text_and_mentions(source_message, str(bot.self_id))
     reply_fetcher = reply_message_fetcher(bot, event)
     plain_text, mentions = await render_message_text_and_mentions_with_forwards(
-        event.message,
+        source_message,
         str(bot.self_id),
         forward_message_fetcher(bot),
         reply_fetcher=reply_fetcher,
     )
     attachments = await image_attachments_from_message_with_replies(
-        event.message,
+        source_message,
         reply_fetcher=reply_fetcher,
         event=event,
     )
@@ -48,7 +49,7 @@ async def build_message_context(
         user_id=str(event.user_id),
         message_id=str(event.message_id),
         plain_text=plain_text,
-        raw_message=str(event.message),
+        raw_message=_raw_message(event, source_message),
         sender_name=sender_name,
         sender_nickname=sender_nickname,
         sender_role=sender_role,
@@ -58,6 +59,23 @@ async def build_message_context(
         attachments=attachments,
         mentions=mentions,
     )
+
+
+def _source_message(event: GroupMessageEvent) -> Any:
+    return getattr(event, "original_message", None) or event.message
+
+
+def _raw_message(event: GroupMessageEvent, source_message: Any) -> str:
+    raw_message = getattr(event, "raw_message", None)
+    if raw_message is not None and str(raw_message) != "":
+        return str(raw_message)
+    return str(source_message)
+
+
+def _adapter_marked_to_me_without_original(event: GroupMessageEvent) -> bool:
+    if getattr(event, "original_message", None) is not None:
+        return False
+    return bool(getattr(event, "to_me", False))
 
 
 def forward_message_fetcher(bot: Bot):
@@ -175,7 +193,9 @@ def _is_direct_message(
         return True
     if _is_reply_to_bot(bot, event):
         return True
-    return looks_like_bot_address(plain_text, bot_names)
+    return looks_like_bot_address(plain_text, bot_names) or _adapter_marked_to_me_without_original(
+        event
+    )
 
 
 def _is_bot_mentioned(
@@ -188,11 +208,12 @@ def _is_bot_mentioned(
         _has_explicit_bot_at(bot, event)
         or _is_reply_to_bot(bot, event)
         or text_mentions_bot_name(plain_text, bot_names)
+        or _adapter_marked_to_me_without_original(event)
     )
 
 
 def _has_explicit_bot_at(bot: Bot, event: GroupMessageEvent) -> bool:
-    for segment in event.message:
+    for segment in _source_message(event):
         if segment.type == "at" and str(segment.data.get("qq")) == str(bot.self_id):
             return True
     return False

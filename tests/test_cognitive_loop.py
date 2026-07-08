@@ -50,7 +50,10 @@ from qq_llm_bot.onebot_messages import (
     strip_forwarded_records,
     strip_quoted_messages,
 )
-from qq_llm_bot.onebot_context import image_attachments_from_message_with_replies
+from qq_llm_bot.onebot_context import (
+    build_message_context,
+    image_attachments_from_message_with_replies,
+)
 from qq_llm_bot.realtime_merge import (
     merge_realtime_contexts,
     split_image_descriptions_by_context,
@@ -65,6 +68,65 @@ from tests.helpers import (
 
 
 class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_context_preserves_nickname_stripped_by_adapter(self) -> None:
+        original_text = "\u53ef\u53ef\u4f60\u8d77\u5e8a\u4e86\u4e48"
+        stripped_text = "\u4f60\u8d77\u5e8a\u4e86\u4e48"
+
+        class FakeBot:
+            self_id = "999"
+
+        class FakeEvent:
+            group_id = "100"
+            user_id = "42"
+            message_id = "m1"
+            time = 123
+            original_message = Message(original_text)
+            message = Message(stripped_text)
+            raw_message = original_text
+            sender = {"nickname": "Alice", "card": "", "role": "member"}
+            to_me = True
+            reply = None
+
+        context = await build_message_context(
+            FakeBot(),
+            FakeEvent(),
+            bot_names=("\u53ef\u53ef",),
+        )
+
+        self.assertEqual(context.plain_text, original_text)
+        self.assertEqual(context.raw_message, original_text)
+        self.assertTrue(context.is_direct)
+        self.assertTrue(context.bot_mentioned)
+
+    async def test_build_context_uses_strict_directness_when_original_message_exists(self) -> None:
+        original_text = "\u53ef\u53ef\u7684\u5f62\u8c61\u662f\u56fa\u5b9a\u7684"
+        stripped_text = "\u7684\u5f62\u8c61\u662f\u56fa\u5b9a\u7684"
+
+        class FakeBot:
+            self_id = "999"
+
+        class FakeEvent:
+            group_id = "100"
+            user_id = "42"
+            message_id = "m1"
+            time = 123
+            original_message = Message(original_text)
+            message = Message(stripped_text)
+            raw_message = original_text
+            sender = {"nickname": "Alice", "card": "", "role": "member"}
+            to_me = True
+            reply = None
+
+        context = await build_message_context(
+            FakeBot(),
+            FakeEvent(),
+            bot_names=("\u53ef\u53ef",),
+        )
+
+        self.assertEqual(context.plain_text, original_text)
+        self.assertFalse(context.is_direct)
+        self.assertTrue(context.bot_mentioned)
+
     def test_realtime_merge_context_uses_latest_message_and_combines_context(self) -> None:
         first = MessageContext(
             group_id="100",
