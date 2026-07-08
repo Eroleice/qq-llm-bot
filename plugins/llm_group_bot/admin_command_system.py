@@ -36,7 +36,7 @@ async def handle_stickers(rest: list[str], group_id: str) -> None:
 async def handle_llm(bot: Bot, event: GroupMessageEvent, rest: list[str]) -> None:
     action = rest[0].lower() if rest else "status"
     if action == "status":
-        routing = _state.config._state.llm.routing
+        routing = _state.config.llm.routing
         await _state.finish_command(
             _state.admin_cmd,
             "LLM 模型路由：\n"
@@ -69,4 +69,8 @@ async def handle_token_usage() -> None:
 
 
 def _model_display(model: str) -> str:
-    return model.strip() or "未配置"
+    clean_model = model.strip()
+    if not clean_model:
+        return "未配置"
+    _, separator, model_name = clean_model.partition(":")
+    return model_name if separator else clean_model
