@@ -23,7 +23,7 @@ from qq_llm_bot.cognitive_storage import BotStorage
 from qq_llm_bot.config import ParticipationMode, load_config
 from qq_llm_bot.dashboard import register_dashboard_routes
 from qq_llm_bot.llm import build_llm_client
-from qq_llm_bot.models import MessageContext
+from qq_llm_bot.models import MessageContext, ParticipationDecision
 from qq_llm_bot.onebot_context import build_message_context
 from qq_llm_bot.outbound_queue import (
     OutboundGroupSendQueue,
@@ -34,6 +34,7 @@ from plugins.llm_group_bot.reply_sending import (
     reply_record_text as _reply_record_text,
 )
 from qq_llm_bot.realtime_merge import split_image_descriptions_by_context
+from qq_llm_bot.repetition_guard import GroupTextRepeatGuard
 from qq_llm_bot.stickers import StickerLocalStore
 
 __plugin_meta__ = PluginMetadata(
@@ -68,6 +69,7 @@ _post_pipeline_maintenance_tasks: set[asyncio.Task[None]] = set()
 _post_pipeline_maintenance_lock = asyncio.Lock()
 _post_reply_sticker_tasks: set[asyncio.Task[None]] = set()
 _post_reply_sticker_lock = asyncio.Lock()
+repeat_guard = GroupTextRepeatGuard()
 
 if config.dashboard.enabled:
     register_dashboard_routes(
@@ -324,11 +326,23 @@ async def _handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     storage.record_message(context)
     if storage.is_user_ignored(context.user_id):
         return
+    mode = storage.get_group_mode(group_id, config.bot.default_group_mode)
+    if repeat_guard.is_repeat(context):
+        storage.record_decision(
+            context,
+            ParticipationDecision(
+                "observe",
+                "repeat text already handled recently in group",
+                mode,
+                0.0,
+            ),
+            "",
+        )
+        return
     _maintenance.cleanup_unused_stickers()
     observation_batch.register_pending_vision(context)
     observation_batch.ensure_deferred_vision_task(context)
 
-    mode = storage.get_group_mode(group_id, config.bot.default_group_mode)
     if await _realtime_reply.maybe_enqueue_realtime_reply(bot, context, mode):
         return
 

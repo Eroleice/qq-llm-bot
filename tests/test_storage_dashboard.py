@@ -127,6 +127,7 @@ class MemoryStorageTests(unittest.TestCase):
 
         record_line = first_attribute_call_line(handler, "record_message")
         ignore_line = first_attribute_call_line(handler, "is_user_ignored")
+        repeat_line = first_attribute_call_line(handler, "is_repeat")
         register_pending_line = first_attribute_call_line(handler, "register_pending_vision")
         realtime_enqueue_line = first_attribute_call_line(handler, "maybe_enqueue_realtime_reply")
         defer_check_line = first_attribute_call_line(handler, "should_defer_realtime_pipeline")
@@ -149,7 +150,8 @@ class MemoryStorageTests(unittest.TestCase):
         image_summary_line = first_attribute_call_line(deferred_vision_handler, "update_image_descriptions")
 
         self.assertLess(record_line, ignore_line)
-        self.assertLess(ignore_line, register_pending_line)
+        self.assertLess(ignore_line, repeat_line)
+        self.assertLess(repeat_line, register_pending_line)
         self.assertLess(register_pending_line, realtime_enqueue_line)
         self.assertLess(realtime_enqueue_line, defer_check_line)
         self.assertLess(defer_check_line, defer_line)
