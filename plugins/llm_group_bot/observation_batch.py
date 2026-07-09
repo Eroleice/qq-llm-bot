@@ -10,6 +10,7 @@ from loguru import logger
 from plugins.llm_group_bot import deferred_vision as _deferred_vision
 from qq_llm_bot.config import ParticipationMode
 from qq_llm_bot.models import MessageContext, ParticipationDecision, RelationDelta
+from qq_llm_bot.observation_batching import select_observation_batch_size
 
 
 class ObservationBatchCoordinator:
@@ -200,7 +201,12 @@ class ObservationBatchCoordinator:
         if not force and not due_by_size and not due_by_time:
             return
     
-        batch_size = min(len(buffer), self.config.observation_batch.max_messages_per_batch)
+        batch_size = select_observation_batch_size(
+            buffer,
+            batch_size=self.config.observation_batch.batch_size,
+            max_messages_per_batch=self.config.observation_batch.max_messages_per_batch,
+            max_interval_seconds=self.config.observation_batch.max_interval_seconds,
+        )
         batch = list(buffer[:batch_size])
         try:
             result = await self.pipeline.observe_batch(

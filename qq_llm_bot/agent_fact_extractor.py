@@ -65,6 +65,8 @@ class FactExtractorAgent:
                 "只记录成员的观点、偏好、身份、稳定倾向或对事件/对象的评价。"
                 "不要记录聊天动作、继续聊、分享、发送图片、空消息、一次性情绪或流水账。"
                 "如果主语、对象/话题、结论、证据任一不明确，facts 返回空数组。"
+                "最近上下文只用于理解当前消息里的指代和话题延续，不能从最近上下文本身抽取新 FACT。"
+                "每条 FACT 的 evidence_text 必须是当前消息里的原文片段；如果证据只出现在最近上下文，返回空数组。"
                 "本人发言里的自我观点用 self_report；别人转述某成员用 third_party。"
                 "输出 JSON："
                 '{"facts":[{"subject_user_id":"QQ或name:称呼","fact_type":"preference|dislike|'
@@ -112,6 +114,8 @@ class FactExtractorAgent:
         topic = _clean_fact_text(str(item.get("topic", "")), 120)
         evidence_text = _clean_fact_text(str(item.get("evidence_text", "")), 1000)
         if not subject_user_id or not claim_text or not topic or not evidence_text:
+            return None
+        if not _evidence_is_from_current_message(context, evidence_text):
             return None
         if _looks_low_value_fact_text(claim_text, topic, evidence_text):
             return None
@@ -210,3 +214,23 @@ class FactExtractorAgent:
                 )
             )
         return _dedupe_fact_candidates(facts)
+
+
+def _evidence_is_from_current_message(context: MessageContext, evidence_text: str) -> bool:
+    evidence = _canonical_evidence_text(evidence_text)
+    source = _canonical_evidence_text(
+        "\n".join(part for part in (context.plain_text, context.raw_message) if part)
+    )
+    if not evidence or not source:
+        return False
+    if evidence in source:
+        return True
+    return len(source) >= 8 and source in evidence
+
+
+def _canonical_evidence_text(value: str) -> str:
+    return re.sub(
+        r"[\s，。,.!！?？：:；;\"'“”‘’（）()\[\]【】<>《》]+",
+        "",
+        str(value or "").strip().lower(),
+    )

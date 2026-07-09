@@ -54,6 +54,7 @@ from qq_llm_bot.onebot_context import (
     build_message_context,
     image_attachments_from_message_with_replies,
 )
+from qq_llm_bot.observation_batching import select_observation_batch_size
 from qq_llm_bot.realtime_merge import (
     merge_realtime_contexts,
     split_image_descriptions_by_context,
@@ -184,6 +185,38 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
                 ("m2", ["second image"]),
             ],
         )
+
+    def test_observation_batch_prefers_natural_pause_near_limit(self) -> None:
+        contexts = [
+            MessageContext("100", "42", "m1", "first", "first", timestamp=1),
+            MessageContext("100", "42", "m2", "second", "second", timestamp=2),
+            MessageContext("100", "7", "m3", "third", "third", timestamp=3),
+            MessageContext("100", "8", "m4", "after pause", "after pause", timestamp=300),
+            MessageContext("100", "8", "m5", "next", "next", timestamp=301),
+            MessageContext("100", "9", "m6", "more", "more", timestamp=302),
+            MessageContext("100", "9", "m7", "tail", "tail", timestamp=303),
+        ]
+
+        size = select_observation_batch_size(
+            contexts,
+            batch_size=4,
+            max_messages_per_batch=6,
+            max_interval_seconds=600,
+        )
+        continuous_size = select_observation_batch_size(
+            [replace(context, timestamp=index) for index, context in enumerate(contexts, start=1)],
+            batch_size=4,
+            max_messages_per_batch=6,
+            max_interval_seconds=600,
+        )
+
+        self.assertEqual(size, 3)
+        self.assertEqual([context.message_id for context in contexts[:size]], ["m1", "m2", "m3"])
+        self.assertEqual(
+            [context.message_id for context in contexts[size:]],
+            ["m4", "m5", "m6", "m7"],
+        )
+        self.assertEqual(continuous_size, 6)
 
     def test_onebot_at_segment_is_rendered_with_qq_id(self) -> None:
         message = Message("[CQ:at,qq=123,name=Alice] 叫小明")
@@ -637,6 +670,32 @@ class CognitiveLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(facts[0].subject_user_id, "42")
         self.assertEqual(facts[0].topic, "刮刮乐活动")
         self.assertIn("负期望彩票", facts[0].claim_text)
+
+    async def test_fact_extractor_rejects_fact_from_recent_context_only(self) -> None:
+        llm = FakeLLM(
+            [
+                '{"facts":[{"subject_user_id":"42","fact_type":"preference",'
+                '"claim_text":"用户42喜欢 Rust","topic":"Rust","stance":"positive",'
+                '"confidence":0.9,"claim_scope":"self_report","evidence_text":"我喜欢 Rust"}]}'
+            ]
+        )
+        agent = FactExtractorAgent(llm)
+        context = MessageContext(
+            group_id="100",
+            user_id="42",
+            message_id="m-context-only",
+            plain_text="可可你怎么看这个话题？",
+            raw_message="可可你怎么看这个话题？",
+        )
+
+        facts = await agent.extract(
+            context,
+            PerceptionResult(True, False, True),
+            ConversationSnapshot(recent_messages=["Alice: 我喜欢 Rust"]),
+        )
+
+        self.assertEqual(facts, [])
+        self.assertIn("最近上下文只用于理解当前消息", llm.text_calls[0][1])
 
     async def test_fact_extractor_rejects_low_value_chat_action(self) -> None:
         llm = FakeLLM(
