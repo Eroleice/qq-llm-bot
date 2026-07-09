@@ -119,9 +119,8 @@ def sticker_file_ref(sticker: StickerAssetRecord) -> str:
 def sticker_file_refs(sticker: StickerAssetRecord) -> tuple[str, ...]:
     refs: list[str] = []
     _append_ref(refs, sticker.url)
-    base64_ref, local_ref = _local_sticker_refs(sticker.local_path)
+    base64_ref = _local_sticker_base64_ref(sticker.local_path)
     _append_ref(refs, base64_ref)
-    _append_ref(refs, local_ref)
     return tuple(refs)
 
 
@@ -131,22 +130,21 @@ def _append_ref(refs: list[str], ref: str) -> None:
         refs.append(cleaned)
 
 
-def _local_sticker_refs(local_path: str) -> tuple[str, str]:
+def _local_sticker_base64_ref(local_path: str) -> str:
     local_path = str(local_path or "").strip()
     if not local_path:
-        return ("", "")
+        return ""
     try:
         path = Path(local_path)
         if not path.exists() or not path.is_file():
-            return ("", "")
-        resolved_path = str(path.resolve())
+            return ""
         data = path.read_bytes()
     except OSError as exc:
         logger.warning("Sticker path read failed for {}: {}", local_path, exc)
-        return ("", "")
+        return ""
     if not data:
-        return ("", resolved_path)
-    return ("base64://" + base64.b64encode(data).decode("ascii"), resolved_path)
+        return ""
+    return "base64://" + base64.b64encode(data).decode("ascii")
 
 
 def _image_suffix(content_type: str, url: str) -> str:

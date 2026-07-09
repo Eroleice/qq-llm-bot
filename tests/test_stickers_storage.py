@@ -112,7 +112,7 @@ class StickerStorageTests(unittest.TestCase):
             self.assertEqual(active[0].url, "https://example.test/b.jpg")
             self.assertEqual(active[0].hit_count, 2)
 
-    def test_sticker_file_refs_prefer_url_with_local_fallbacks(self) -> None:
+    def test_sticker_file_refs_prefer_url_then_base64_without_local_path_fallback(self) -> None:
         with project_temp_directory() as tmp:
             sticker_path = Path(tmp) / "meme.gif"
             sticker_path.write_bytes(b"fake image")
@@ -139,15 +139,11 @@ class StickerStorageTests(unittest.TestCase):
 
             refs = sticker_file_refs(asset)
             file_ref = sticker_file_ref(asset)
+            base64_ref = "base64://" + base64.b64encode(b"fake image").decode("ascii")
 
             self.assertEqual(file_ref, "https://example.test/meme.gif")
-            self.assertEqual(refs[0], "https://example.test/meme.gif")
-            self.assertEqual(
-                refs[1],
-                "base64://" + base64.b64encode(b"fake image").decode("ascii"),
-            )
-            self.assertEqual(refs[2], str(sticker_path.resolve()))
-            self.assertFalse(refs[2].startswith("file:"))
+            self.assertEqual(refs, ("https://example.test/meme.gif", base64_ref))
+            self.assertNotIn(str(sticker_path.resolve()), refs)
 
     def test_delete_sticker_asset_and_local_file(self) -> None:
         with project_temp_directory() as tmp:

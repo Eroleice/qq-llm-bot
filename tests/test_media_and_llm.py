@@ -414,7 +414,9 @@ class ImageGenerationTests(unittest.TestCase):
             source,
         )
 
-    def test_draw_command_retries_image_send_with_base64_fallback(self) -> None:
+    def test_draw_command_sends_generated_local_image_as_base64_without_local_path_fallback(
+        self,
+    ) -> None:
         sender_path = (
             Path(__file__).resolve().parents[1]
             / "plugins"
@@ -423,7 +425,10 @@ class ImageGenerationTests(unittest.TestCase):
         )
         source = sender_path.read_text(encoding="utf-8")
 
+        self.assertIn("send_refs = _generated_image_send_refs(saved)", source)
         self.assertIn("base64_ref = _generated_image_base64_ref(saved.local_path)", source)
+        self.assertIn('_append_send_ref(send_refs, "base64", base64_ref)', source)
+        self.assertNotIn('send_refs = [("file", saved.file_ref)]', source)
         self.assertIn("except ActionFailed as exc:", source)
         self.assertIn("except Exception as exc:", source)
         self.assertIn("outbound_queue.queue_group_attempts(", source)

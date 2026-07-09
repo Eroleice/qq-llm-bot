@@ -25,10 +25,13 @@ async def send_generated_image(
     command_sender: Any,
     outbound_queue: OutboundGroupSendQueue,
 ) -> bool:
-    send_refs = [("file", saved.file_ref)]
-    base64_ref = _generated_image_base64_ref(saved.local_path)
-    if base64_ref:
-        send_refs.append(("base64", base64_ref))
+    send_refs = _generated_image_send_refs(saved)
+    if not send_refs:
+        logger.warning(
+            "Generated image has no sendable non-local ref for {}",
+            saved.local_path or saved.url or saved.file_ref,
+        )
+        return False
 
     prepared_attempts = [
         (ref_kind, include_reply, _generated_image_message(context.message_id if include_reply else "", file_ref))
@@ -40,7 +43,7 @@ async def send_generated_image(
             await command_sender.send(message)
             if ref_kind != "file" or not include_reply:
                 logger.info(
-                    "Generated image send succeeded via {} fallback reply={} for {}",
+                    "Generated image send succeeded via {} reply={} for {}",
                     ref_kind,
                     include_reply,
                     saved.local_path or saved.url or saved.file_ref,
@@ -76,6 +79,28 @@ async def send_generated_image(
                 return True
             return False
     return False
+
+
+def _generated_image_send_refs(saved: Any) -> list[tuple[str, str]]:
+    send_refs: list[tuple[str, str]] = []
+    base64_ref = _generated_image_base64_ref(saved.local_path)
+    _append_send_ref(send_refs, "base64", base64_ref)
+    _append_send_ref(send_refs, "url", saved.url)
+    _append_send_ref(send_refs, "file", _non_local_image_ref(saved.file_ref))
+    return send_refs
+
+
+def _append_send_ref(send_refs: list[tuple[str, str]], ref_kind: str, ref: str) -> None:
+    cleaned = str(ref or "").strip()
+    if cleaned and cleaned not in {existing_ref for _, existing_ref in send_refs}:
+        send_refs.append((ref_kind, cleaned))
+
+
+def _non_local_image_ref(file_ref: str) -> str:
+    cleaned = str(file_ref or "").strip()
+    if cleaned.lower().startswith(("http://", "https://", "base64://")):
+        return cleaned
+    return ""
 
 
 def _generated_image_message(reply_to_message_id: str, file_ref: str) -> Message:
