@@ -96,13 +96,13 @@ def _whoami_user_prompt(
 ) -> str:
     user_label = f"{display_name}(QQ:{user_id})" if display_name else f"QQ:{user_id}"
     return (
-        "请根据可可对这位发言用户的记忆认知，整理一份不超过 80 字的总结。\n"
+        "请根据可可对这位发言用户的记忆认知，整理一份 50 字以上、100 字以下的总结。\n"
         "要求：\n"
         "- 优先用“你”称呼对方，语气温和自然。\n"
         "- 只能使用下方资料支持的信息，不要编造。\n"
         "- 不要提到 FACT、id、置信度、画像或关系分。\n"
         "- 不要列表，不要加标题，不要写“总结：”。\n"
-        "- 字数控制交给你，不要超过 80 字。\n\n"
+        "- 字数控制交给你，保持在 50-100 字之间。\n\n"
         f"用户：{user_label}\n\n"
         f"已有画像：\n{_format_profile(profile)}\n\n"
         f"关系认知：\n{_format_relationship(relationship)}\n\n"

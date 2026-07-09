@@ -128,6 +128,8 @@ class GuesswhoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active_guesswho_game("100").answer_user_id, "42")  # type: ignore[union-attr]
         self.assertIn("第二题", unlocked)
         self.assertEqual(llm.text_call_purposes, ["guesswho", "guesswho"])
+        self.assertIn("40-80字介绍", llm.text_calls[0][1])
+        self.assertIn("intro 控制在 40-80 字", llm.text_calls[0][1])
 
     async def test_guesswho_prompt_excludes_identity_material_and_redacts_user_id(self) -> None:
         storage = FakeGuesswhoStorage(

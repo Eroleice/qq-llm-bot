@@ -119,7 +119,8 @@ class WhoamiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(reply, expected)
         self.assertEqual(llm.text_call_purposes, ["whoami"])
-        self.assertIn("不超过 80 字", llm.text_calls[0][1])
+        self.assertIn("50 字以上、100 字以下", llm.text_calls[0][1])
+        self.assertIn("50-100 字", llm.text_calls[0][1])
         self.assertIn("Alice(QQ:42)", llm.text_calls[0][1])
         self.assertIn("用户42喜欢咖啡", llm.text_calls[0][1])
         self.assertIn("常整理项目笔记", llm.text_calls[0][1])
