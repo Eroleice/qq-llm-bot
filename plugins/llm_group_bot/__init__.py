@@ -36,6 +36,7 @@ from plugins.llm_group_bot.reply_sending import (
 from qq_llm_bot.realtime_merge import split_image_descriptions_by_context
 from qq_llm_bot.repetition_guard import GroupTextRepeatGuard
 from qq_llm_bot.stickers import StickerLocalStore
+from qq_llm_bot.whoami import build_whoami_reply
 
 __plugin_meta__ = PluginMetadata(
     name="llm-group-bot",
@@ -112,6 +113,7 @@ admin_cmd = on_command("bot", priority=5, block=True)
 user_relation_cmd = on_command("relation", priority=5, block=True)
 user_ignore_cmd = on_command("ignore", priority=5, block=True)
 user_pending_cmd = on_command("pending", priority=5, block=True)
+user_whoami_cmd = on_command("whoami", priority=5, block=True)
 user_approval_cmd = on_command("approval", priority=5, block=True)
 user_reject_cmd = on_command("reject", priority=5, block=True)
 draw_cmd = on_command("draw", priority=5, block=True)
@@ -144,6 +146,15 @@ def _with_command_reply(message: Message | str) -> Message | str:
     elif message:
         wrapped += MessageSegment.text(message)
     return wrapped
+
+
+def _sender_display_name(event: GroupMessageEvent) -> str:
+    sender = getattr(event, "sender", None)
+    return str(
+        getattr(sender, "card", "")
+        or getattr(sender, "nickname", "")
+        or getattr(event, "user_id", "")
+    ).strip()
 
 
 _draw_command.configure(
@@ -278,6 +289,22 @@ async def _handle_user_pending_command(event: GroupMessageEvent) -> None:
         user_pending_cmd,
         "\n".join(_admin_commands.format_user_pending_fact(fact) for fact in facts),
     )
+
+
+@user_whoami_cmd.handle()
+async def _handle_user_whoami_command(event: GroupMessageEvent) -> None:
+    _remember_command_reply(event)
+    user_id = str(event.user_id)
+    if storage.is_user_ignored(user_id):
+        return
+    reply = await build_whoami_reply(
+        storage,
+        llm,
+        user_id,
+        group_id=str(event.group_id),
+        display_name=_sender_display_name(event),
+    )
+    await _finish_command(user_whoami_cmd, reply)
 
 
 @user_approval_cmd.handle()

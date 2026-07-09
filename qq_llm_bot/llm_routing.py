@@ -39,6 +39,7 @@ COGNITION_PURPOSES = {
     "self_narrative_check",
     "self_narrative_draft",
     "self_narrative_plan",
+    "whoami",
 }
 
 
