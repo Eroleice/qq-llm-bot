@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from qq_llm_bot.storage_relationship_keys import GLOBAL_RELATIONSHIP_GROUP_ID
 from qq_llm_bot.storage_records import _dashboard_user_id, _dashboard_user_id_variants
 
 
@@ -94,11 +95,8 @@ def _fetch_relationship_candidate_rows(
     user_filter_params: list[object],
     query_limit: int,
 ) -> list[sqlite3.Row]:
-    relationship_where = "WHERE 1 = 1"
-    relationship_params: list[object] = []
-    if requested_group_id:
-        relationship_where += " AND group_id = ?"
-        relationship_params.append(requested_group_id)
+    relationship_where = "WHERE group_id = ?"
+    relationship_params: list[object] = [GLOBAL_RELATIONSHIP_GROUP_ID]
     relationship_where += user_filter_sql
     relationship_params.extend(user_filter_params)
     return conn.execute(
@@ -122,9 +120,6 @@ def _fetch_fact_candidate_rows(
 ) -> list[sqlite3.Row]:
     fact_where = ["status = 'accepted'"]
     fact_params: list[object] = []
-    if requested_group_id:
-        fact_where.append("source_group_id = ?")
-        fact_params.append(requested_group_id)
     return conn.execute(
         f"""
         SELECT subject_user_id AS user_id, source_group_id, MAX(updated_at) AS updated_at
@@ -145,8 +140,6 @@ def _fetch_profile_candidate_rows(
     user_variants: list[str],
     query_limit: int,
 ) -> list[sqlite3.Row]:
-    if requested_group_id:
-        return []
     profile_where = "WHERE 1 = 1"
     profile_params: list[object] = []
     if user_variants:

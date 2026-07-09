@@ -1312,6 +1312,67 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertEqual(relation.summary, "主动找可可讨论技术问题")
             self.assertEqual(items[0]["relationship"]["summary"], "主动找可可讨论技术问题")  # type: ignore[index]
 
+    def test_relationships_migrate_to_global_user_scope(self) -> None:
+        with project_temp_directory() as tmp:
+            config = test_config(Path(tmp) / "bot.sqlite3")
+            storage = BotStorage.from_config(config)
+            storage.setup()
+            with storage._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO relationships (
+                        group_id, user_id, closeness, trust, familiarity, tension, summary, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("100", "QQ:42", 2, 75, 4, 1, "老群里多次帮可可处理问题", 10),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO relationships (
+                        group_id, user_id, closeness, trust, familiarity, tension, summary, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("200", "42", 1, 5, 3, 0, "新群继续和可可聊天", 20),
+                )
+
+            storage.setup()
+
+            relation = storage.get_relationship("300", "42")
+            self.assertEqual(relation.closeness, 3)
+            self.assertEqual(relation.trust, 80)
+            self.assertEqual(relation.familiarity, 7)
+            self.assertEqual(relation.tension, 1)
+            self.assertIn("老群里多次帮可可处理问题", relation.summary)
+            self.assertIn("新群继续和可可聊天", relation.summary)
+            with storage._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT group_id, user_id
+                    FROM relationships
+                    ORDER BY user_id
+                    """
+                ).fetchall()
+            self.assertEqual([(row["group_id"], row["user_id"]) for row in rows], [("", "42")])
+
+            fact = FactCandidate(
+                subject_user_id="77",
+                fact_type="preference",
+                claim_text="用户77喜欢吃鱼",
+                topic="吃鱼",
+                stance="positive",
+                confidence=0.9,
+                evidence_message_id="m1",
+                evidence_text="77喜欢吃鱼",
+                source_user_id="42",
+                source_group_id="300",
+                claim_scope="third_party",
+            )
+            write = storage.record_fact_candidates([fact])
+
+            self.assertEqual(len(write.accepted), 1)
+
     def test_relationship_ranking_formats_top_five_by_closeness_and_familiarity(self) -> None:
         with project_temp_directory() as tmp:
             config = test_config(Path(tmp) / "bot.sqlite3")
@@ -1350,7 +1411,7 @@ class MemoryStorageTests(unittest.TestCase):
 
             ranking = storage.format_relationship_ranking("100")
 
-            self.assertIn("本群亲密/了解程度 TOP 5", ranking)
+            self.assertIn("全局亲密/了解程度 TOP 5", ranking)
             self.assertIn("Alice(QQ:2)", ranking)
             self.assertIn("综合=14", ranking)
             self.assertLess(ranking.index("Alice(QQ:2)"), ranking.index("QQ:3"))
@@ -1358,7 +1419,12 @@ class MemoryStorageTests(unittest.TestCase):
             self.assertNotIn("聊过", ranking)
             self.assertNotIn("|", ranking)
             self.assertNotIn("QQ:6", ranking)
-            self.assertEqual(storage.format_relationship_ranking("404"), "本群暂无关系记录。")
+            self.assertEqual(storage.format_relationship_ranking("404"), ranking)
+
+            empty_config = test_config(Path(tmp) / "empty.sqlite3")
+            empty_storage = BotStorage.from_config(empty_config)
+            empty_storage.setup()
+            self.assertEqual(empty_storage.format_relationship_ranking("404"), "暂无关系记录。")
 
     def test_image_description_update_keeps_unsampled_images_blank(self) -> None:
         with project_temp_directory() as tmp:

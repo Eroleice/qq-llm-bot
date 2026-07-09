@@ -8,6 +8,7 @@ from qq_llm_bot.storage_records import (
     _fact_record,
     _user_profile_record,
 )
+from qq_llm_bot.storage_relationship_keys import GLOBAL_RELATIONSHIP_GROUP_ID
 
 
 def list_dashboard_relationship_rows(
@@ -21,11 +22,12 @@ def list_dashboard_relationship_rows(
         f"""
         SELECT group_id, user_id, closeness, trust, familiarity, tension, summary, updated_at
         FROM relationships
-        WHERE user_id IN ({placeholders})
+        WHERE group_id = ?
+          AND user_id IN ({placeholders})
         ORDER BY updated_at DESC
         LIMIT ?
         """,
-        [*variants, int(limit)],
+        [GLOBAL_RELATIONSHIP_GROUP_ID, *variants, int(limit)],
     ).fetchall()
 
 

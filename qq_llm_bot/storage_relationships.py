@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from qq_llm_bot.storage_records import _relationship_rank_label
+from qq_llm_bot.storage_relationship_keys import GLOBAL_RELATIONSHIP_GROUP_ID
 from qq_llm_bot.storage_relationship_state import (
     apply_relationship_delta,
     get_relationship,
@@ -46,7 +47,7 @@ def format_relationship_ranking(storage: Any, group_id: str, limit: int = 5) -> 
                      updated_at DESC
             LIMIT ?
             """,
-            (str(group_id), limit),
+            (GLOBAL_RELATIONSHIP_GROUP_ID, limit),
         ).fetchall()
         profiles = {
             str(row["user_id"]): storage._dashboard_user_profile(conn, str(row["user_id"]))
@@ -54,9 +55,9 @@ def format_relationship_ranking(storage: Any, group_id: str, limit: int = 5) -> 
         }
 
     if not rows:
-        return "本群暂无关系记录。"
+        return "暂无关系记录。"
 
-    lines = [f"本群亲密/了解程度 TOP {limit}（按 亲密+了解 排序）："]
+    lines = [f"全局亲密/了解程度 TOP {limit}（按 亲密+了解 排序）："]
     for index, row in enumerate(rows, start=1):
         user_id = str(row["user_id"])
         closeness = int(row["closeness"])

@@ -30,7 +30,9 @@ def build_dashboard_cognition_items(
         group_ids = entry["group_ids"]
         assert isinstance(group_ids, set)
         for row in relationships:
-            group_ids.add(str(row["group_id"]))
+            relationship_group_id = str(row["group_id"] or "")
+            if relationship_group_id:
+                group_ids.add(relationship_group_id)
             entry["sort_at"] = max(int(entry["sort_at"]), int(row["updated_at"]))
         for record in fact_records:
             if record.source_group_id:

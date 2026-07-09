@@ -5,6 +5,8 @@ from typing import Any
 
 from qq_llm_bot.models import MemoryCandidate
 from qq_llm_bot.storage_fact_constants import TRUSTED_THIRD_PARTY_THRESHOLD
+from qq_llm_bot.storage_records import _dashboard_user_id
+from qq_llm_bot.storage_relationship_keys import GLOBAL_RELATIONSHIP_GROUP_ID
 
 
 def acceptance_status(
@@ -37,13 +39,16 @@ def acceptance_status(
 
 
 def source_trust(conn: sqlite3.Connection, group_id: str, user_id: str) -> int:
+    subject = _dashboard_user_id(user_id)
+    if not subject:
+        return 0
     row = conn.execute(
         """
         SELECT trust
         FROM relationships
         WHERE group_id = ? AND user_id = ?
         """,
-        (str(group_id), str(user_id)),
+        (GLOBAL_RELATIONSHIP_GROUP_ID, subject),
     ).fetchone()
     return int(row["trust"]) if row else 0
 

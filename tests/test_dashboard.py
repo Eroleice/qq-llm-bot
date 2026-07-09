@@ -236,7 +236,7 @@ class DashboardTests(unittest.TestCase):
             user_items = [item for item in items if item["user_id"] == "42"]
 
             self.assertEqual(len(user_items), 1)
-            self.assertEqual(user_items[0]["group_ids"], ["100", "200"])
+            self.assertEqual(user_items[0]["group_ids"], ["200"])
             self.assertEqual(user_items[0]["relationship"]["trust"], 2)  # type: ignore[index]
             self.assertEqual(user_items[0]["relationship"]["familiarity"], 4)  # type: ignore[index]
             self.assertEqual(user_items[0]["profile"]["summary"], "用户42喜欢海边。")  # type: ignore[index]
@@ -246,7 +246,8 @@ class DashboardTests(unittest.TestCase):
             filtered_user_items = [item for item in filtered_items if item["user_id"] == "42"]
 
             self.assertEqual(len(filtered_user_items), 1)
-            self.assertEqual(filtered_user_items[0]["group_ids"], ["100", "200"])
+            self.assertEqual(filtered_user_items[0]["group_ids"], ["200"])
+            self.assertEqual(filtered_user_items[0]["relationship"]["familiarity"], 4)  # type: ignore[index]
             self.assertEqual(filtered_user_items[0]["profile"]["summary"], "用户42喜欢海边。")  # type: ignore[index]
             self.assertEqual(filtered_user_items[0]["facts"][0]["claim_text"], "用户42喜欢海边")  # type: ignore[index]
 

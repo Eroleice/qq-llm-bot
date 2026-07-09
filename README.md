@@ -57,7 +57,7 @@ http://127.0.0.1:8080/dashboard
 #reject <fact_id>
 ```
 
-- `#relation`：查询机器人在当前群对自己的关系参数，不返回画像或 FACT。
+- `#relation`：查询机器人对自己的全局关系参数，不返回画像或 FACT。
 - `#ignore`：切换自己的忽略状态；已忽略时再次执行会取消忽略。
 - `#pending`：查看关于自己的 pending FACT，并显示可用的批准/拒绝命令。
 - `#approval <fact_id>` / `#reject <fact_id>`：批准或拒绝关于自己的 pending FACT。
@@ -139,7 +139,7 @@ final_qa_enabled = true
 - 已接入 NoneBot2 + OneBot V11 正向 WebSocket 配置。
 - 已实现管理员与群白名单配置。
 - 已实现群状态机：`silent | passive | active`。
-- 已实现群消息 SQLite 记录、上下文检索、成员 FACT、全局成员画像、自我记忆、群复盘和关系记录。
+- 已实现群消息 SQLite 记录、上下文检索、成员 FACT、全局成员画像、自我记忆、群复盘和按 QQ 绑定的全局关系记录。
 - 已实现结构化 LLM agents pipeline：感知、FACT 抽取、关系变化、增量价值参与决策、回复生成、回复后自我记忆账本。
 - 已实现发送前最终 QA：结合最近群聊和拟发送文本审核是否合理、贴合上下文且不涉及政治立场或其它不当内容。
 - 已实现保守记忆写入：低置信候选拒绝，冲突候选标记为 `conflict`，不会覆盖旧记忆。
@@ -161,7 +161,7 @@ http://127.0.0.1:8080/dashboard
 看板包含：
 
 - `自我设定`：展示稳定/当前人设和机器人自己的 self memory。
-- `成员认知`：按群号和 QQ ID 查询成员全局画像、accepted FACT、亲近、信任、熟悉、紧张和关系摘要。
+- `成员认知`：按 QQ ID 查看成员全局画像、accepted FACT、亲近、信任、熟悉、紧张和关系摘要；群号保留为来源与聊天记录筛选维度。
 - `群聊记录`：按群号、发言人、开始日期、结束日期筛选已入库消息。
 - `表情包`：查看现存可使用表情包、触发条件和复制删除命令。
 - `Pending`：展示 `pending_confirmation` 和 `conflict` 记忆，并生成可直接复制到 QQ 群里的确认命令。
