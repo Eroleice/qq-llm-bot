@@ -226,6 +226,12 @@ async def _handle_admin_command(
     if topic == "facts":
         await _admin_commands.handle_facts(rest)
 
+    if topic == "guesswho":
+        await _admin_commands.handle_guesswho(bot, group_id)
+
+    if topic == "tellmewho":
+        await _admin_commands.handle_tellmewho(group_id)
+
     if topic == "profile":
         await _admin_commands.handle_profile(rest)
 

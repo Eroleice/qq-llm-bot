@@ -19,3 +19,6 @@ class StorageCognitionRelationshipFacadeMixin:
 
     def format_relationship_ranking(self, group_id: str, limit: int = 5) -> str:
         return _storage_relationships.format_relationship_ranking(self, group_id, limit)
+
+    def list_familiar_user_ids(self, min_familiarity: int = 100) -> list[str]:
+        return _storage_relationships.list_familiar_user_ids(self, min_familiarity)

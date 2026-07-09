@@ -33,6 +33,7 @@ FACT_EXTRACTION_PURPOSES = {
 }
 COGNITION_PURPOSES = {
     "batch_observation",
+    "guesswho",
     "profile_aggregate",
     "reflection",
     "relationship",

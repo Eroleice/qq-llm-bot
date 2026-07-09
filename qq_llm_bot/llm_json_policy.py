@@ -22,6 +22,7 @@ STRUCTURED_JSON_REQUIRED_KEYS = {
     "fact_extract": {"facts"},
     "final_qa": {"verdict", "reason", "categories", "confidence"},
     "followup_gate": {"action", "confidence", "value_type", "reason"},
+    "guesswho": {"intro", "facts"},
     "lexicon_detect": {"terms"},
     "lexicon_summarize": {"should_remember", "definition", "confidence"},
     "memory_curator": {"memories"},

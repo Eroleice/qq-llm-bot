@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from qq_llm_bot.storage_records import _relationship_rank_label
+from qq_llm_bot.storage_records import _dashboard_user_id, _relationship_rank_label
 from qq_llm_bot.storage_relationship_keys import GLOBAL_RELATIONSHIP_GROUP_ID
 from qq_llm_bot.storage_relationship_state import (
     apply_relationship_delta,
@@ -15,8 +15,24 @@ __all__ = [
     "format_relationship",
     "format_relationship_ranking",
     "get_relationship",
+    "list_familiar_user_ids",
     "touch_relationship",
 ]
+
+
+def list_familiar_user_ids(storage: Any, min_familiarity: int = 100) -> list[str]:
+    threshold = max(0, min(100, int(min_familiarity)))
+    with storage._connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id
+            FROM relationships
+            WHERE group_id = ? AND familiarity >= ?
+            ORDER BY familiarity DESC, closeness DESC, trust DESC, updated_at DESC
+            """,
+            (GLOBAL_RELATIONSHIP_GROUP_ID, threshold),
+        ).fetchall()
+    return [_dashboard_user_id(str(row["user_id"])) for row in rows]
 
 
 def format_relationship(storage: Any, group_id: str, user_id: str) -> str:

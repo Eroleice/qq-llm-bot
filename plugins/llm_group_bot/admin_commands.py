@@ -8,6 +8,10 @@ from plugins.llm_group_bot.admin_command_basic import (
     handle_relation,
     handle_whitelist,
 )
+from plugins.llm_group_bot.admin_command_game import (
+    handle_guesswho,
+    handle_tellmewho,
+)
 from plugins.llm_group_bot.admin_command_memory import (
     handle_facts,
     handle_memory,
@@ -40,6 +44,7 @@ __all__ = [
     "handle_admin",
     "handle_facts",
     "handle_forget",
+    "handle_guesswho",
     "handle_ignore",
     "handle_llm",
     "handle_memory",
@@ -48,6 +53,7 @@ __all__ = [
     "handle_profile",
     "handle_relation",
     "handle_stickers",
+    "handle_tellmewho",
     "handle_token_usage",
     "handle_user_fact_decision",
     "handle_whitelist",

@@ -54,6 +54,8 @@ def help_text() -> str:
         "#bot ignore list|add <qq_id>|remove <qq_id>\n"
         "#bot memory lexicon [term]|pending|conflicts|approve <id>|reject <id>\n"
         "#bot facts user <qq_id>|pending|approve <id>|reject <id>|forget <id>\n"
+        "#bot guesswho\n"
+        "#bot tellmewho\n"
         "#bot profile <qq_id>\n"
         "#bot stickers list [数量]|enable <id>|disable <id>|delete <id>\n"
         "#bot persona show|self [pending|conflicts|approve <id>|reject <id>|forget <id>]\n"
