@@ -120,6 +120,16 @@ class UserProfileRecord:
 
 
 @dataclass(frozen=True)
+class GuessWhoScoreRecord:
+    group_id: str
+    user_id: str
+    correct_count: int
+    wrong_count: int
+    nickname: str = ""
+    updated_at: int = 0
+
+
+@dataclass(frozen=True)
 class TargetUserContext:
     user_id: str
     resolution_status: str

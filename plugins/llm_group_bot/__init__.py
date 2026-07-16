@@ -117,6 +117,7 @@ user_whoami_cmd = on_command("whoami", priority=5, block=True)
 user_approval_cmd = on_command("approval", priority=5, block=True)
 user_reject_cmd = on_command("reject", priority=5, block=True)
 draw_cmd = on_command("draw", priority=5, block=True)
+guess_cmd = on_command("guess", priority=5, block=True)
 
 _command_reply_message_id: ContextVar[str] = ContextVar("command_reply_message_id", default="")
 
@@ -226,12 +227,6 @@ async def _handle_admin_command(
     if topic == "facts":
         await _admin_commands.handle_facts(rest)
 
-    if topic == "guesswho":
-        await _admin_commands.handle_guesswho(bot, group_id)
-
-    if topic == "tellmewho":
-        await _admin_commands.handle_tellmewho(group_id)
-
     if topic == "profile":
         await _admin_commands.handle_profile(rest)
 
@@ -295,6 +290,16 @@ async def _handle_user_pending_command(event: GroupMessageEvent) -> None:
         user_pending_cmd,
         "\n".join(_admin_commands.format_user_pending_fact(fact) for fact in facts),
     )
+
+
+@guess_cmd.handle()
+async def _handle_guess_command(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    _remember_command_reply(event)
+    await _admin_commands.handle_guess_command(bot, event, args)
 
 
 @user_whoami_cmd.handle()
@@ -666,6 +671,7 @@ _admin_commands.configure(
     storage_=storage,
     config_=config,
     admin_cmd_=admin_cmd,
+    guess_cmd_=guess_cmd,
     sticker_store_=sticker_store,
     llm_=llm,
     finish_command=_finish_command,

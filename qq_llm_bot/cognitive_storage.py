@@ -12,6 +12,7 @@ from qq_llm_bot.storage_access_facade import StorageAccessFacadeMixin
 from qq_llm_bot.storage_cognition_facade import StorageCognitionFacadeMixin
 from qq_llm_bot.storage_dashboard_facade import StorageDashboardFacadeMixin
 from qq_llm_bot.storage_helpers import clamp_float as _clamp_float
+from qq_llm_bot.storage_guesswho_facade import StorageGuessWhoFacadeMixin
 from qq_llm_bot.storage_message_facade import StorageMessageFacadeMixin
 from qq_llm_bot.storage_records import (
     _clamp_score,
@@ -32,6 +33,7 @@ class BotStorage(
     StorageDashboardFacadeMixin,
     StorageSnapshotFacadeMixin,
     StorageAccessFacadeMixin,
+    StorageGuessWhoFacadeMixin,
 ):
     def __init__(
         self,
